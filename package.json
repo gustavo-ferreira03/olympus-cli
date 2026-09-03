@@ -1,0 +1,39 @@
+{
+  "name": "olympus-cli-gustavos-fork",
+  "version": "0.2.0-gustavo.1",
+  "description": "Olympus CLI — Gustavo's Fork, maintained in TypeScript with current check APIs",
+  "type": "module",
+  "homepage": "https://shipd.ai/quests/olympus",
+  "keywords": [
+    "shipd",
+    "olympus",
+    "cli",
+    "convex"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "olympus": "dist/index.js"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "tsc && node -e \"require('node:fs').chmodSync('dist/index.js',0o755)\"",
+    "typecheck": "tsc --noEmit",
+    "cli": "node dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "citty": "^0.2.1",
+    "convex": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "^3.9.6",
+    "tsx": "^4.21.0",
+    "typescript": "~5.7.0"
+  },
+  "private": true
+}
