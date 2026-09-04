@@ -145,6 +145,56 @@ const view = defineCommand({
         console.log("\n  \x1b[90mUse --json for the full check payload.\x1b[0m\n");
     },
 });
+function isActiveStatus(status: unknown): boolean {
+    return status === "pending" || status === "running";
+}
+
+async function ensureDockerImage(
+    client: Awaited<ReturnType<typeof getClient>>,
+    versionId: string,
+    intervalMs: number,
+    timeoutMs: number,
+): Promise<{ built: boolean; jobId?: string }> {
+    let image: any = await client.query(api.dockerImage.getImageStatus, { versionId });
+    if (image?.hasImage && !image?.stale && !image?.rebuildSafeNeeded) {
+        return { built: false };
+    }
+
+    let job: any = await client.query(api.dockerImage.getLatestBuildJobForVersion, {
+        versionId,
+    });
+    let built = isActiveStatus(job?.status);
+    if (!built) {
+        if (image?.lastBuildFailedForCurrentInputs && !image?.rebuildSafeNeeded) {
+            throw new Error(
+                "The last Docker image build failed for the current Dockerfile; edit it before retrying",
+            );
+        }
+        if (image?.canBuild === false) {
+            throw new Error("The Docker image cannot currently be built");
+        }
+        await client.action(api.dockerImage.buildVersionImage, { versionId });
+        built = true;
+    }
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        job = await client.query(api.dockerImage.getLatestBuildJobForVersion, { versionId });
+        if (job?.status === "failed") {
+            throw new Error(job.error || "Docker image build failed");
+        }
+        if (job?.status === "completed") {
+            image = await client.query(api.dockerImage.getImageStatus, { versionId });
+            if (image?.hasImage && !image?.stale && !image?.rebuildSafeNeeded) {
+                return { built, jobId: job.jobId };
+            }
+            throw new Error("Docker image build completed, but the resulting image is not current");
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw new Error("Timed out waiting for the Docker image build");
+}
+
 const run = defineCommand({
     meta: { name: "checks run", description: "Run one quality check" },
     args: {
@@ -153,6 +203,18 @@ const run = defineCommand({
             type: "string",
             description: `Check key (one of: ${TRIGGERABLE_CHECK_KEYS.join(", ")})`,
             required: false,
+        },
+        "use-general-tokens": {
+            type: "boolean",
+            description: "Charge general tokens instead of revision tokens",
+        },
+        interval: {
+            type: "string",
+            description: "Docker build poll interval in seconds (default 10)",
+        },
+        timeout: {
+            type: "string",
+            description: "Docker build timeout in minutes (default 30)",
         },
         list: { type: "boolean", description: "List available check keys and exit" },
         json: { type: "boolean", description: "Output as JSON" },
@@ -196,13 +258,25 @@ const run = defineCommand({
         }
         const client = await getClient();
         const { version } = await requireProblemVersion(client, args.id);
+        const imageBuild = args.check === "verifyBuild"
+            ? await ensureDockerImage(
+                client,
+                version._id,
+                (Number.parseInt(args.interval ?? "", 10) || 10) * 1000,
+                (Number.parseInt(args.timeout ?? "", 10) || 30) * 60 * 1000,
+            )
+            : null;
         const result = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
             versionId: version._id,
             checkKey: args.check,
+            useGeneralTokens: Boolean(args["use-general-tokens"]),
         });
         if (args.json) {
-            printJson(result);
+            printJson({ ...result, imageBuild });
             return;
+        }
+        if (imageBuild?.built) {
+            console.log(`\n  Docker image ready${imageBuild.jobId ? ` (${imageBuild.jobId})` : ""}.`);
         }
         console.log(`\n  Triggered ${args.check} on v${version.version}`);
         console.log("  \x1b[90mUse `olympus checks wait <id>` to watch active checks.\x1b[0m\n");
