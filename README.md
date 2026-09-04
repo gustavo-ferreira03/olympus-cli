@@ -48,6 +48,7 @@ The JSON form is compact by default and includes safe next commands for deeper i
 olympus auth             Authentication
 olympus problems         Challenge metadata, artifacts, versions, and submission
 olympus checks           Prechecks, quality checks, findings, and readiness
+olympus image            Version image build, status, waiting, and cancellation
 olympus scope-gate       Scope Gate inspection and execution
 olympus fp-check         False-positive check inspection and execution
 olympus verifier-audit   Verifier Completeness Audit and decisions
@@ -87,6 +88,35 @@ Request the complete backend payload only when necessary:
 ```bash
 olympus problems view <challenge-id> --json --full
 ```
+
+## Build the version image
+
+Inspect the image state:
+
+```bash
+olympus image view <challenge-id> --json
+```
+
+Build or rebuild and wait until the image is ready:
+
+```bash
+olympus image build <challenge-id> --wait --json
+```
+
+Without `--wait`, the response includes the exact `image wait` command and build job ID:
+
+```bash
+olympus image build <challenge-id> --json
+olympus image wait <challenge-id> --job=<job-id> --json
+```
+
+Cancel an active build:
+
+```bash
+olympus image cancel <challenge-id> --json
+```
+
+`image build` is idempotent. If the image is already current and rebuild-safe, it returns `status: "ready"` without queuing another build.
 
 ## Prechecks and quality checks
 
@@ -136,7 +166,6 @@ olympus checks run-all <challenge-id> --wait --json
 Current public check keys:
 
 ```text
-verifyBuild
 verifyTests
 verifySolution
 verifyFlakiness
@@ -145,8 +174,6 @@ taskQuality
 solutionQuality
 descriptionQuality
 ```
-
-`verifyBuild` ensures that the version image exists, is current, and is rebuild-safe before running the quality check.
 
 Later-stage checks use their dedicated commands:
 
@@ -162,7 +189,7 @@ Prefer integrated `--wait`. When separate waiting is useful, always select the i
 ```bash
 olympus checks wait <challenge-id> --job=<job-id> --json
 olympus checks wait <challenge-id> --check=testQuality --json
-olympus checks wait <challenge-id> --checks=verifyBuild,verifyTests --json
+olympus checks wait <challenge-id> --checks=verifyTests,testQuality --json
 ```
 
 An unscoped wait watches only active current checks and returns a compact `idle` response when none exist.

@@ -9,6 +9,7 @@ import runs from "./commands/runs.ts";
 import autoReview from "./commands/auto-review.ts";
 import contest from "./commands/contest.ts";
 import fpCheck from "./commands/fp-check.ts";
+import image from "./commands/image.ts";
 import scopeGate from "./commands/scope-gate.ts";
 import verifierAudit from "./commands/verifier-audit.ts";
 import { checkVersion, UPDATE_PACKAGE_NAME } from "./config.ts";
@@ -50,6 +51,7 @@ const main = defineCommand({
         auth,
         problems,
         checks,
+        image,
         "scope-gate": scopeGate,
         "fp-check": fpCheck,
         "verifier-audit": verifierAudit,

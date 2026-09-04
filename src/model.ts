@@ -1,4 +1,4 @@
-import { toPublicCheckKey } from "./expected.ts";
+import { RENDERABLE_CHECK_KEYS, toPublicCheckKey } from "./expected.ts";
 
 export type SubmissionReadiness = {
   criteria: Array<{
@@ -66,8 +66,7 @@ export type AgentRunGroup = {
 };
 
 export const DYNAMIC_CHECK_ORDER = [
-    // Execution checks, in the order the platform runs them
-    "verifyBuild",
+    // Current execution checks
     "verifyTests",
     "verifySolution",
     "verifyFlakiness",
@@ -79,13 +78,8 @@ export const DYNAMIC_CHECK_ORDER = [
     // Post-rollout / diagnostic checks
     "verifierIncompleteness",
     "autoReview",
-    // Retired: still labelled so stored results on old versions do not render
-    // as raw keys. Never triggerable — see expected.js RETIRED_CHECK_KEYS.
-    "environmentQuality",
-    "crossRunAnalysis",
 ];
 const DYNAMIC_CHECK_LABELS: Record<string, string> = {
-    verifyBuild: "Verify Build",
     verifyTests: "Verify Tests",
     verifySolution: "Verify Solution",
     verifyFlakiness: "Verify Flakiness",
@@ -96,8 +90,6 @@ const DYNAMIC_CHECK_LABELS: Record<string, string> = {
     descriptionQuality: "Description Quality",
     verifierIncompleteness: "Verifier Incompleteness",
     autoReview: "Auto Review",
-    environmentQuality: "Environment Quality (retired)",
-    crossRunAnalysis: "Holistic AI Review (retired)",
 };
 /**
  * Checks whose verdict the backend can mark as contested by the author.
@@ -154,7 +146,8 @@ export function normalizeDynamicChecks(dynamicChecks: unknown): DynamicCheckReco
         return {};
     }
     return Object.fromEntries(Object.entries(dynamicChecks).filter(([key, value]) => {
-        return (!key.startsWith("_") &&
+        return (RENDERABLE_CHECK_KEYS.includes(key as any) &&
+            !key.startsWith("_") &&
             !!value &&
             typeof value === "object" &&
             !Array.isArray(value) &&

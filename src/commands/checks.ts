@@ -4,10 +4,8 @@ import {
     GATING_CHECK_KEYS,
     NON_GATING_CHECK_KEYS,
     PRECHECK_STAGE_IDS,
-    RETIRED_CHECK_KEYS,
     TRIGGERABLE_CHECK_KEYS,
     toBackendCheckKey,
-    toPublicCheckKey,
 } from "../expected.ts";
 import { printJson, statusBadge, truncate } from "../format.ts";
 import { omitEmpty, paginate, parsePositiveInteger, sliceText } from "../output.ts";
@@ -16,12 +14,10 @@ import { formatDynamicCheckLabel, getDynamicCheckEntries, normalizeDynamicChecks
  * The production quality-check set, ordered so execution checks run before the
  * review checks that depend on their artifacts.
  *
- * Excludes `autoReview` and `verifierIncompleteness` (later stage / opt-in) and
- * every retired key: the backend rejects a retired key and that aborts the batch.
+ * Excludes `autoReview` and `verifierIncompleteness` (later stage / opt-in).
  */
 export const DEFAULT_RUN_ALL_CHECK_KEYS = [...GATING_CHECK_KEYS];
 const CHECK_ARTIFACTS: Record<string, string[]> = {
-    verifyBuild: ["buildLog"],
     verifyTests: ["buildLog", "testLog"],
     verifySolution: ["buildLog", "testLog"],
     verifyFlakiness: ["buildLog", "testLog"],
@@ -32,16 +28,6 @@ function includesKey<T extends string>(values: readonly T[], value: string): val
     return values.includes(value as T);
 }
 
-/** Reject retired keys before spending an RPC. */
-function rejectUnavailable(keys: readonly string[]) {
-    const retired = keys.filter((key) => includesKey(RETIRED_CHECK_KEYS, key));
-    if (retired.length > 0) {
-        console.error(`\n  Retired check key(s): ${retired.join(", ")}`);
-        console.error("  These no longer exist on the platform; the backend rejects them.");
-        console.error("  They are still labelled when reading stored results on old versions.\n");
-        process.exit(1);
-    }
-}
 function formatCheckVerdict(check) {
     const verdict = check.output?.verdict ??
         check.output?.evaluation?.verdict;
@@ -173,8 +159,7 @@ const view = defineCommand({
             }));
             let checkEntries = getDynamicCheckEntries(dynamicChecks);
             if (args.check) {
-                const requestedCheck = toPublicCheckKey(args.check);
-                checkEntries = checkEntries.filter((check) => check.key === requestedCheck);
+                checkEntries = checkEntries.filter((check) => check.key === args.check);
             }
             if (args.only) {
                 checkEntries = checkEntries.filter((check) => {
@@ -218,51 +203,6 @@ function isActiveStatus(status: unknown): boolean {
     return status === "pending" || status === "running";
 }
 
-async function ensureDockerImage(
-    client: Awaited<ReturnType<typeof getClient>>,
-    versionId: string,
-    intervalMs: number,
-    timeoutMs: number,
-): Promise<{ built: boolean; jobId?: string }> {
-    let image: any = await client.query(api.dockerImage.getImageStatus, { versionId });
-    if (image?.hasImage && !image?.stale && !image?.rebuildSafeNeeded) {
-        return { built: false };
-    }
-
-    let job: any = await client.query(api.dockerImage.getLatestBuildJobForVersion, {
-        versionId,
-    });
-    let built = isActiveStatus(job?.status);
-    if (!built) {
-        if (image?.lastBuildFailedForCurrentInputs && !image?.rebuildSafeNeeded) {
-            throw new Error(
-                "The last Docker image build failed for the current Dockerfile; edit it before retrying",
-            );
-        }
-        if (image?.canBuild === false) {
-            throw new Error("The Docker image cannot currently be built");
-        }
-        await client.action(api.dockerImage.buildVersionImage, { versionId });
-        built = true;
-    }
-
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < timeoutMs) {
-        job = await client.query(api.dockerImage.getLatestBuildJobForVersion, { versionId });
-        if (job?.status === "failed") {
-            throw new Error(job.error || "Docker image build failed");
-        }
-        if (job?.status === "completed") {
-            image = await client.query(api.dockerImage.getImageStatus, { versionId });
-            if (image?.hasImage && !image?.stale && !image?.rebuildSafeNeeded) {
-                return { built, jobId: job.jobId };
-            }
-            throw new Error("Docker image build completed, but the resulting image is not current");
-        }
-        await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
-    throw new Error("Timed out waiting for the Docker image build");
-}
 
 const run = defineCommand({
     meta: { name: "checks run", description: "Run one quality check" },
@@ -279,11 +219,11 @@ const run = defineCommand({
         },
         interval: {
             type: "string",
-            description: "Docker build poll interval in seconds (default 10)",
+            description: "Check poll interval in seconds (default 5)",
         },
         timeout: {
             type: "string",
-            description: "Docker build timeout in minutes (default 30)",
+            description: "Check wait timeout in minutes (default 30)",
         },
         wait: { type: "boolean", description: "Wait for this check to finish" },
         full: { type: "boolean", description: "Include raw result when waiting" },
@@ -305,17 +245,12 @@ const run = defineCommand({
             for (const key of NON_GATING_CHECK_KEYS) {
                 console.log(`    \x1b[90m${key.padEnd(24)} ${formatDynamicCheckLabel(key)}\x1b[0m`);
             }
-            console.log("\n  \x1b[90mRetired (read-only, cannot be triggered):\x1b[0m");
-            for (const key of RETIRED_CHECK_KEYS) {
-                console.log(`    \x1b[90m${key.padEnd(24)} ${formatDynamicCheckLabel(key)}\x1b[0m`);
-            }
             console.log("");
             if (!args.list)
                 process.exit(1);
             return;
         }
-        const checkKey = toPublicCheckKey(args.check);
-        rejectUnavailable([checkKey]);
+        const checkKey = args.check;
         if (includesKey(NON_GATING_CHECK_KEYS, checkKey)) {
             const command = checkKey === "autoReview"
                 ? "olympus auto-review run"
@@ -323,21 +258,12 @@ const run = defineCommand({
             throw new Error(`${checkKey} must be run through: ${command} ${args.id}`);
         }
         if (!includesKey(TRIGGERABLE_CHECK_KEYS, checkKey)) {
-            console.error(`\n  Unknown check key: ${args.check}`);
-            console.error(`  Known keys: ${TRIGGERABLE_CHECK_KEYS.join(", ")}`);
-            console.error("  Run `olympus checks run <id> --list` to see labels.\n");
-            process.exit(1);
+            throw new Error(
+                `Unknown check key: ${args.check}. Known keys: ${TRIGGERABLE_CHECK_KEYS.join(", ")}`,
+            );
         }
         const client = await getClient();
         const { version } = await requireProblemVersion(client, args.id);
-        const imageBuild = checkKey === "verifyBuild"
-            ? await ensureDockerImage(
-                client,
-                version._id,
-                (Number.parseInt(args.interval ?? "", 10) || 10) * 1000,
-                (Number.parseInt(args.timeout ?? "", 10) || 30) * 60 * 1000,
-            )
-            : null;
         const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
             versionId: version._id,
             checkKey: toBackendCheckKey(checkKey),
@@ -361,11 +287,8 @@ const run = defineCommand({
             ? `olympus checks wait ${args.id} --job=${result.jobId} --json`
             : `olympus checks wait ${args.id} --check=${checkKey} --json`;
         if (args.json) {
-            printJson({ ...result, imageBuild, waitCommand });
+            printJson({ ...result, waitCommand });
             return;
-        }
-        if (imageBuild?.built) {
-            console.log(`\n  Docker image ready${imageBuild.jobId ? ` (${imageBuild.jobId})` : ""}.`);
         }
         console.log(`\n  Triggered ${checkKey} on v${version.version}`);
         console.log(`  \x1b[90mWait: ${waitCommand}\x1b[0m\n`);
@@ -394,17 +317,15 @@ const runAll = defineCommand({
         if (args.checks) {
             const requested = args.checks
                 .split(",")
-                .map((key) => toPublicCheckKey(key.trim()))
+                .map((key) => key.trim())
                 .filter(Boolean);
             const unknown = requested.filter((key) =>
-                !includesKey(TRIGGERABLE_CHECK_KEYS, key) &&
-                !includesKey(RETIRED_CHECK_KEYS, key));
+                !includesKey(TRIGGERABLE_CHECK_KEYS, key));
             if (unknown.length > 0) {
-                console.error(`\n  Unknown check key(s): ${unknown.join(", ")}`);
-                console.error(`  Known keys: ${TRIGGERABLE_CHECK_KEYS.join(", ")}\n`);
-                process.exit(1);
+                throw new Error(
+                    `Unknown check key(s): ${unknown.join(", ")}. Known keys: ${TRIGGERABLE_CHECK_KEYS.join(", ")}`,
+                );
             }
-            rejectUnavailable(requested);
             const special = requested.filter((key) => includesKey(NON_GATING_CHECK_KEYS, key));
             if (special.length > 0) {
                 throw new Error(
@@ -628,9 +549,9 @@ const wait = defineCommand({
             throw new Error("Use only one of --check or --checks");
         }
         const requestedKeys = args.check
-            ? [toPublicCheckKey(args.check)]
+            ? [args.check]
             : args.checks
-                ? args.checks.split(",").map((key) => toPublicCheckKey(key.trim())).filter(Boolean)
+                ? args.checks.split(",").map((key) => key.trim()).filter(Boolean)
                 : undefined;
         const client = await getClient();
         const { version } = await requireProblemVersion(client, args.id);
@@ -695,7 +616,7 @@ const show = defineCommand({
         const dynamic = await client.query(api.runDynamicChecks.getDynamicChecks, {
             versionId: version._id,
         });
-        const checkKey = toPublicCheckKey(args.check);
+        const checkKey = args.check;
         const check = getDynamicCheckEntries(dynamic).find((entry) => entry.key === checkKey);
         if (!check) throw new Error(`Check ${checkKey} has not been started on v${version.version}`);
         if (args.full) {
@@ -735,7 +656,7 @@ const finding = defineCommand({
         const dynamic = await client.query(api.runDynamicChecks.getDynamicChecks, {
             versionId: version._id,
         });
-        const checkKey = toPublicCheckKey(args.check);
+        const checkKey = args.check;
         const check = getDynamicCheckEntries(dynamic).find((entry) => entry.key === checkKey);
         if (!check) throw new Error(`Check ${checkKey} has not been started on v${version.version}`);
         const findings = extractCheckFindings(check.output);
@@ -784,7 +705,7 @@ const artifact = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
-        const checkKey = toPublicCheckKey(args.check);
+        const checkKey = args.check;
         const backendCheckKey = toBackendCheckKey(checkKey);
         const artifactKey = args.key;
         if (!artifactKey) {

@@ -68,9 +68,9 @@ export function sliceText(content: string, options: TextSliceOptions): TextSlice
   };
 }
 
-export function omitEmpty(value: unknown): unknown {
+export function omitEmpty<T>(value: T): T {
   if (Array.isArray(value)) {
-    return value.map(omitEmpty).filter((item) => item !== undefined);
+    return value.map((item) => omitEmpty(item)).filter((item) => item !== undefined) as T;
   }
   if (!value || typeof value !== "object") return value;
   const entries = Object.entries(value as Record<string, unknown>)
@@ -81,7 +81,7 @@ export function omitEmpty(value: unknown): unknown {
       if (item && typeof item === "object" && Object.keys(item).length === 0) return false;
       return true;
     });
-  return Object.fromEntries(entries);
+  return Object.fromEntries(entries) as T;
 }
 
 export function paginate<T>(items: T[], limit: number, offset: number) {

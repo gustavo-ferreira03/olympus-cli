@@ -4,19 +4,13 @@ import { printJson, printKeyValue, printTable, statusBadge, truncate } from "./f
 import { omitEmpty, paginate, parsePositiveInteger, sliceText } from "./output.ts";
 import { formatAgentType, formatRunLabel, groupRunsByBatch, normalizeAgentRuns, parseAgentTypeInput, resolveRunSelector, summarizeStatuses, } from "./model.ts";
 import type { AgentRun } from "./model.ts";
-const LEGACY_SINGLE_RUN_CONFIGS = {
+const AGENT_RUN_CONFIGS = {
     vegaVega: { taskAgentType: "claude_code", evalAgentType: "claude_code" },
     vegaOrion: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
-    vegaVega2: { taskAgentType: "claude_code", evalAgentType: "claude_code" },
-    vegaOrion2: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
-    vegaOrion3: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
     orionVega: { taskAgentType: "codex_cli", evalAgentType: "claude_code" },
     orionOrion: { taskAgentType: "codex_cli", evalAgentType: "codex_cli" },
     novaVega1: { taskAgentType: "gemini_cli", evalAgentType: "claude_code" },
-    novaVega2: { taskAgentType: "gemini_cli", evalAgentType: "claude_code" },
-    novaVega3: { taskAgentType: "gemini_cli", evalAgentType: "claude_code" },
     novaOrion1: { taskAgentType: "gemini_cli", evalAgentType: "codex_cli" },
-    novaOrion2: { taskAgentType: "gemini_cli", evalAgentType: "codex_cli" },
     castorVega1: { taskAgentType: "taiga", evalAgentType: "claude_code" },
     castorOrion1: { taskAgentType: "taiga", evalAgentType: "codex_cli" },
 };
@@ -44,8 +38,6 @@ function formatPhase(phase) {
             return "evaluation";
         case "extended":
             return "extended";
-        case "legacy":
-            return "legacy";
         default:
             return phase ?? "unknown";
     }
@@ -183,7 +175,7 @@ async function getPresetConfigs(
 }
 
 function findAgentRunKey(config: RunConfig): string | undefined {
-    return Object.entries(LEGACY_SINGLE_RUN_CONFIGS).find(([, candidate]) =>
+    return Object.entries(AGENT_RUN_CONFIGS).find(([, candidate]) =>
         candidate.taskAgentType === config.taskAgentType &&
         candidate.evalAgentType === config.evalAgentType)?.[0];
 }
@@ -192,15 +184,8 @@ function buildConfigs(args) {
     if (args.preset === "quick" || args.preset === "full") {
         throw new Error("preset configs require problem context");
     }
-    if (args.target) {
-        const config = LEGACY_SINGLE_RUN_CONFIGS[args.target];
-        if (!config) {
-            throw new Error(`Unknown rollout selector "${args.target}". Pass a legacy key or use --solver/--evaluator.`);
-        }
-        return [config];
-    }
     if (!args.solver || !args.evaluator) {
-        throw new Error("Provide --solver and --evaluator, or pass a legacy rollout key.");
+        throw new Error("Provide --solver and --evaluator, or use --preset=quick|full.");
     }
     const solver = parseAgentTypeOrExit(args.solver, "solver");
     const evaluator = parseAgentTypeOrExit(args.evaluator, "evaluator");
@@ -305,7 +290,7 @@ const presets = defineCommand({
         }
         console.log(`\n  Custom runs:`);
         console.log(`    \x1b[90molympus runs run ${args.id} --solver nova --evaluator orion --count 3\x1b[0m`);
-        console.log(`    \x1b[90molympus runs run-all ${args.id}  # alias for --preset full\x1b[0m\n`);
+        console.log(`    \x1b[90molympus runs run ${args.id} --preset full\x1b[0m\n`);
     },
 });
 const view = defineCommand({
@@ -499,11 +484,6 @@ const run = defineCommand({
     meta: { name: "runs run", description: "Trigger a rollout batch for a challenge" },
     args: {
         id: { type: "positional", description: "Challenge ID", required: true },
-        target: {
-            type: "positional",
-            description: "Optional legacy rollout key (compatibility only)",
-            required: false,
-        },
         solver: { type: "string", description: `Solver agent (${AGENT_INPUT_HELP})` },
         evaluator: { type: "string", description: `Evaluator agent (${AGENT_INPUT_HELP})` },
         count: { type: "string", description: "How many identical runs to trigger" },
@@ -523,7 +503,6 @@ const run = defineCommand({
     run: async ({ args }) => {
         const { result, version, configs } = await triggerBatch({
             problemId: args.id,
-            target: args.target,
             solver: args.solver,
             evaluator: args.evaluator,
             count: args.count,
@@ -563,61 +542,7 @@ const run = defineCommand({
         console.log(`  \x1b[90mWait: ${waitCommand}\x1b[0m\n`);
     },
 });
-const runAll = defineCommand({
-    meta: { name: "runs run-all", description: "Alias for `olympus runs run <id> --preset full`" },
-    args: {
-        id: { type: "positional", description: "Challenge ID", required: true },
-        hinted: { type: "boolean", description: "Include the version hint text" },
-        "batch-name": { type: "string", description: "Optional batch name" },
-        "use-general-tokens": {
-            type: "boolean",
-            description: "Charge general tokens instead of revision tokens",
-        },
-        wait: { type: "boolean", description: "Wait for triggered rollouts to finish" },
-        interval: { type: "string", description: "Poll interval in seconds (default 10)" },
-        timeout: { type: "string", description: "Timeout in minutes (default 120)" },
-        full: { type: "boolean", description: "Include raw results when waiting" },
-        json: { type: "boolean", description: "Output as JSON" },
-    },
-    run: async ({ args }) => {
-        const { result, version, configs } = await triggerBatch({
-            problemId: args.id,
-            preset: "full",
-            hinted: args.hinted,
-            batchName: args["batch-name"],
-            useGeneralTokens: args["use-general-tokens"],
-        });
-        const batchTag = result?.batchTag;
-        if (args.wait) {
-            await waitForRuns({
-                client: await getClient(),
-                problemId: args.id,
-                version,
-                jobId: undefined,
-                runSelector: undefined,
-                batch: batchTag,
-                includeStale: false,
-                intervalMs: parseRunWaitNumber(args.interval, 10, "--interval") * 1000,
-                timeoutMs: parseRunWaitNumber(args.timeout, 120, "--timeout") * 60 * 1000,
-                json: Boolean(args.json),
-                full: Boolean(args.full),
-            });
-            return;
-        }
-        const waitCommand = batchTag
-            ? `olympus runs wait ${args.id} --batch=${batchTag} --json`
-            : `olympus runs wait ${args.id} --json`;
-        if (args.json) {
-            printJson({ result, triggered: configs, preset: "full", waitCommand });
-            return;
-        }
-        console.log(`\n  Triggered preset full (${configs.length} runs) on v${version.version}`);
-        for (const summary of summarizeConfigMix(configs)) {
-            console.log(`    ${summary}`);
-        }
-        console.log(`  \x1b[90mWait: ${waitCommand}\x1b[0m\n`);
-    },
-});
+
 type RunWaitSummary = {
     id: string;
     jobId?: string;
@@ -1059,7 +984,6 @@ export default defineCommand({
         show,
         presets,
         run,
-        "run-all": runAll,
         wait,
         cancel,
         scratch,
