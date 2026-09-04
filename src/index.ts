@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { defineCommand, runCommand, runMain } from "citty";
+import { defineCommand, runCommand, runMain, showUsage } from "citty";
 import auth from "./commands/auth.ts";
 import checks from "./commands/checks.ts";
 import problems from "./commands/problems.ts";
@@ -45,6 +45,7 @@ const main = defineCommand({
         version,
         description: "Olympus CLI — Gustavo's Fork",
     },
+    default: "help",
     subCommands: {
         auth,
         problems,
@@ -68,6 +69,12 @@ const main = defineCommand({
                     throw new Error("Problems view command is unavailable.");
                 }
                 await sub.run?.(ctx);
+            },
+        }),
+        help: defineCommand({
+            meta: { name: "help", description: "Show the main command overview" },
+            run: async () => {
+                await showUsage(main);
             },
         }),
     },

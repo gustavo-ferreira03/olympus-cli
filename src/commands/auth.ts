@@ -56,7 +56,7 @@ const logout = defineCommand({
     },
 });
 const status = defineCommand({
-    meta: { name: "auth status", description: "Show current auth status" },
+    meta: { name: "auth status", alias: "whoami", description: "Show current auth status" },
     args: {
         json: { type: "boolean", description: "Output as JSON" },
     },
@@ -96,5 +96,6 @@ const status = defineCommand({
 });
 export default defineCommand({
     meta: { name: "auth", description: "Authentication" },
+    default: "status",
     subCommands: { login, logout, status },
 });
