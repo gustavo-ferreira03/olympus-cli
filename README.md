@@ -4,17 +4,6 @@ A maintained TypeScript CLI for Project Olympus on Shipd.
 
 Use it to inspect and edit challenges, run prechecks and quality checks, manage Docker-backed verification, review rollouts, handle later-stage audits, and automate long-running operations without external polling scripts.
 
-## Highlights
-
-- Current Olympus check and workflow APIs.
-- Maintainable TypeScript sources with `.ts` relative imports.
-- Compact, structured output designed for LLM agents.
-- Integrated `--wait --json` for checks, reviews, and rollouts.
-- Progressive disclosure through `view`, `show`, and `finding` commands.
-- Native filtering, pagination, and artifact slicing.
-- Current public quality-check name: `testQuality`.
-- Stale rollout history excluded by default.
-
 ## Install from source
 
 ```bash
