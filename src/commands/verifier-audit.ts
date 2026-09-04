@@ -1,5 +1,6 @@
 import { defineCommand } from "citty";
 import { api } from "../convex.ts";
+import { parseWaitNumber, waitForChecks } from "./checks.ts";
 import { printJson } from "../format.ts";
 import { normalizeDynamicChecks } from "../model.ts";
 import {
@@ -53,9 +54,13 @@ const run = defineCommand({
       type: "boolean",
       description: "Charge general tokens instead of revision tokens",
     },
+    wait: { type: "boolean", description: "Wait for the verifier audit to finish" },
+    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    timeout: { type: "string", description: "Timeout in minutes (default 45)" },
+    full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const { client, version, versionId, versionNumber } = await resolveCommandContext(args);
+    const { client, problemId, version, versionId, versionNumber } = await resolveCommandContext(args);
     const [dynamic, isAdmin] = await Promise.all([
       client.query(api.runDynamicChecks.getDynamicChecks, { versionId }),
       client.query(api.admins.isCurrentUser, {}),
@@ -75,13 +80,31 @@ const run = defineCommand({
     if (!isAdmin && !solutionPassed) {
       throw new Error("Verifier audit requires a fresh passing Verify Solution check");
     }
-    const result = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
+    const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
       versionId,
       checkKey: "verifierIncompleteness",
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
-    if (args.json) return printJson(result);
-    console.log(`\n  Verifier completeness audit triggered on v${versionNumber}.\n`);
+    if (args.wait) {
+      await waitForChecks({
+        client,
+        problemId,
+        version,
+        jobId: result?.jobId,
+        requestedKeys: result?.jobId ? undefined : ["verifierIncompleteness"],
+        intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
+        timeoutMs: parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000,
+        json: Boolean(args.json),
+        full: Boolean(args.full),
+      });
+      return;
+    }
+    const waitCommand = result?.jobId
+      ? `olympus checks wait ${problemId} --job=${result.jobId} --json`
+      : `olympus checks wait ${problemId} --check=verifierIncompleteness --json`;
+    if (args.json) return printJson({ ...result, waitCommand });
+    console.log(`\n  Verifier completeness audit triggered on v${versionNumber}.`);
+    console.log(`  Wait: ${waitCommand}\n`);
   },
 });
 

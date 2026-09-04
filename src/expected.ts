@@ -11,7 +11,7 @@ export const GATING_CHECK_KEYS = [
   "verifyTests",
   "verifySolution",
   "verifyFlakiness",
-  "verifyFairness",
+  "testQuality",
   "taskQuality",
   "solutionQuality",
   "descriptionQuality",
@@ -35,9 +35,20 @@ export const TRIGGERABLE_CHECK_KEYS = [
   ...NON_GATING_CHECK_KEYS,
 ] as const;
 
+/** Map public CLI names to the backend's stored/trigger keys. */
+export function toBackendCheckKey(key: string): string {
+  return key === "testQuality" ? "verifyFairness" : key;
+}
+
+/** Normalize stored legacy keys to current public CLI names. */
+export function toPublicCheckKey(key: string): string {
+  return key === "verifyFairness" ? "testQuality" : key;
+}
+
 /** Every key that may need a label when rendering stored payloads. */
 export const RENDERABLE_CHECK_KEYS = [
   ...TRIGGERABLE_CHECK_KEYS,
+  "verifyFairness",
   ...RETIRED_CHECK_KEYS,
 ] as const;
 

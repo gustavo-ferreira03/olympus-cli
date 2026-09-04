@@ -21,7 +21,10 @@ function requireNote(note: string): string {
 
 const view = defineCommand({
   meta: { name: "contest view", description: "View contest state for quality checks" },
-  args: commonArgs,
+  args: {
+    ...commonArgs,
+    full: { type: "boolean", description: "Include complete raw contest payloads" },
+  },
   run: async ({ args }) => {
     const { client, problemId, versionId } = await resolveCommandContext(args);
     const [dynamicChecks, description, taskQuality] = await Promise.all([
@@ -32,7 +35,29 @@ const view = defineCommand({
       }),
       client.query(api.taskQualityContest.getTaskQualityContestStatus, { problemId }),
     ]);
-    printResult({ dynamicChecks, description, taskQuality }, args.json);
+    if (args.full) {
+      printResult({ dynamicChecks, description, taskQuality }, args.json);
+      return;
+    }
+    const dynamic: any = dynamicChecks ?? {};
+    printResult(
+      {
+        descriptionQuality: {
+          contested: Boolean(dynamic._descriptionQualityContested),
+          ...description,
+        },
+        testQuality: {
+          contested: Boolean(dynamic._verifyFairnessContested),
+          note: dynamic._verifyFairnessContestNote ?? undefined,
+        },
+        solutionQuality: {
+          contested: Boolean(dynamic._solutionQualityContested),
+          note: dynamic._solutionQualityContestNote ?? undefined,
+        },
+        taskQuality,
+      },
+      args.json,
+    );
   },
 });
 
@@ -49,8 +74,8 @@ const description = defineCommand({
   },
 });
 
-const fairness = defineCommand({
-  meta: { name: "contest fairness", description: "Contest Test Quality / Verify Fairness" },
+const testQuality = defineCommand({
+  meta: { name: "contest test-quality", description: "Contest Test Quality" },
   args: noteArgs("Why the flagged tests are fair"),
   run: async ({ args }) => {
     const { client, problemId, versionId } = await resolveCommandContext(args);
@@ -113,5 +138,5 @@ const taskAsMars = defineCommand({
 
 export default defineCommand({
   meta: { name: "contest", description: "Contest quality-check verdicts" },
-  subCommands: { view, description, fairness, solution, "task-as-mars": taskAsMars },
+  subCommands: { view, description, "test-quality": testQuality, solution, "task-as-mars": taskAsMars },
 });

@@ -1,5 +1,6 @@
 import { defineCommand } from "citty";
 import { api } from "../convex.ts";
+import { parseWaitNumber, waitForChecks } from "./checks.ts";
 import { printJson } from "../format.ts";
 import {
   commonArgs,
@@ -31,9 +32,13 @@ const run = defineCommand({
       type: "boolean",
       description: "Charge general tokens instead of revision tokens",
     },
+    wait: { type: "boolean", description: "Wait for Auto Review to finish" },
+    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    timeout: { type: "string", description: "Timeout in minutes (default 30)" },
+    full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const { client, versionId, versionNumber } = await resolveCommandContext(args);
+    const { client, problemId, version, versionId, versionNumber } = await resolveCommandContext(args);
     const state: any = await client.query(
       api.runDynamicChecks.getAutoReviewTriggerState,
       { versionId },
@@ -44,13 +49,31 @@ const run = defineCommand({
         .filter(Boolean);
       throw new Error(`Auto Review is blocked: ${reasons.join("; ") || "unknown reason"}`);
     }
-    const result = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
+    const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
       versionId,
       checkKey: "autoReview",
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
-    if (args.json) return printJson(result);
-    console.log(`\n  Auto Review triggered on v${versionNumber}.\n`);
+    if (args.wait) {
+      await waitForChecks({
+        client,
+        problemId,
+        version,
+        jobId: result?.jobId,
+        requestedKeys: result?.jobId ? undefined : ["autoReview"],
+        intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
+        timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+        json: Boolean(args.json),
+        full: Boolean(args.full),
+      });
+      return;
+    }
+    const waitCommand = result?.jobId
+      ? `olympus checks wait ${problemId} --job=${result.jobId} --json`
+      : `olympus checks wait ${problemId} --check=autoReview --json`;
+    if (args.json) return printJson({ ...result, waitCommand });
+    console.log(`\n  Auto Review triggered on v${versionNumber}.`);
+    console.log(`  Wait: ${waitCommand}\n`);
   },
 });
 

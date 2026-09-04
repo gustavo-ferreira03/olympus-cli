@@ -1,3 +1,5 @@
+import { toPublicCheckKey } from "./expected.ts";
+
 export type SubmissionReadiness = {
   criteria: Array<{
     id: string;
@@ -70,7 +72,7 @@ export const DYNAMIC_CHECK_ORDER = [
     "verifySolution",
     "verifyFlakiness",
     // Review checks
-    "verifyFairness",
+    "testQuality",
     "taskQuality",
     "solutionQuality",
     "descriptionQuality",
@@ -87,7 +89,8 @@ const DYNAMIC_CHECK_LABELS: Record<string, string> = {
     verifyTests: "Verify Tests",
     verifySolution: "Verify Solution",
     verifyFlakiness: "Verify Flakiness",
-    verifyFairness: "Verify Fairness",
+    testQuality: "Test Quality",
+    verifyFairness: "Test Quality",
     taskQuality: "Task Quality",
     solutionQuality: "Solution Quality",
     descriptionQuality: "Description Quality",
@@ -103,7 +106,7 @@ const DYNAMIC_CHECK_LABELS: Record<string, string> = {
 export const CONTESTABLE_CHECK_KEYS = [
     "descriptionQuality",
     "solutionQuality",
-    "verifyFairness",
+    "testQuality",
 ];
 export const AGENT_TYPE_LABELS: Record<string, string> = {
     claude_code: "Vega",
@@ -164,19 +167,19 @@ export function getDynamicCheckEntries(dynamicChecks: unknown): DynamicCheckEntr
         ? dynamicChecks as Record<string, unknown>
         : {};
     const contestedFor = (key: string): boolean | undefined => {
-        if (!CONTESTABLE_CHECK_KEYS.includes(key))
+        if (!CONTESTABLE_CHECK_KEYS.includes(toPublicCheckKey(key)))
             return undefined;
         return payload[`_${key}Contested`] ? true : undefined;
     };
     const contestNoteFor = (key: string): string | undefined => {
-        if (!CONTESTABLE_CHECK_KEYS.includes(key))
+        if (!CONTESTABLE_CHECK_KEYS.includes(toPublicCheckKey(key)))
             return undefined;
         const note = payload[`_${key}ContestNote`];
         return typeof note === "string" && note.trim() ? note : undefined;
     };
     return Object.entries(record)
         .map(([key, value]) => ({
-        key,
+        key: toPublicCheckKey(key),
         ...value,
         contested: contestedFor(key),
         contestNote: contestNoteFor(key),

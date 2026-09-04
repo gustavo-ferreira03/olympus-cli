@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { defineCommand } from "citty";
 import { api, asId, getClient, parseVersionNumber, requireProblemVersion, resolveProblemVersion } from "../convex.ts";
 import { printJson, printKeyValue, printTable, statusBadge, truncate } from "../format.ts";
+import { omitEmpty } from "../output.ts";
 import { formatDynamicCheckLabel, formatRunLabel, getDynamicCheckEntries, groupRunsByBatch, normalizeAgentRuns, } from "../model.ts";
 const DEFAULT_LIMIT = 30;
 function printReadiness(readiness) {
@@ -311,7 +312,9 @@ const view = defineCommand({
     meta: { name: "problems view", description: "View challenge details" },
     args: {
         id: { type: "positional", description: "Challenge ID", required: true },
-        json: { type: "boolean", description: "Output as JSON" },
+        fields: { type: "string", description: "Compact fields: metadata,artifacts,readiness,description" },
+        full: { type: "boolean", description: "Include complete checks, runs, reviews, and version payload" },
+        json: { type: "boolean", description: "Output compact JSON" },
     },
     run: async ({ args }) => {
         const client = await getClient();
@@ -323,6 +326,72 @@ const view = defineCommand({
             process.exit(1);
         }
         const latestVersion = data.latestVersion;
+        if (args.json && !args.full) {
+            const requested = new Set(
+                (args.fields ?? "metadata,artifacts,readiness")
+                    .split(",")
+                    .map((field) => field.trim())
+                    .filter(Boolean),
+            );
+            const allowed = new Set(["metadata", "artifacts", "readiness", "description"]);
+            const unknown = [...requested].filter((field) => !allowed.has(field));
+            if (unknown.length) throw new Error(`Unknown --fields: ${unknown.join(", ")}`);
+            const readiness = requested.has("readiness")
+                ? await client.query(api.submissionReadiness.getSubmissionReadiness, {
+                    problemId: asId(args.id),
+                }).catch(() => null)
+                : null;
+            const result: Record<string, unknown> = {
+                id: String(data._id),
+                title: data.title,
+                status: data.status,
+                version: latestVersion?.version,
+            };
+            if (requested.has("metadata")) {
+                result.metadata = omitEmpty({
+                    locked: latestVersion?.isLocked,
+                    reviewState: latestVersion?.reviewState,
+                    language: latestVersion?.language ?? data.language,
+                    difficulty: latestVersion?.difficulty ?? data.difficulty,
+                    category: latestVersion?.category ?? data.category,
+                    repository: latestVersion?.githubRepoUrl,
+                    commit: latestVersion?.githubCommitHash,
+                });
+            }
+            if (requested.has("artifacts")) {
+                result.artifacts = {
+                    description: Boolean(latestVersion?.description),
+                    testPatch: Boolean(latestVersion?.testPatch),
+                    solutionPatch: Boolean(latestVersion?.solutionPatch),
+                    dockerfile: Boolean(latestVersion?.dockerfile),
+                    hint: Boolean(latestVersion?.hintText),
+                    solutionApproach: Boolean(latestVersion?.solutionApproach),
+                };
+            }
+            if (requested.has("description")) result.description = latestVersion?.description;
+            if (requested.has("readiness")) {
+                result.readiness = omitEmpty({
+                    canSubmit: readiness?.canSubmit,
+                    bypassed: readiness?.isBypassed,
+                    blockers: readiness?.criteria
+                        ?.filter((criterion: any) => !["pass", "warn"].includes(criterion.status))
+                        .map((criterion: any) => ({
+                            id: criterion.id,
+                            label: criterion.label,
+                            status: criterion.status,
+                            detail: criterion.detail,
+                            stale: criterion.stale,
+                        })),
+                });
+            }
+            result.nextCommands = {
+                checks: `olympus checks view ${args.id} --json`,
+                runs: `olympus runs view ${args.id} --json`,
+                full: `olympus problems view ${args.id} --json --full`,
+            };
+            printJson(omitEmpty(result));
+            return;
+        }
         const [stages, dynamicChecks, runs, criteria, readiness, reviews] = latestVersion
             ? await Promise.all([
                 client.query(api.stages.getByVersion, { versionId: latestVersion._id }).catch(() => []),

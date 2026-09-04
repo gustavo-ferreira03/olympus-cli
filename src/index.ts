@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { defineCommand, runMain } from "citty";
+import { defineCommand, runCommand, runMain } from "citty";
 import auth from "./commands/auth.ts";
 import checks from "./commands/checks.ts";
 import problems from "./commands/problems.ts";
@@ -74,4 +74,35 @@ const main = defineCommand({
 });
 // Non-blocking min version check
 void checkVersion();
-runMain(main);
+
+function errorMessage(error: unknown): string {
+    if (error && typeof error === "object" && "data" in error) {
+        const data = (error as { data?: unknown }).data;
+        if (typeof data === "string" && data.trim()) return data.trim();
+    }
+    if (error instanceof Error && error.message.trim()) return error.message.trim();
+    return String(error);
+}
+
+const rawArgs = process.argv.slice(2);
+const usesBuiltinOutput = rawArgs.some((arg) => arg === "--help" || arg === "-h") ||
+    (rawArgs.length === 1 && (rawArgs[0] === "--version" || rawArgs[0] === "-v"));
+
+if (usesBuiltinOutput) {
+    await runMain(main, { rawArgs });
+}
+else {
+    try {
+        await runCommand(main, { rawArgs });
+    }
+    catch (error) {
+        const message = errorMessage(error);
+        if (rawArgs.includes("--json")) {
+            console.log(JSON.stringify({ status: "error", error: message }, null, 2));
+        }
+        else {
+            console.error(`Error: ${message}`);
+        }
+        process.exitCode = 1;
+    }
+}
