@@ -1,10 +1,28 @@
-# Olympus CLI — Gustavo's Fork
+# Olympus CLI _(Gustavo's Fork)_
 
-A maintained TypeScript CLI for Project Olympus on Shipd.
+A maintained TypeScript CLI for Project Olympus on Shipd, based on the [@shipd-ai/olympus-cli npm package](https://www.npmjs.com/package/@shipd-ai/olympus-cli).
 
 Use it to inspect and edit challenges, run prechecks and quality checks, manage Docker-backed verification, review rollouts, handle later-stage audits, and automate long-running operations without external polling scripts.
 
-## Install from source
+## Contents
+
+- [Installation](#installation)
+- [Get started](#get-started)
+- [Command overview](#command-overview)
+- [Inspect a challenge](#inspect-a-challenge)
+- [Build the version image](#build-the-version-image)
+- [Prechecks and quality checks](#prechecks-and-quality-checks)
+- [Scope Gate and later-stage reviews](#scope-gate-and-later-stage-reviews)
+- [Rollouts](#rollouts)
+- [Artifact output without external tools](#artifact-output-without-external-tools)
+- [JSON behavior for agents](#json-behavior-for-agents)
+- [Download a challenge locally](#download-a-challenge-locally)
+- [Create, edit, and version drafts](#create-edit-and-version-drafts)
+- [Guardrails](#guardrails)
+- [Environment](#environment)
+- [Development](#development)
+
+## Installation
 
 ```bash
 git clone https://github.com/gustavo-ferreira03/olympus-cli.git
@@ -56,42 +74,10 @@ olympus auto-review      Auto Review inspection and execution
 olympus contest          Quality-check contests
 olympus runs             Rollout batches, runs, artifacts, and re-evaluation
 olympus tokens           Token balance, usage history, and challenge costs
-olympus policy           Local rollout and spending guardrails
+olympus policy           Local guardrails
 ```
 
 Run `olympus <command> --help` for the exact arguments accepted by a command.
-
-## Local spending policy
-
-`olympus policy show --json` shows and validates the effective policy without authentication.
-`olympus policy init` creates `~/.shipd/olympus/policy.yaml` without overwriting it.
-Edit that file to configure the rules; omitted fields use these defaults, also active when the file is absent:
-
-```yaml
-version: 1 # Policy format version
-
-runs:
-  allowed_solvers: [nova] # Restrict solvers after resolving presets
-  max_new_runs_per_version: 10 # Cap new runs using existing version records
-  allow_manual_batch_name: false # Reject explicit batch names
-
-tokens:
-  allow_general_tokens: false # Reject explicit use of general tokens
-```
-
-- Solver aliases: `vega`, `orion`, `nova`, `castor`. Evaluators are unrestricted.
-- Quick, full and explicit batches share the same rules after preset expansion.
-- The limit checks existing version records plus requested new runs. It includes queued,
-  failed, stale and scratched records and deduplicates by run ID. A new version starts a new scope.
-  Re-evaluation itself is not capped; because the API does not expose reliable solution lineage,
-  any re-evaluation records returned by it also count conservatively when requesting **new** runs.
-- Zero prohibits new runs. This is a cap, not an instruction to fill a batch to ten.
-- General-token protection rejects explicit `--use-general-tokens` requests across spending
-  commands. It does not guarantee the backend will never automatically charge general tokens.
-- Invalid or unreadable policies block spending, not read-only inspection. Missing or malformed
-  run state is not treated as zero runs. JSON failures include `status: "blocked"` and `rule`.
-- No cache, local operation history, automatic retry, or `--yes` policy bypass is added.
-  Separate CLI processes or the web UI can race the check; this is not an atomic server quota.
 
 ## Inspect a challenge
 
@@ -414,6 +400,44 @@ Submission remains explicit:
 
 ```bash
 olympus problems submit <challenge-id> --json
+```
+
+## Guardrails
+
+`olympus policy show --json` shows and validates the guardrails.
+`olympus policy init` creates `~/.shipd/olympus/policy.yml` without overwriting it.
+`policy init` also creates `policy.schema.json` beside the `.yml` file. The
+`# yaml-language-server: $schema=./policy.schema.json` directive enables autocomplete
+and validation in editors with YAML Language Server support (such as VS Code with
+the Red Hat YAML extension).
+
+Edit that file to configure the rules; omitted fields use these defaults, also active when the file is absent:
+
+```yaml
+# yaml-language-server: $schema=./policy.schema.json
+runs:
+  max_runs: {nova: 10, vega: 0, orion: 0, castor: 0} # Maximum current original runs per model
+  allow_full_preset: false # Allow the full rollout preset
+  allow_manual_batch_name: false # Allow explicit batch names
+  allow_contests: false # Allow run contests
+  re_evaluation:
+    enabled: true # Allow re-evaluating existing solutions
+    max_attempts: 1 # Maximum attempts per solution set across challenge versions
+
+tokens:
+  allow_general_tokens: false # Allow explicit use of general tokens
+  max_operation_fraction: null # Maximum request cost divided by reported balance
+  min_remaining_balance: null # Minimum reported balance after request cost
+
+checks:
+  allowed: [verifyTests, verifySolution, verifyFlakiness, testQuality, taskQuality, solutionQuality, descriptionQuality, autoReview, verifierIncompleteness] # Allowed dynamic checks
+  require_explicit_selection: true # Require explicit check selection
+  max_checks_per_request: 3 # Maximum distinct checks submitted together
+  max_active: 3 # Maximum active dynamic checks per challenge
+  allow_contests: false # Allow check contests
+
+auto_review:
+  allow_force_refresh: false # Allow forced reruns of all review dimensions
 ```
 
 ## Environment
