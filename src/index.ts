@@ -12,6 +12,7 @@ import fpCheck from "./commands/fp-check.ts";
 import image from "./commands/image.ts";
 import scopeGate from "./commands/scope-gate.ts";
 import verifierAudit from "./commands/verifier-audit.ts";
+import tokens from "./commands/tokens.ts";
 import { checkVersion, UPDATE_PACKAGE_NAME } from "./config.ts";
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
@@ -58,6 +59,7 @@ const main = defineCommand({
         "auto-review": autoReview,
         contest,
         runs,
+        tokens,
         update,
         view: defineCommand({
             meta: { name: "view", description: "Shortcut for `olympus problems view <id>`" },

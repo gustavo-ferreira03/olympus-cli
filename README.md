@@ -55,6 +55,7 @@ olympus verifier-audit   Verifier Completeness Audit and decisions
 olympus auto-review      Auto Review inspection and execution
 olympus contest          Quality-check contests
 olympus runs             Rollout batches, runs, artifacts, and re-evaluation
+olympus tokens           Token balance, usage history, and challenge costs
 ```
 
 Run `olympus <command> --help` for the exact arguments accepted by a command.
