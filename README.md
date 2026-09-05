@@ -419,6 +419,7 @@ runs:
   max_runs: {nova: 10, vega: 0, orion: 0, castor: 0} # Maximum current original runs per model
   allow_full_preset: false # Allow the full rollout preset
   allow_manual_batch_name: false # Allow explicit batch names
+  allow_cancellations: false # Allow run cancellations
   allow_contests: false # Allow run contests
   re_evaluation:
     enabled: true # Allow re-evaluating existing solutions

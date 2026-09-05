@@ -809,6 +809,7 @@ const cancel = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
+        assertPaidEndpoint("runAgentRuns:cancelRun", {});
         const client = await getClient();
         const selected = await resolveSelectedRun(client, args.id, args.run);
         const result = await client.mutation(api.runAgentRuns.cancelRun, {

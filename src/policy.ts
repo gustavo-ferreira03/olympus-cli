@@ -12,6 +12,7 @@ export interface Policy {
     max_runs: Partial<Record<"nova" | "vega" | "orion" | "castor", number | null>>;
     allow_full_preset: boolean;
     allow_manual_batch_name: boolean;
+    allow_cancellations: boolean;
     allow_contests: boolean;
     re_evaluation: { enabled: boolean; max_attempts: number | null };
   };
@@ -35,6 +36,7 @@ runs:
   max_runs: {nova: 10, vega: 0, orion: 0, castor: 0} # Maximum current original runs per model
   allow_full_preset: false # Allow the full rollout preset
   allow_manual_batch_name: false # Allow explicit batch names
+  allow_cancellations: false # Allow run cancellations
   allow_contests: false # Allow run contests
   re_evaluation:
     enabled: true # Allow re-evaluating existing solutions
@@ -103,6 +105,7 @@ export function parsePolicy(text: string): Policy {
       "max_runs",
       "allow_full_preset",
       "allow_manual_batch_name",
+      "allow_cancellations",
       "allow_contests",
       "re_evaluation",
     ]);
@@ -127,6 +130,7 @@ export function parsePolicy(text: string): Policy {
         max_runs: value(runs, "max_runs", {nova: 10, vega: 0, orion: 0, castor: 0}),
         allow_full_preset: value(runs, "allow_full_preset", false),
         allow_manual_batch_name: value(runs, "allow_manual_batch_name", false),
+        allow_cancellations: value(runs, "allow_cancellations", false),
         allow_contests: value(runs, "allow_contests", false),
         re_evaluation: { enabled: value(reeval, "enabled", true), max_attempts: value(reeval, "max_attempts", 1) },
       },
@@ -199,6 +203,7 @@ export function parsePolicy(text: string): Policy {
       );
     for (const [key, v] of Object.entries({
       "runs.allow_manual_batch_name": result.runs.allow_manual_batch_name,
+      "runs.allow_cancellations": result.runs.allow_cancellations,
       "runs.allow_full_preset": result.runs.allow_full_preset,
       "tokens.allow_general_tokens": result.tokens.allow_general_tokens,
       "checks.require_explicit_selection":
@@ -352,7 +357,7 @@ export function isPolicyEndpoint(
   name: string,
   args: Record<string, unknown>,
 ): boolean {
-  return name === "runAgentRuns:scratchRun" || paidEndpoints.has(name) || Object.hasOwn(args, "useGeneralTokens");
+  return name === "runAgentRuns:cancelRun" || name === "runAgentRuns:scratchRun" || paidEndpoints.has(name) || Object.hasOwn(args, "useGeneralTokens");
 }
 
 export function assertRunPreset(preset: unknown, policy = loadPolicy()): void {
@@ -429,6 +434,8 @@ export function assertPaidEndpoint(
   if (!isPolicyEndpoint(name, args)) return;
   const effective = policy ?? loadPolicy();
   assertTokenPolicy(args, effective);
+  if (name === "runAgentRuns:cancelRun" && !effective.runs.allow_cancellations)
+    throw new PolicyError("runs.allow_cancellations", "Run cancellations are disabled by guardrails");
   if (name === "runAgentRuns:scratchRun" && args.scratched !== false && !effective.runs.allow_contests)
     throw new PolicyError("runs.allow_contests", "Run contests are disabled by policy");
   if (contestEndpoints.has(name) && !effective.checks.allow_contests)
@@ -517,7 +524,7 @@ export async function assertOperationCost(
   client: Reader, name: string, args: Record<string, any>, policy?: Policy,
 ): Promise<void> {
   // Scratching/restoring a run changes metadata, not token spending.
-  if (name === "runAgentRuns:scratchRun" || !isPolicyEndpoint(name, args)) return;
+  if (name === "runAgentRuns:cancelRun" || name === "runAgentRuns:scratchRun" || !isPolicyEndpoint(name, args)) return;
   const effective = policy ?? loadPolicy();
   const { max_operation_fraction: fraction, min_remaining_balance: reserve } = effective.tokens;
   if (fraction === null && reserve === null) return;
