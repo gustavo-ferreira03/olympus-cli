@@ -130,7 +130,11 @@ function orderIndex(order: readonly string[], value: string): number {
 export function parseAgentTypeInput(value: string | undefined): string | undefined {
     if (!value)
         return undefined;
-    return AGENT_TYPE_ALIASES[value.trim().toLowerCase()];
+    const key = value.trim().toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(AGENT_TYPE_ALIASES, key))
+        return undefined;
+    const alias = AGENT_TYPE_ALIASES[key];
+    return typeof alias === "string" ? alias : undefined;
 }
 export function canonicalizeRunLabel(label: string | undefined): string {
     if (!label)
