@@ -1,4 +1,5 @@
 import { defineCommand } from "citty";
+import { assertCheckCapacity, assertPaidEndpoint } from "../policy.ts";
 import { api } from "../convex.ts";
 import { parseWaitNumber } from "./checks.ts";
 import { printJson } from "../format.ts";
@@ -256,6 +257,7 @@ const run = defineCommand({
         `Auto Review is blocked: ${reasons.join("; ") || "unknown reason"}`,
       );
     }
+    await assertCheckCapacity(client, problemId, versionId, ["autoReview"]);
     const result: any = await client.action(
       api.runDynamicChecks.triggerDynamicCheck,
       {
@@ -300,13 +302,15 @@ const orchestrate = defineCommand({
     },
   },
   run: async ({ args }) => {
-    const { client, versionId } = await resolveCommandContext(args);
+    assertPaidEndpoint("orchestratorReview:triggerOrchestratorReview", { forceFresh: Boolean(args["force-fresh"]) });
+    const { client, problemId, versionId } = await resolveCommandContext(args);
     const isAdmin = await client.query(api.admins.isCurrentUser, {});
     if (!isAdmin) {
       throw new Error(
         "Auto Review orchestration is restricted to admins in the UI",
       );
     }
+    await assertCheckCapacity(client, problemId, versionId, ["autoReview"]);
     const result = await client.action(
       api.orchestratorReview.triggerOrchestratorReview,
       { versionId, forceFresh: Boolean(args["force-fresh"]) },

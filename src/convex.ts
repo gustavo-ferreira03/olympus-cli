@@ -1,6 +1,6 @@
 import { ConvexHttpClient } from "convex/browser";
 import { anyApi, getFunctionName } from "convex/server";
-import { assertPaidEndpoint } from "./policy.ts";
+import { assertPaidEndpoint, assertOperationCost } from "./policy.ts";
 import { requireAuth } from "./auth.ts";
 import { getConvexUrl } from "./config.ts";
 
@@ -22,6 +22,7 @@ export async function getClient(): Promise<ConvexHttpClient> {
     const invoke = client[method].bind(client);
     Object.defineProperty(client, method, { value: async (reference: any, args: any = {}, ...options: any[]) => {
       assertPaidEndpoint(getFunctionName(reference), args);
+      await assertOperationCost(client, getFunctionName(reference), args);
       return (invoke as any)(reference, args, ...options);
     } });
   }

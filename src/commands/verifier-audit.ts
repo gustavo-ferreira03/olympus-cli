@@ -1,4 +1,5 @@
 import { defineCommand } from "citty";
+import { assertCheckCapacity } from "../policy.ts";
 import { api } from "../convex.ts";
 import { parseWaitNumber, waitForChecks } from "./checks.ts";
 import { printJson } from "../format.ts";
@@ -80,6 +81,7 @@ const run = defineCommand({
     if (!isAdmin && !solutionPassed) {
       throw new Error("Verifier audit requires a fresh passing Verify Solution check");
     }
+    await assertCheckCapacity(client, problemId, versionId, ["verifierIncompleteness"]);
     const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
       versionId,
       checkKey: "verifierIncompleteness",

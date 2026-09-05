@@ -1,4 +1,5 @@
 import { defineCommand } from "citty";
+import { assertCheckCapacity, assertCheckSelection, assertPaidEndpoint, assertTokenPolicy } from "../policy.ts";
 import { api, asId, getClient, requireProblemVersion } from "../convex.ts";
 import {
     GATING_CHECK_KEYS,
@@ -6,6 +7,7 @@ import {
     PRECHECK_STAGE_IDS,
     TRIGGERABLE_CHECK_KEYS,
     toBackendCheckKey,
+    toPublicCheckKey,
 } from "../expected.ts";
 import { printJson, statusBadge, truncate } from "../format.ts";
 import { omitEmpty, paginate, parsePositiveInteger, sliceText } from "../output.ts";
@@ -250,7 +252,7 @@ const run = defineCommand({
                 process.exit(1);
             return;
         }
-        const checkKey = args.check;
+        const checkKey = toPublicCheckKey(args.check);
         if (includesKey(NON_GATING_CHECK_KEYS, checkKey)) {
             const command = checkKey === "autoReview"
                 ? "olympus auto-review run"
@@ -264,6 +266,8 @@ const run = defineCommand({
         }
         const client = await getClient();
         const { version } = await requireProblemVersion(client, args.id);
+        assertPaidEndpoint("runDynamicChecks:triggerDynamicCheck", { checkKey, useGeneralTokens: args["use-general-tokens"] });
+        await assertCheckCapacity(client, args.id, version._id, [checkKey]);
         const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
             versionId: version._id,
             checkKey: toBackendCheckKey(checkKey),
@@ -313,11 +317,12 @@ const runAll = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
+        assertTokenPolicy({ useGeneralTokens: args["use-general-tokens"] });
         let checkKeys: string[] = [...DEFAULT_RUN_ALL_CHECK_KEYS];
-        if (args.checks) {
+        if (args.checks !== undefined) {
             const requested = args.checks
                 .split(",")
-                .map((key) => key.trim())
+                .map((key) => toPublicCheckKey(key.trim()))
                 .filter(Boolean);
             const unknown = requested.filter((key) =>
                 !includesKey(TRIGGERABLE_CHECK_KEYS, key));
@@ -336,10 +341,12 @@ const runAll = defineCommand({
                 console.error("\n  --checks was empty.\n");
                 process.exit(1);
             }
-            checkKeys = requested;
+            checkKeys = [...new Set(requested)];
         }
+        assertCheckSelection(checkKeys, args.checks !== undefined);
         const client = await getClient();
         const { version } = await requireProblemVersion(client, args.id);
+        await assertCheckCapacity(client, args.id, version._id, checkKeys);
         const result: any = await client.action(api.runDynamicChecks.triggerAllDynamicChecks, {
             versionId: version._id,
             checkKeys: checkKeys.map(toBackendCheckKey),

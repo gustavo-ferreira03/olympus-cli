@@ -1,10 +1,10 @@
 import { defineCommand } from "citty";
+import { assertRemoteReevaluationAttempts, inspectReevaluationHistory, assertRunCount, assertPaidEndpoint, assertRunCapacity, assertRunPreset, assertRunRequest, assertTokenPolicy, loadPolicy } from "./policy.ts";
 import { api, getClient, requireProblemVersion } from "./convex.ts";
 import { printJson, printKeyValue, printTable, statusBadge, truncate } from "./format.ts";
 import { omitEmpty, paginate, parsePositiveInteger, sliceText } from "./output.ts";
 import { formatAgentType, formatRunLabel, groupRunsByBatch, normalizeAgentRuns, parseAgentTypeInput, resolveRunSelector, summarizeStatuses, } from "./model.ts";
 import type { AgentRun } from "./model.ts";
-import { assertRunCapacity, assertRunRequest, assertTokenPolicy, loadPolicy, PolicyError } from "./policy.ts";
 const AGENT_RUN_CONFIGS = {
     vegaVega: { taskAgentType: "claude_code", evalAgentType: "claude_code" },
     vegaOrion: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
@@ -192,8 +192,7 @@ function buildConfigs(args) {
     const evaluator = parseAgentTypeOrExit(args.evaluator, "evaluator");
     const count = args.count === undefined ? 1 : Number(args.count);
     if (!Number.isSafeInteger(count) || count < 1) throw new Error("--count must be a positive integer");
-    const limit = loadPolicy().runs.max_new_runs_per_version;
-    if (count > limit) throw new PolicyError("runs.max_new_runs_per_version", "Requested runs exceed the version limit", { limit, requested: count });
+    assertRunCount(solver, count);
     return Array.from({ length: count }, () => ({
         taskAgentType: solver,
         evalAgentType: evaluator,
@@ -216,6 +215,7 @@ async function assertRolloutsAllowed(client: Awaited<ReturnType<typeof getClient
 async function triggerBatch(args) {
     const policy = loadPolicy();
     assertTokenPolicy(args, policy);
+    assertRunPreset(args.preset, policy);
     if (args.preset !== undefined && args.preset !== "quick" && args.preset !== "full") {
         throw new Error("--preset must be quick or full");
     }
@@ -231,7 +231,7 @@ async function triggerBatch(args) {
         : buildConfigs(args);
     assertRunRequest(configs, args.batchName, policy);
     const records = await client.query(api.runAgentRuns.getAgentRuns, { versionId: version._id });
-    assertRunCapacity(records, configs.length, policy);
+    assertRunCapacity(records, configs, policy);
     if (args.preset === "quick") {
         if (configs.length !== 1) {
             throw new Error(`Quick preset must resolve to exactly one run, got ${configs.length}.`);
@@ -845,6 +845,7 @@ const scratch = defineCommand({
 const reEvaluateView = defineCommand({
     meta: { name: "runs re-evaluate view", description: "View the rollout re-evaluation offer" },
     args: {
+        history: { type: "boolean", description: "Fingerprint remote solution patches and count re-evaluation batches" },
         id: { type: "positional", description: "Challenge ID", required: true },
         json: { type: "boolean", description: "Output as JSON" },
     },
@@ -854,8 +855,11 @@ const reEvaluateView = defineCommand({
         const offer = await client.query(api.reEvalRuns.getReEvalOffer, {
             versionId: version._id,
         });
-        if (args.json) return printJson(offer);
-        console.log(JSON.stringify(offer, null, 2));
+        const output = args.history
+            ? { offer, ...await inspectReevaluationHistory(client, args.id, version._id) }
+            : offer;
+        if (args.json) return printJson(output);
+        console.log(JSON.stringify(output, null, 2));
     },
 });
 
@@ -880,6 +884,8 @@ const reEvaluateRun = defineCommand({
             versionId: version._id,
         });
         if (!offer?.eligible) throw new Error("This version is not eligible for rollout re-evaluation");
+        assertPaidEndpoint("reEvalRuns:triggerReEvalRuns", { useGeneralTokens: args["use-general-tokens"] });
+        await assertRemoteReevaluationAttempts(client, args.id, version._id);
         const result: any = await client.action(api.reEvalRuns.triggerReEvalRuns, {
             versionId: version._id,
             useGeneralTokens: args["use-general-tokens"] || undefined,

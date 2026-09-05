@@ -1,4 +1,5 @@
 import { defineCommand } from "citty";
+import { assertPaidEndpoint, assertCheckCapacity, assertOperationCost } from "../policy.ts";
 import { api } from "../convex.ts";
 import {
   commonArgs,
@@ -116,22 +117,27 @@ const taskAsMars = defineCommand({
   },
   run: async ({ args }) => {
     const { client, problemId, versionId } = await resolveCommandContext(args);
+    const contestArgs = { problemId, versionId };
+    const triggerArgs = {
+      versionId,
+      checkKey: "taskQuality",
+      useGeneralTokens: args["use-general-tokens"] || undefined,
+    };
+    // Preflight both operations before changing the rubric; dispatch still rechecks.
+    assertPaidEndpoint("taskQualityContest:contestTaskQualityAsMars", contestArgs);
+    assertPaidEndpoint("runDynamicChecks:triggerDynamicCheck", triggerArgs);
+    await assertCheckCapacity(client, problemId, versionId, ["taskQuality"]);
+    await assertOperationCost(client, "taskQualityContest:contestTaskQualityAsMars", contestArgs);
+    await assertOperationCost(client, "runDynamicChecks:triggerDynamicCheck", triggerArgs);
     try {
-      await client.mutation(api.taskQualityContest.contestTaskQualityAsMars, {
-        problemId,
-        versionId,
-      });
+      await client.mutation(api.taskQualityContest.contestTaskQualityAsMars, contestArgs);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!/ALREADY_MARS|already evaluated against the Mars rubric/i.test(message)) {
         throw error;
       }
     }
-    const result = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
-      versionId,
-      checkKey: "taskQuality",
-      useGeneralTokens: args["use-general-tokens"] || undefined,
-    });
+    const result = await client.action(api.runDynamicChecks.triggerDynamicCheck, triggerArgs);
     printResult(result ?? { triggered: "taskQuality" }, args.json);
   },
 });
