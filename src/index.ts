@@ -13,6 +13,8 @@ import image from "./commands/image.ts";
 import scopeGate from "./commands/scope-gate.ts";
 import verifierAudit from "./commands/verifier-audit.ts";
 import tokens from "./commands/tokens.ts";
+import policy from "./commands/policy.ts";
+import { PolicyError } from "./policy.ts";
 import { checkVersion, UPDATE_PACKAGE_NAME } from "./config.ts";
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
@@ -60,6 +62,7 @@ const main = defineCommand({
         contest,
         runs,
         tokens,
+        policy,
         update,
         view: defineCommand({
             meta: { name: "view", description: "Shortcut for `olympus problems view <id>`" },
@@ -109,7 +112,9 @@ else {
     catch (error) {
         const message = errorMessage(error);
         if (rawArgs.includes("--json")) {
-            console.log(JSON.stringify({ status: "error", error: message }, null, 2));
+            console.log(JSON.stringify(error instanceof PolicyError
+                ? { status: "blocked", error: message, rule: error.rule, ...error.details }
+                : { status: "error", error: message }));
         }
         else {
             console.error(`Error: ${message}`);

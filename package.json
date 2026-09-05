@@ -27,7 +27,8 @@
   ],
   "dependencies": {
     "citty": "^0.2.1",
-    "convex": "^1.29.0"
+    "convex": "^1.29.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

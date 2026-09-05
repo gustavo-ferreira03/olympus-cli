@@ -14,6 +14,9 @@ importers:
       convex:
         specifier: ^1.29.0
         version: 1.45.0
+      yaml:
+        specifier: ^2.9.0
+        version: 2.9.0
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -412,6 +415,11 @@ packages:
       utf-8-validate:
         optional: true
 
+  yaml@2.9.0:
+    resolution: {integrity: sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA==}
+    engines: {node: '>= 14.6'}
+    hasBin: true
+
 snapshots:
 
   '@esbuild/aix-ppc64@0.27.0':
@@ -659,3 +667,5 @@ snapshots:
   undici-types@6.21.0: {}
 
   ws@8.21.0: {}
+
+  yaml@2.9.0: {}

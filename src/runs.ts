@@ -4,6 +4,7 @@ import { printJson, printKeyValue, printTable, statusBadge, truncate } from "./f
 import { omitEmpty, paginate, parsePositiveInteger, sliceText } from "./output.ts";
 import { formatAgentType, formatRunLabel, groupRunsByBatch, normalizeAgentRuns, parseAgentTypeInput, resolveRunSelector, summarizeStatuses, } from "./model.ts";
 import type { AgentRun } from "./model.ts";
+import { assertRunCapacity, assertRunRequest, assertTokenPolicy, loadPolicy, PolicyError } from "./policy.ts";
 const AGENT_RUN_CONFIGS = {
     vegaVega: { taskAgentType: "claude_code", evalAgentType: "claude_code" },
     vegaOrion: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
@@ -189,7 +190,10 @@ function buildConfigs(args) {
     }
     const solver = parseAgentTypeOrExit(args.solver, "solver");
     const evaluator = parseAgentTypeOrExit(args.evaluator, "evaluator");
-    const count = parseCount(args.count, 1);
+    const count = args.count === undefined ? 1 : Number(args.count);
+    if (!Number.isSafeInteger(count) || count < 1) throw new Error("--count must be a positive integer");
+    const limit = loadPolicy().runs.max_new_runs_per_version;
+    if (count > limit) throw new PolicyError("runs.max_new_runs_per_version", "Requested runs exceed the version limit", { limit, requested: count });
     return Array.from({ length: count }, () => ({
         taskAgentType: solver,
         evalAgentType: evaluator,
@@ -210,6 +214,14 @@ async function assertRolloutsAllowed(client: Awaited<ReturnType<typeof getClient
 }
 
 async function triggerBatch(args) {
+    const policy = loadPolicy();
+    assertTokenPolicy(args, policy);
+    if (args.preset !== undefined && args.preset !== "quick" && args.preset !== "full") {
+        throw new Error("--preset must be quick or full");
+    }
+    if (args.preset && (args.solver !== undefined || args.evaluator !== undefined || args.count !== undefined)) {
+        throw new Error("Do not combine --preset with --solver, --evaluator, or --count");
+    }
     const client = await getClient();
     const { problem, version } = await requireProblemVersion(client, args.problemId);
     await assertRolloutsAllowed(client, args.problemId);
@@ -217,12 +229,15 @@ async function triggerBatch(args) {
     const configs: RunConfig[] = args.preset === "quick" || args.preset === "full"
         ? await getPresetConfigs(client, args.preset, isDiamond)
         : buildConfigs(args);
+    assertRunRequest(configs, args.batchName, policy);
+    const records = await client.query(api.runAgentRuns.getAgentRuns, { versionId: version._id });
+    assertRunCapacity(records, configs.length, policy);
     if (args.preset === "quick") {
         if (configs.length !== 1) {
             throw new Error(`Quick preset must resolve to exactly one run, got ${configs.length}.`);
         }
         const agentRunKey = findAgentRunKey(configs[0]);
-        if (agentRunKey) {
+        if (agentRunKey && !args.useGeneralTokens && args.batchName === undefined && !args.hinted) {
             const result = await client.action(api.runAgentRuns.triggerAgentRun, {
                 versionId: version._id,
                 agentRunKey,
