@@ -30,7 +30,8 @@ export interface Policy {
   auto_review: { allow_force_refresh: boolean };
 }
 
-export const defaultPolicyYaml = `runs:
+export const defaultPolicyYaml = `# yaml-language-server: $schema=./policy.schema.json
+runs:
   max_runs: {nova: 10, vega: 0, orion: 0, castor: 0} # Maximum current original runs per model
   allow_full_preset: false # Allow the full rollout preset
   allow_manual_batch_name: false # Allow explicit batch names
@@ -67,7 +68,7 @@ export class PolicyError extends Error {
 }
 
 export function policyPath(): string {
-  return resolve(credentialsDir(), "policy.yaml");
+  return resolve(credentialsDir(), "policy.yml");
 }
 
 function object(
@@ -219,13 +220,34 @@ export function parsePolicy(text: string): Policy {
 }
 
 
+/** Editor schema shares runtime defaults and model/check choices. */
+export function policySchema(): Record<string, unknown> {
+  const defaults = parsePolicy(defaultPolicyYaml);
+  const mapping = (properties: Record<string, any>) => ({type: "object", additionalProperties: false, properties});
+  const integer = {type: ["integer", "null"], minimum: 0, maximum: Number.MAX_SAFE_INTEGER};
+  const describe = (value: any, path: string): any => {
+    if (path === "runs.max_runs") return {...mapping(Object.fromEntries(
+      Object.entries(defaults.runs.max_runs).map(([model, cap]) => [model, {...integer, default: cap, description: "Maximum current original runs; zero, null or omission blocks this model."}])
+    )), default: value};
+    if (path === "checks.allowed") return {type: "array", items: {type: "string", enum: [...TRIGGERABLE_CHECK_KEYS]}, default: value};
+    if (path === "tokens.max_operation_fraction") return {type: ["number", "null"], exclusiveMinimum: 0, maximum: 1, default: null};
+    if (path === "tokens.min_remaining_balance") return {type: ["number", "null"], minimum: 0, default: null};
+    if (path === "checks.max_active" || path === "runs.re_evaluation.max_attempts") return {...integer, default: value};
+    if (typeof value === "boolean") return {type: "boolean", default: value};
+    if (typeof value === "number") return {type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: value};
+    return mapping(Object.fromEntries(Object.entries(value).map(([key, child]) => [key, describe(child, path ? `${path}.${key}` : key)])));
+  };
+  return {$schema: "http://json-schema.org/draft-07/schema#", title: "Olympus guardrails", ...describe(defaults, "")};
+}
+
 export function loadPolicy(): Policy {
   let text: string;
   try {
     text = readFileSync(policyPath(), "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return parsePolicy(defaultPolicyYaml);
+    }
     throw new PolicyError("policy.unreadable", `Cannot read ${policyPath()}`);
   }
   return parsePolicy(text);
