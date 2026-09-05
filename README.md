@@ -211,6 +211,7 @@ Scope Gate:
 ```bash
 olympus scope-gate view <challenge-id> --json
 olympus scope-gate run <challenge-id> --json
+olympus scope-gate wait <challenge-id> --json
 ```
 
 False-positive check:
@@ -218,6 +219,7 @@ False-positive check:
 ```bash
 olympus fp-check view <challenge-id> --json
 olympus fp-check run <challenge-id> --json
+olympus fp-check wait <challenge-id> --json
 ```
 
 Verifier Completeness Audit:
@@ -235,6 +237,7 @@ Auto Review:
 ```bash
 olympus auto-review view <challenge-id> --json
 olympus auto-review run <challenge-id> --wait --json
+olympus auto-review wait <challenge-id> --json
 ```
 
 Quality-check contests:

@@ -1,11 +1,57 @@
 import { defineCommand } from "citty";
 import { api } from "../convex.ts";
+import { parseWaitNumber } from "./checks.ts";
 import { printJson } from "../format.ts";
 import {
   commonArgs,
   printResult,
   resolveCommandContext,
 } from "../command-utils.ts";
+
+function activeState(state: any): boolean {
+  return Boolean(state?.inFlight) || ["pending", "running", "queued", "processing"].includes(
+    String(state?.status ?? state?.job?.status ?? state?.jobStatus ?? "").toLowerCase(),
+  );
+}
+
+function failedState(state: any): boolean {
+  return ["failed", "error", "cancelled", "canceled"].includes(
+    String(state?.status ?? state?.job?.status ?? state?.jobStatus ?? "").toLowerCase(),
+  );
+}
+
+async function waitForFpCheck({ client, versionId, versionNumber, jobId, intervalMs, timeoutMs, json, full }: any) {
+  const startedAt = Date.now();
+  while (true) {
+    const state: any = await client.query(api.fpReview.getFpCheckForVersion, { versionId });
+    const currentJobId = state?.jobId ?? state?.job?.id;
+    if (jobId && currentJobId && currentJobId !== jobId) {
+      throw new Error(`FP check ${jobId} was replaced by ${currentJobId}`);
+    }
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    if (!activeState(state)) {
+      const result = {
+        status: failedState(state) ? "failed" : "completed",
+        version: versionNumber,
+        elapsedSeconds,
+        ...(full ? { state } : { jobId: currentJobId, verdict: state?.verdict ?? state?.output?.verdict }),
+      };
+      if (json) printJson(result);
+      else printResult(result, false);
+      if (failedState(state)) process.exitCode = 1;
+      return result;
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      const result = { status: "timeout", version: versionNumber, elapsedSeconds, jobId: currentJobId };
+      if (json) printJson(result);
+      else console.error(`\n  Timed out waiting for FP check ${currentJobId ?? ""}.\n`);
+      process.exitCode = 2;
+      return result;
+    }
+    if (!json) process.stderr.write(`\r  waiting FP check elapsed=${elapsedSeconds}s`);
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
 
 const view = defineCommand({
   meta: { name: "fp-check view", description: "View false-positive review state" },
@@ -17,6 +63,30 @@ const view = defineCommand({
   },
 });
 
+const wait = defineCommand({
+  meta: { name: "fp-check wait", description: "Wait for the current false-positive review" },
+  args: {
+    ...commonArgs,
+    job: { type: "string", description: "Expected FP check job ID" },
+    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    timeout: { type: "string", description: "Timeout in minutes (default 45)" },
+    full: { type: "boolean", description: "Include the complete backend payload" },
+  },
+  run: async ({ args }) => {
+    const { client, versionId, versionNumber } = await resolveCommandContext(args);
+    await waitForFpCheck({
+      client,
+      versionId,
+      versionNumber,
+      jobId: args.job,
+      intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
+      timeoutMs: parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000,
+      json: Boolean(args.json),
+      full: Boolean(args.full),
+    });
+  },
+});
+
 const run = defineCommand({
   meta: { name: "fp-check run", description: "Run the false-positive review panel" },
   args: {
@@ -25,6 +95,10 @@ const run = defineCommand({
       type: "boolean",
       description: "Charge general tokens instead of revision tokens",
     },
+    wait: { type: "boolean", description: "Wait for the FP check to finish" },
+    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    timeout: { type: "string", description: "Timeout in minutes (default 45)" },
+    full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
     const { client, versionId, versionNumber } = await resolveCommandContext(args);
@@ -36,16 +110,33 @@ const run = defineCommand({
       ].filter(Boolean);
       throw new Error(`FP check is blocked: ${reasons.join("; ") || "unknown reason"}`);
     }
-    const result = await client.action(api.fpReview.requestFpCheck, {
+    const result: any = await client.action(api.fpReview.requestFpCheck, {
       versionId,
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
-    if (args.json) return printJson(result);
-    console.log(`\n  False-positive review triggered on v${versionNumber}.\n`);
+    if (args.wait) {
+      await waitForFpCheck({
+        client,
+        versionId,
+        versionNumber,
+        jobId: result?.jobId,
+        intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
+        timeoutMs: parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000,
+        json: Boolean(args.json),
+        full: Boolean(args.full),
+      });
+      return;
+    }
+    const waitCommand = result?.jobId
+      ? `olympus fp-check wait ${args.id} --job=${result.jobId} --json`
+      : `olympus fp-check wait ${args.id} --json`;
+    if (args.json) return printJson({ ...result, waitCommand });
+    console.log(`\n  False-positive review triggered on v${versionNumber}.`);
+    console.log(`  Wait: ${waitCommand}\n`);
   },
 });
 
 export default defineCommand({
   meta: { name: "fp-check", description: "False-positive review operations" },
-  subCommands: { view, run },
+  subCommands: { view, run, wait },
 });

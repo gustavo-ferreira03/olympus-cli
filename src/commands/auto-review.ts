@@ -24,6 +24,31 @@ const view = defineCommand({
   },
 });
 
+const wait = defineCommand({
+  meta: { name: "auto-review wait", description: "Wait for the current Auto Review check" },
+  args: {
+    ...commonArgs,
+    job: { type: "string", description: "Expected Auto Review job ID" },
+    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    timeout: { type: "string", description: "Timeout in minutes (default 30)" },
+    full: { type: "boolean", description: "Include raw result when waiting" },
+  },
+  run: async ({ args }) => {
+    const { client, problemId, version } = await resolveCommandContext(args);
+    await waitForChecks({
+      client,
+      problemId,
+      version,
+      jobId: args.job,
+      requestedKeys: args.job ? undefined : ["autoReview"],
+      intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
+      timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+      json: Boolean(args.json),
+      full: Boolean(args.full),
+    });
+  },
+});
+
 const run = defineCommand({
   meta: { name: "auto-review run", description: "Run the UI Auto Review check" },
   args: {
@@ -105,5 +130,5 @@ const orchestrate = defineCommand({
 
 export default defineCommand({
   meta: { name: "auto-review", description: "Auto Review operations" },
-  subCommands: { view, run, orchestrate },
+  subCommands: { view, run, wait, orchestrate },
 });
