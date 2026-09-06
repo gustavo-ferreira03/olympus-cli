@@ -27,7 +27,6 @@ export interface Policy {
   };
   tokens: {
     allow_general_tokens: boolean;
-    max_operation_fraction: number | null;
     min_remaining_balance: number | null;
     challenge_budget: number | null;
   };
@@ -54,7 +53,6 @@ runs:
 
 tokens:
   allow_general_tokens: false # Allow explicit use of general tokens
-  max_operation_fraction: null # Maximum request cost divided by reported balance
   min_remaining_balance: null # Minimum reported balance after request cost
   challenge_budget: null # Local per-challenge quoted-token budget; null disables
 
@@ -122,7 +120,6 @@ export function parsePolicy(text: string): Policy {
     ]);
     const tokens = group("tokens", [
       "allow_general_tokens",
-      "max_operation_fraction",
       "min_remaining_balance",
       "challenge_budget",
     ]);
@@ -160,7 +157,6 @@ export function parsePolicy(text: string): Policy {
       },
       tokens: {
         allow_general_tokens: value(tokens, "allow_general_tokens", false),
-        max_operation_fraction: value(tokens, "max_operation_fraction", null),
         min_remaining_balance: value(tokens, "min_remaining_balance", null),
         challenge_budget: value(tokens, "challenge_budget", null),
       },
@@ -217,17 +213,6 @@ export function parsePolicy(text: string): Policy {
         "checks.max_active must be null or a non-negative integer",
       );
 
-    const fraction = result.tokens.max_operation_fraction;
-    if (
-      fraction !== null &&
-      (typeof fraction !== "number" ||
-        !Number.isFinite(fraction) ||
-        fraction <= 0 ||
-        fraction > 1)
-    )
-      throw new Error(
-        "tokens.max_operation_fraction must be null or a number in (0, 1]",
-      );
     const budget = result.tokens.challenge_budget;
     if (budget !== null && (typeof budget !== "number" || !Number.isFinite(budget) || budget < 0))
       throw new Error("tokens.challenge_budget must be null or a non-negative number");
@@ -300,13 +285,6 @@ export function policySchema(): Record<string, unknown> {
         default: value,
       };
 
-    if (path === "tokens.max_operation_fraction")
-      return {
-        type: ["number", "null"],
-        exclusiveMinimum: 0,
-        maximum: 1,
-        default: null,
-      };
     if (path === "tokens.min_remaining_balance" || path === "tokens.challenge_budget")
       return { type: ["number", "null"], minimum: 0, default: null };
     if (
@@ -695,6 +673,88 @@ async function quoteCost(
   return amount(total) ? { cost: total, parts: identities.map((identity, index) => ({ ...identity, amount: prices[index] as number })) } : undefined;
 }
 
+// Align decimal API token values before sums/division (avoid binary 0.1 + 0.2).
+function tokenUnits(values: number[]): { units: bigint[]; exponent: number } {
+  const parts = values.map((value) => {
+    const [mantissa, power = "0"] = String(value).split("e");
+    const [whole, fraction = ""] = mantissa.split(".");
+    return { digits: BigInt(whole + fraction), exponent: Number(power) - fraction.length };
+  });
+  const exponent = Math.min(...parts.map((part) => part.exponent));
+  return { exponent, units: parts.map((part) => part.digits * 10n ** BigInt(part.exponent - exponent)) };
+}
+function decimalTokenSum(values: number[]): number {
+  if (!values.every(Number.isFinite)) return NaN;
+  const { units, exponent } = tokenUnits(values);
+  return Number(`${units.reduce((sum, value) => sum + value, 0n)}e${exponent}`);
+}
+
+interface DripEstimate {
+  waitSeconds: number | null;
+  retryAt: string | null;
+  drip: {
+    status: "estimated" | "unknown" | "unreachable" | "paused";
+    reason: string;
+    amount: number | null;
+    intervalSeconds: number;
+    nextDripAt: number | null;
+    cap: number | null;
+    source: string;
+    estimated: boolean;
+    dripsNeeded?: number;
+  };
+}
+
+export function estimateTokenDrip(
+  snapshot: Record<string, any>,
+  requiredBalance: number,
+  now = Date.now(),
+  tier?: Record<string, any>,
+): DripEstimate {
+  const rate = amount(snapshot.tierDripAmount) ? snapshot.tierDripAmount
+    : tier?.name === snapshot.tierName && amount(tier?.dripAmount) ? tier.dripAmount : null;
+  const cap = amount(snapshot.cap) ? snapshot.cap : null;
+  const next = typeof snapshot.nextDripAt === "number" && Number.isSafeInteger(snapshot.nextDripAt)
+    && snapshot.nextDripAt > 0 && snapshot.nextDripAt <= 8.64e15 ? snapshot.nextDripAt : null;
+  const result: DripEstimate = {
+    waitSeconds: null, retryAt: null,
+    drip: { status: "unknown", reason: "The token drip schedule is unavailable", amount: rate,
+      intervalSeconds: 3600, nextDripAt: next, cap,
+      source: amount(snapshot.tierDripAmount) ? "contributorTokens:getBalance; official UI hourly drip contract"
+        : "contributorTokens:getBalance + contributorTokens:getTierConfig; official UI hourly drip contract",
+      estimated: false },
+  };
+  const stop = (status: DripEstimate["drip"]["status"], reason: string) => {
+    result.drip.status = status; result.drip.reason = reason; return result;
+  };
+  if (snapshot.dripUnlimited !== false)
+    return stop("unknown", "The account's special or unknown drip mode cannot be estimated safely");
+  if (cap !== null && requiredBalance > cap)
+    return stop("unreachable", "Required balance exceeds the current token cap; waiting for drip alone cannot satisfy it");
+  if (snapshot.dripPaused === true)
+    return stop("paused", "Token drip is paused; replenishment time is unknown");
+  if (rate === 0)
+    return stop("unreachable", "The current tier has no token drip; waiting alone cannot satisfy the threshold");
+  if (snapshot.needsRefresh === true)
+    return stop("unknown", "The server reports that the balance needs refresh; replenishment time is unknown until a fresh balance is available");
+  if (rate === null || cap === null || snapshot.dripPaused !== false || next === null)
+    return result;
+  if (next < now)
+    return stop("unknown", "The reported next drip is in the past; refresh the balance before estimating");
+  if (!amount(snapshot.balance) || !amount(requiredBalance) || !Number.isFinite(now)) return result;
+  const { units: [required, balance, perDrip] } = tokenUnits([requiredBalance, snapshot.balance, rate]);
+  const missing = required > balance ? required - balance : 0n;
+  const count = Number((missing + perDrip - 1n) / perDrip);
+  const retry = count === 0 ? now : next + (count - 1) * 3600_000;
+  if (!Number.isSafeInteger(count) || !Number.isSafeInteger(retry) || retry > 8.64e15)
+    return stop("unknown", "The estimated replenishment time is outside the supported range");
+  result.waitSeconds = Math.ceil(Math.max(0, retry - now) / 1000);
+  result.retryAt = new Date(retry).toISOString();
+  result.drip = { ...result.drip, status: "estimated", estimated: true, dripsNeeded: count,
+    reason: "Estimate only: assumes unchanged hourly drip, tier and cap, no other spending, and timely server replenishment; recheck before retrying" };
+  return result;
+}
+
 export async function assertOperationCost(
   client: Reader,
   name: string,
@@ -710,47 +770,51 @@ export async function assertOperationCost(
   )
     return;
   const effective = policy ?? loadPolicy();
-  const { max_operation_fraction: fraction, min_remaining_balance: reserve } =
-    effective.tokens;
-  if (fraction === null && reserve === null) return;
+  const { min_remaining_balance: reserve } = effective.tokens;
+  if (reserve === null) return;
   let cost: number | undefined;
   try {
     cost = quotedCost ?? (await quoteCost(client, name, args))?.cost;
   } catch {
     cost = undefined;
   }
-  if (cost === undefined) {
+  if (!amount(cost)) {
     throw new PolicyError(
       "tokens.cost_unavailable",
       "Cannot establish a prospective cost for this operation",
       { endpoint: name },
     );
   }
-  let balance: unknown;
+  let snapshot: Record<string, any> | undefined;
   try {
-    balance = (await client.query(api.contributorTokens.getBalance, {}))
-      ?.balance;
+    snapshot = await client.query(api.contributorTokens.getBalance, {});
   } catch {
     /* A failed read is never a zero balance. */
   }
+  const balance: unknown = snapshot?.balance;
   if (!amount(balance))
     throw new PolicyError(
       "tokens.balance_unavailable",
       "Cannot establish the reported token balance",
     );
-  if (fraction !== null && cost > balance * fraction)
-    throw new PolicyError(
-      "tokens.max_operation_fraction",
-      "Operation exceeds the allowed fraction of reported balance",
-      { cost, balance, limit: fraction },
-    );
-  // Conservatively subtract the entire quote, ignoring any revision-token coverage.
-  if (reserve !== null && balance - cost < reserve)
-    throw new PolicyError(
-      "tokens.min_remaining_balance",
-      "Operation would breach the minimum remaining balance",
-      { cost, balance, limit: reserve },
-    );
+  const requiredBalance = sumBudgetAmounts([cost, reserve]);
+  if (balance >= requiredBalance) return;
+  const shortfall = decimalTokenSum([requiredBalance, -balance]);
+  let tier: Record<string, any> | undefined;
+  if (!amount(snapshot?.tierDripAmount) && typeof snapshot?.tierName === "string") {
+    try {
+      const tiers = await client.query(api.contributorTokens.getTierConfig, {});
+      if (Array.isArray(tiers)) tier = tiers.find((item) => item?.name === snapshot?.tierName);
+    } catch {}
+  }
+  const estimate = estimateTokenDrip(snapshot!, requiredBalance, Date.now(), tier);
+  const wait = estimate.waitSeconds === null ? estimate.drip.reason
+    : `Estimated wait: ${estimate.waitSeconds} seconds (retry at ${estimate.retryAt}); not guaranteed, recheck the balance before retrying`;
+  throw new PolicyError(
+    "tokens.min_remaining_balance",
+    `Operation would breach the minimum remaining balance. ${wait}`,
+    { cost, balance, limit: reserve, requiredBalance, shortfall, ...estimate },
+  );
 }
 
 export interface BudgetDispatchScope {

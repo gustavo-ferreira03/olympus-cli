@@ -411,6 +411,13 @@ olympus problems submit <challenge-id> --json
 and validation in editors with YAML Language Server support (such as VS Code with
 the Red Hat YAML extension).
 
+A minimum-balance rejection reports the required balance, shortfall, and an
+estimated wait/retry time using the account's reported next drip and current
+hourly tier rate. This is not a guarantee: spending, tier/cap changes, pauses,
+and server timing can change it. Unknown or stale schedules report an unknown
+wait; a required balance above the current cap cannot be reached by drip alone.
+The CLI does not wait, refresh tokens, or submit a paid operation on rejection.
+
 Edit that file to configure the rules; omitted fields use these defaults, also active when the file is absent:
 
 ```yaml
@@ -427,7 +434,6 @@ runs:
 
 tokens:
   allow_general_tokens: false # Allow explicit use of general tokens
-  max_operation_fraction: null # Maximum request cost divided by reported balance
   min_remaining_balance: null # Minimum reported balance after request cost
   challenge_budget: null # Local per-challenge quoted-token budget; null disables
 
