@@ -56,7 +56,7 @@ function isValidVersionCache(value: unknown): value is VersionCache {
         candidate.fetchedAt.length > 0);
 }
 /** OLYMPUS_URL override, or NODE_ENV=development → localhost */
-function getBaseUrl(): string {
+export function getBaseUrl(): string {
     if (process.env.OLYMPUS_URL)
         return process.env.OLYMPUS_URL;
     return process.env.NODE_ENV === "development" ? DEV_URL : PROD_URL;
