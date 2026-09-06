@@ -62,11 +62,25 @@ export function parseOfficialPrices(source: string): OfficialPrices {
   const binding = (n: Node): Node | null | undefined => {
     for (let s = scopes.get(n); s; s = s.parent) if (s.bindings.has(n.name)) return s.bindings.get(n.name);
   };
+  const mutated = new Set<Node>();
+  for (const n of nodes) {
+    let target = n.type === "AssignmentExpression" ? n.left : n.type === "UpdateExpression" || (n.type === "UnaryExpression" && n.operator === "delete") ? n.argument : undefined;
+    while (target?.type === "MemberExpression") target = target.object;
+    if (target?.type === "Identifier") {
+      const b = binding(target);
+      if (b) mutated.add(b);
+    }
+  }
+  const strictProps = (n: Node) => {
+    const p = props(n);
+    if (n?.type !== "ObjectExpression" || p.size !== n.properties.length || mutated.has(n)) fail("unsupported, duplicate or mutated constant object");
+    return p;
+  };
   const resolve = (n: Node, seen = new Set<Node>()): Node => {
-    if (!n || seen.has(n)) return fail("unresolved or cyclic constant");
+    if (!n || seen.has(n) || mutated.has(n)) return fail("unresolved, cyclic or mutated constant");
     seen.add(n);
     if (n.type === "Identifier") return resolve(binding(n), seen);
-    if (n.type === "MemberExpression" && !n.computed) return resolve(props(resolve(n.object, seen)).get(key(n.property)!), seen);
+    if (n.type === "MemberExpression" && !n.computed) return resolve(strictProps(resolve(n.object, seen)).get(key(n.property)!), seen);
     return n;
   };
   const value = (n: Node): number => {
@@ -77,10 +91,14 @@ export function parseOfficialPrices(source: string): OfficialPrices {
   const one = <T>(items: T[], label: string): T => items.length === 1 ? items[0] : fail(`missing or ambiguous ${label} (${items.length} matches)`);
   const objects = nodes.filter(n => n.type === "ObjectExpression");
   const base = one(objects.filter(n => ["verifyBuild", "verifyTests", "verifySolution", "verifyFairness", "taskQuality", "solutionQuality", "descriptionQuality", "crossRunAnalysis", "autoReview", "verifierIncompleteness"].every(k => props(n).has(k))), "base check catalog");
-  if (props(base).size !== base.properties.length) fail("unsupported or duplicate base check properties");
+  strictProps(base);
   const checks = Object.fromEntries([...props(base)].map(([k, n]) => [k, value(n)]));
   const containsLabel = (n: Node, label: string): boolean => n?.type === "Literal" ? n.value === label : n?.type === "ConditionalExpression" && (containsLabel(n.consequent, label) || containsLabel(n.alternate, label));
-  const dialog = (label: string) => one(objects.filter(n => props(n).has("cost") && containsLabel(props(n).get("label"), label)), label);
+  const dialog = (label: string) => {
+    const result = one(objects.filter(n => props(n).has("cost") && containsLabel(props(n).get("label"), label)), label);
+    strictProps(result);
+    return result;
+  };
   const scopeGate = value(props(dialog("Run Scope Gate")).get("cost"));
   const finalQaPerItem = value(props(dialog("Rerun this item")).get("cost"));
   const precheck = one(objects.filter(n => {
@@ -88,7 +106,7 @@ export function parseOfficialPrices(source: string): OfficialPrices {
     if (!k || !props(n).has("defaultCostTokens")) return false;
     try { return resolve(k).value === "bundled_prechecks"; } catch { return false; }
   }), "bundled prechecks");
-  const bundledPrechecks = value(props(precheck).get("defaultCostTokens"));
+  const bundledPrechecks = value(strictProps(precheck).get("defaultCostTokens"));
   const preDialog = props(dialog("Run Prechecks"));
   const pcost = preDialog.get("cost"), plabel = preDialog.get("label");
   if (pcost?.type !== "ConditionalExpression" || plabel?.type !== "ConditionalExpression" || source.slice(pcost.test.start, pcost.test.end) !== source.slice(plabel.test.start, plabel.test.end)) fail("unsupported precheck spend formula");
@@ -102,7 +120,7 @@ export function parseOfficialPrices(source: string): OfficialPrices {
   }
   const buildFunction = one([...buildFunctions], "build component");
   const calls = nodes.filter(n => n.type === "CallExpression" && n.arguments[0]?.type === "Identifier" && binding(n.arguments[0]) === buildFunction && props(n.arguments[1]).has("cost"));
-  const build = value(props(one(calls, "build cost prop").arguments[1]).get("cost"));
+  const build = value(strictProps(one(calls, "build cost prop").arguments[1]).get("cost"));
   const diamond: Record<string, number> = {};
   for (const field of ["diamondChecksCostNewSession", "diamondChecksCostAppendJob", "diamondChecksCostCodeValidation", "diamondChecksCostFullEnvQa"]) {
     const matches = nodes.filter(n => n.type === "LogicalExpression" && n.operator === "??" && member(n.left?.type === "ChainExpression" ? n.left.expression : n.left, field));
@@ -130,7 +148,7 @@ async function readText(url: URL, limit: number): Promise<string> {
 }
 
 export async function fetchOfficialPrices() {
-  const pageUrl = new URL(`${getBaseUrl().replace(/\/$/, "")}/`);
+  const pageUrl = new URL(getBaseUrl().replace(/\/$/, ""));
   const html = await readText(pageUrl, 2 * 1024 * 1024);
   // Only the module entry actually referenced by HTML, not a guessed hashed URL.
   const scripts = [...html.matchAll(/<script\b([^>]*)>/gi)].map(m => {
@@ -138,8 +156,8 @@ export async function fetchOfficialPrices() {
     return attrs.get("type") === "module" ? attrs.get("src") : undefined;
   }).filter((s): s is string => Boolean(s));
   if (scripts.length !== 1) return fail("expected one HTML module entry");
-  const assetUrl = new URL(scripts[0], pageUrl);
-  if (assetUrl.origin !== pageUrl.origin || !["http:", "https:"].includes(assetUrl.protocol)) return fail("frontend asset is not same-origin HTTP(S)");
+  const assetUrl = new URL(scripts[0], `${pageUrl.href}/`);
+  if (assetUrl.origin !== pageUrl.origin || !assetUrl.pathname.startsWith(`${pageUrl.pathname}/`) || assetUrl.username || assetUrl.password || assetUrl.search || !["http:", "https:"].includes(assetUrl.protocol)) return fail("frontend asset is not same-origin HTTP(S)");
   const source = await readText(assetUrl, 16 * 1024 * 1024);
   return { ...parseOfficialPrices(source), source: { pageUrl: pageUrl.href, assetUrl: assetUrl.href, sha256: createHash("sha256").update(source).digest("hex"), fetchedAt: new Date().toISOString() } };
 }
