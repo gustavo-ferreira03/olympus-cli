@@ -88,9 +88,6 @@ const main = defineCommand({
         }),
     },
 });
-// Non-blocking min version check
-void checkVersion();
-
 function errorMessage(error: unknown): string {
     if (error && typeof error === "object" && "data" in error) {
         const data = (error as { data?: unknown }).data;
@@ -108,6 +105,14 @@ if (usesBuiltinOutput) {
     await runMain(main, { rawArgs });
 }
 else {
+    const versionCheck = new AbortController();
+    let versionCheckTimeout: ReturnType<typeof setTimeout> | undefined;
+    const versionCheckStart = setImmediate(() => {
+        versionCheckTimeout = setTimeout(() => versionCheck.abort(), 2000);
+        versionCheckTimeout.unref();
+        void checkVersion(versionCheck.signal);
+    });
+    versionCheckStart.unref();
     try {
         await runCommand(main, { rawArgs });
     }
@@ -127,5 +132,10 @@ else {
             }
             process.exitCode = 1;
         }
+    }
+    finally {
+        clearImmediate(versionCheckStart);
+        clearTimeout(versionCheckTimeout);
+        versionCheck.abort();
     }
 }

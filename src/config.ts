@@ -66,7 +66,7 @@ export function getAuthUrl(): string {
     return `${getBaseUrl()}/cli-auth`;
 }
 /** Load cached config or fetch fresh from the frontend */
-export async function getConfig(): Promise<CliConfig> {
+export async function getConfig(signal?: AbortSignal): Promise<CliConfig> {
     if (existsSync(CONFIG_PATH)) {
         try {
             const cached = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
@@ -82,7 +82,7 @@ export async function getConfig(): Promise<CliConfig> {
     }
     const baseUrl = getBaseUrl();
     try {
-        const res = await fetch(`${baseUrl}/api/cli/config`);
+        const res = await fetch(`${baseUrl}/api/cli/config`, { signal });
         if (res.ok) {
             const data = (await res.json()) as Record<string, unknown>;
             if (!data ||
@@ -132,7 +132,7 @@ function semverGt(a: string, b: string): boolean {
     }
     return false;
 }
-async function getLatestPublishedVersion(): Promise<string | null> {
+async function getLatestPublishedVersion(signal?: AbortSignal): Promise<string | null> {
     if (!UPDATE_PACKAGE_NAME)
         return null;
     if (existsSync(VERSION_CACHE_PATH)) {
@@ -152,6 +152,7 @@ async function getLatestPublishedVersion(): Promise<string | null> {
         const encodedName = encodeURIComponent(UPDATE_PACKAGE_NAME);
         const res = await fetch(`https://registry.npmjs.org/${encodedName}/latest`, {
             headers: { Accept: "application/json" },
+            signal,
         });
         if (!res.ok)
             return null;
@@ -170,13 +171,14 @@ async function getLatestPublishedVersion(): Promise<string | null> {
     }
 }
 /** Check if CLI version meets minimum required by server and whether npm has a newer release. */
-export async function checkVersion() {
+export async function checkVersion(signal?: AbortSignal) {
     if (process.env.OLYMPUS_NO_UPDATE_CHECK === "1")
         return;
     const [configResult, latestResult] = await Promise.allSettled([
-        getConfig(),
-        getLatestPublishedVersion(),
+        getConfig(signal),
+        getLatestPublishedVersion(signal),
     ]);
+    if (signal?.aborted) return;
     try {
         if (configResult.status === "fulfilled" &&
             semverGt(configResult.value.minCliVersion, VERSION)) {
