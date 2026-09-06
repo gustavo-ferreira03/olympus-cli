@@ -4,8 +4,10 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseDocument } from "yaml";
 import { credentialsDir } from "./auth.ts";
+import { BudgetError, budgetScope, readBudget, reserveBudget, settleBudget, sumBudgetAmounts, type BudgetContext, type BudgetFeedback, type BudgetPart } from "./budget.ts";
+import { reportBudget } from "./output.ts";
 import { parseAgentTypeInput } from "./model.ts";
-import { resolveCostCatalog } from "./pricing.ts";
+import { resolveCostCatalog, resolveRunPrices, resolveVersionOffer } from "./pricing.ts";
 import {
   TRIGGERABLE_CHECK_KEYS,
   toPublicCheckKey,
@@ -27,6 +29,7 @@ export interface Policy {
     allow_general_tokens: boolean;
     max_operation_fraction: number | null;
     min_remaining_balance: number | null;
+    challenge_budget: number | null;
   };
   checks: {
     allowed: string[];
@@ -53,6 +56,7 @@ tokens:
   allow_general_tokens: false # Allow explicit use of general tokens
   max_operation_fraction: null # Maximum request cost divided by reported balance
   min_remaining_balance: null # Minimum reported balance after request cost
+  challenge_budget: null # Local per-challenge quoted-token budget; null disables
 
 checks:
   allowed: [verifyTests, verifySolution, verifyFlakiness, testQuality, taskQuality, solutionQuality, descriptionQuality, autoReview, verifierIncompleteness] # Allowed dynamic checks
@@ -120,6 +124,7 @@ export function parsePolicy(text: string): Policy {
       "allow_general_tokens",
       "max_operation_fraction",
       "min_remaining_balance",
+      "challenge_budget",
     ]);
     const checks = group("checks", [
       "allowed",
@@ -157,6 +162,7 @@ export function parsePolicy(text: string): Policy {
         allow_general_tokens: value(tokens, "allow_general_tokens", false),
         max_operation_fraction: value(tokens, "max_operation_fraction", null),
         min_remaining_balance: value(tokens, "min_remaining_balance", null),
+        challenge_budget: value(tokens, "challenge_budget", null),
       },
       checks: {
         allowed: value(checks, "allowed", [...TRIGGERABLE_CHECK_KEYS]),
@@ -210,6 +216,7 @@ export function parsePolicy(text: string): Policy {
       throw new Error(
         "checks.max_active must be null or a non-negative integer",
       );
+
     const fraction = result.tokens.max_operation_fraction;
     if (
       fraction !== null &&
@@ -221,6 +228,9 @@ export function parsePolicy(text: string): Policy {
       throw new Error(
         "tokens.max_operation_fraction must be null or a number in (0, 1]",
       );
+    const budget = result.tokens.challenge_budget;
+    if (budget !== null && (typeof budget !== "number" || !Number.isFinite(budget) || budget < 0))
+      throw new Error("tokens.challenge_budget must be null or a non-negative number");
     const reserve = result.tokens.min_remaining_balance;
     if (
       reserve !== null &&
@@ -289,6 +299,7 @@ export function policySchema(): Record<string, unknown> {
         items: { type: "string", enum: [...TRIGGERABLE_CHECK_KEYS] },
         default: value,
       };
+
     if (path === "tokens.max_operation_fraction")
       return {
         type: ["number", "null"],
@@ -296,7 +307,7 @@ export function policySchema(): Record<string, unknown> {
         maximum: 1,
         default: null,
       };
-    if (path === "tokens.min_remaining_balance")
+    if (path === "tokens.min_remaining_balance" || path === "tokens.challenge_budget")
       return { type: ["number", "null"], minimum: 0, default: null };
     if (
       path === "checks.max_active" ||
@@ -612,7 +623,7 @@ export function assertPaidEndpoint(
 }
 
 // Live cost and capacity guards
-// Read-only, live preflights. No local ledger/cache and no claim of atomic reservation.
+// Read-only, live preflights; the dispatch wrapper separately reserves local budget.
 const api = anyApi;
 type Reader = { query: (reference: any, args: any) => Promise<any> };
 const record = (value: any): value is Record<string, any> =>
@@ -638,38 +649,50 @@ async function quoteCost(
   client: Reader,
   name: string,
   args: Record<string, any>,
-): Promise<number | undefined> {
+): Promise<{ cost: number; parts: BudgetPart[] } | undefined> {
   // Admin resume/force and contests have no proven author tariff.
   if (name === "orchestratorReview:triggerOrchestratorReview" || contestEndpoints.has(name)) return undefined;
-  const catalog = await resolveCostCatalog(client, typeof args.versionId === "string" ? args.versionId : undefined);
-  if (name === "reEvalRuns:triggerReEvalRuns") return catalog.offers.reevaluation.tokens ?? undefined;
-  if (name === "fpReview:requestFpCheck") return catalog.offers.fp.tokens ?? undefined;
-  const special = {
-    "scopeGate:triggerScopeGate": catalog.actions.scopeGate,
-    "contributorTokens:runAllChecksWithToken": catalog.actions.bundledPrechecks,
-    "dockerImage:buildVersionImage": catalog.actions.build,
-  };
-  if (Object.hasOwn(special, name)) return special[name as keyof typeof special].tokens ?? undefined;
+  if (name === "reEvalRuns:triggerReEvalRuns" || name === "fpReview:requestFpCheck") {
+    const kind = name === "fpReview:requestFpCheck" ? "fp" : "reevaluation";
+    const cost = (await resolveVersionOffer(client, kind, typeof args.versionId === "string" ? args.versionId : undefined)).tokens;
+    return cost === null ? undefined : { cost, parts: [{ operation: kind === "fp" ? "reviews:fpCheck" : "runs:reEvaluation", amount: cost }] };
+  }
   const isRun = name === "runAgentRuns:triggerRuns" || name === "runAgentRuns:triggerAgentRun";
   let prices: unknown[];
+  let identities: { operation: string; checkKey?: string }[];
   if (isRun) {
+    const runs = await resolveRunPrices(client);
     const solvers = name === "runAgentRuns:triggerAgentRun"
       ? [Object.hasOwn(quickSolvers, args.agentRunKey) ? quickSolvers[args.agentRunKey] : undefined]
       : Array.isArray(args.configs) && args.configs.length
         ? args.configs.map((item: any) => typeof item?.taskAgentType === "string" ? (parseAgentTypeInput(item.taskAgentType) ?? item.taskAgentType) : undefined)
         : [undefined];
-    prices = solvers.map(solver => solver && Object.hasOwn(catalog.runs, solver) ? catalog.runs[solver].tokens : undefined);
+    prices = solvers.map(solver => solver && Object.hasOwn(runs, solver) ? runs[solver].tokens : undefined);
+    identities = solvers.map(solver => ({ operation: `runs:${solver}` }));
   } else {
+    const catalog = await resolveCostCatalog(client);
+    const special = {
+      "scopeGate:triggerScopeGate": catalog.actions.scopeGate,
+      "contributorTokens:runAllChecksWithToken": catalog.actions.bundledPrechecks,
+      "dockerImage:buildVersionImage": catalog.actions.build,
+    };
+    if (Object.hasOwn(special, name)) {
+      const cost = special[name as keyof typeof special].tokens;
+      const operation = name === "scopeGate:triggerScopeGate" ? "scope:scopeGate"
+        : name === "dockerImage:buildVersionImage" ? "builds:build" : "checks:bundledPrechecks";
+      return cost === null ? undefined : { cost, parts: [{ operation, amount: cost }] };
+    }
     const keys = checkKeysForEndpoint(name, args);
     if (!keys.length) return undefined;
     prices = keys.map(key => {
       const backendKey = toBackendCheckKey(key);
       return Object.hasOwn(catalog.checks, backendKey) ? catalog.checks[backendKey].tokens : undefined;
     });
+    identities = keys.map(key => ({ operation: `checks:${toPublicCheckKey(key)}`, checkKey: toPublicCheckKey(key) }));
   }
   if (!prices.every(amount)) return undefined;
-  const total = (prices as number[]).reduce((sum, price) => sum + price, 0);
-  return amount(total) ? total : undefined;
+  const total = sumBudgetAmounts(prices as number[]);
+  return amount(total) ? { cost: total, parts: identities.map((identity, index) => ({ ...identity, amount: prices[index] as number })) } : undefined;
 }
 
 export async function assertOperationCost(
@@ -677,6 +700,7 @@ export async function assertOperationCost(
   name: string,
   args: Record<string, any>,
   policy?: Policy,
+  quotedCost?: number,
 ): Promise<void> {
   // Scratching/restoring a run changes metadata, not token spending.
   if (
@@ -691,7 +715,7 @@ export async function assertOperationCost(
   if (fraction === null && reserve === null) return;
   let cost: number | undefined;
   try {
-    cost = await quoteCost(client, name, args);
+    cost = quotedCost ?? (await quoteCost(client, name, args))?.cost;
   } catch {
     cost = undefined;
   }
@@ -727,6 +751,71 @@ export async function assertOperationCost(
       "Operation would breach the minimum remaining balance",
       { cost, balance, limit: reserve },
     );
+}
+
+export interface BudgetDispatchScope {
+  directory: string;
+  backend: string;
+  account: string;
+  resolveChallenge: (args: Record<string, any>) => Promise<string>;
+}
+
+export function assertChallengeBudget(state: BudgetFeedback): void {
+  const total = state.spent !== null && state.reserved !== null && state.cost !== null
+    ? sumBudgetAmounts([state.spent, state.reserved, state.cost]) : NaN;
+  if (!Number.isFinite(total) || total > state.limit)
+    throw new PolicyError("tokens.challenge_budget", "Operation exceeds the remaining local challenge budget", { budget: { ...state, status: "blocked" } });
+}
+
+export async function dispatchWithBudget<T>(
+  client: Reader,
+  name: string,
+  args: Record<string, any>,
+  invoke: () => Promise<T>,
+  scope: BudgetDispatchScope,
+  policy?: Policy,
+): Promise<T> {
+  if (!isPolicyEndpoint(name, args)) return invoke();
+  const effective = policy ?? loadPolicy();
+  const limit = effective.tokens.challenge_budget;
+  if (limit === null || !paidEndpoints.has(name)) {
+    assertPaidEndpoint(name, args, effective);
+    await assertOperationCost(client, name, args, effective);
+    return invoke();
+  }
+  let context: BudgetContext | undefined;
+  let reservation: string | undefined;
+  let invoked = false;
+  let state: BudgetFeedback = { scope: "local", scopeId: null, accounting: "prospective-quotes", cost: null, spent: null, reserved: null, limit, remaining: null, activatedAt: null, endpoint: name, status: "blocked" };
+  try {
+    const challenge = await scope.resolveChallenge(args);
+    state.challengeId = challenge;
+    context = { directory: scope.directory, scope: budgetScope(scope.backend, scope.account, challenge), limit };
+    state = { ...state, ...await readBudget(context) };
+    assertPaidEndpoint(name, args, effective);
+    let quote: Awaited<ReturnType<typeof quoteCost>>;
+    try { quote = await quoteCost(client, name, args); } catch { quote = undefined; }
+    if (quote === undefined) throw new PolicyError("tokens.cost_unavailable", "Cannot establish a prospective cost for this operation", { endpoint: name });
+    const { cost, parts } = quote;
+    state.cost = cost;
+    await assertOperationCost(client, name, args, effective, cost);
+    const held = await reserveBudget(context, cost, assertChallengeBudget, parts);
+    reservation = held.id;
+    state = { ...state, ...held.feedback };
+    invoked = true;
+    const result = await invoke();
+    state = { ...state, ...await settleBudget(context, reservation, "spent") };
+    reportBudget(state);
+    return result;
+  } catch (error) {
+    if (reservation && context && !invoked) {
+      state = { ...state, ...await settleBudget(context, reservation, "released") };
+    } else if ((error instanceof BudgetError || error instanceof PolicyError) && error.details.budget) {
+      state = { ...state, ...error.details.budget as BudgetFeedback };
+    }
+    reportBudget(state);
+    throw error;
+  }
 }
 
 const activeStatuses = new Set(["pending", "running", "queued", "processing"]);

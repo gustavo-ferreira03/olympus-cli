@@ -429,6 +429,7 @@ tokens:
   allow_general_tokens: false # Allow explicit use of general tokens
   max_operation_fraction: null # Maximum request cost divided by reported balance
   min_remaining_balance: null # Minimum reported balance after request cost
+  challenge_budget: null # Local per-challenge quoted-token budget; null disables
 
 checks:
   allowed: [verifyTests, verifySolution, verifyFlakiness, testQuality, taskQuality, solutionQuality, descriptionQuality, autoReview, verifierIncompleteness] # Allowed dynamic checks

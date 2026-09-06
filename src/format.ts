@@ -1,3 +1,4 @@
+import { withBudgetFeedback } from "./output.ts";
 /** Minimal output formatting helpers. */
 
 // eslint-disable-next-line no-control-regex
@@ -20,7 +21,7 @@ function padVisible(str: string, width: number): string {
 }
 
 export function printJson(data: unknown): void {
-  console.log(JSON.stringify(data, null, 2));
+  console.log(JSON.stringify(withBudgetFeedback(data), null, 2));
 }
 
 export function printTable(

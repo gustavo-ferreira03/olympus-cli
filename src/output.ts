@@ -1,3 +1,27 @@
+import type { BudgetFeedback } from "./budget.ts";
+
+const budgets: BudgetFeedback[] = [];
+export function reportBudget(value: BudgetFeedback): void {
+  budgets.push(value);
+  if (!process.argv.includes("--json")) {
+    const n = (value: number | null) => value === null ? "unknown" : String(value);
+    console.error(`Local budget (prospective quotes): cost=${n(value.cost)} spent=${n(value.spent)} reserved=${n(value.reserved)} limit=${value.limit} remaining=${n(value.remaining)} scope=local challenge=${value.challengeId ?? "unknown"} status=${value.status ?? "blocked"}`);
+    for (const [operation, entry] of Object.entries(value.byOperation ?? {})) {
+      console.error(`  ${operation}: spent=${entry.spent} reserved=${entry.reserved}`);
+    }
+    if (value.unattributed && (value.unattributed.spent || value.unattributed.reserved)) {
+      console.error(`  unattributed: spent=${value.unattributed.spent} reserved=${value.unattributed.reserved}`);
+    }
+  }
+}
+export function withBudgetFeedback(data: unknown): unknown {
+  if (!budgets.length) return data;
+  const budget = budgets.length === 1 ? budgets[0] : [...budgets];
+  return data !== null && typeof data === "object" && !Array.isArray(data)
+    ? { ...data, budget }
+    : { result: data, budget };
+}
+
 export type TextSliceOptions = {
   head?: number;
   tail?: number;

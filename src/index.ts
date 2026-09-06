@@ -15,6 +15,8 @@ import verifierAudit from "./commands/verifier-audit.ts";
 import tokens from "./commands/tokens.ts";
 import policy from "./commands/policy.ts";
 import { PolicyError } from "./policy.ts";
+import { BudgetError } from "./budget.ts";
+import { printJson } from "./format.ts";
 import { checkVersion, UPDATE_PACKAGE_NAME } from "./config.ts";
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
@@ -112,9 +114,9 @@ else {
     catch (error) {
         const message = errorMessage(error);
         if (rawArgs.includes("--json")) {
-            console.log(JSON.stringify(error instanceof PolicyError
+            printJson(error instanceof PolicyError || error instanceof BudgetError
                 ? { status: "blocked", error: message, rule: error.rule, ...error.details }
-                : { status: "error", error: message }));
+                : { status: "error", error: message });
         }
         else {
             console.error(`Error: ${message}`);

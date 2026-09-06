@@ -1,14 +1,29 @@
 import { ConvexHttpClient } from "convex/browser";
 import { anyApi, getFunctionName } from "convex/server";
-import { assertPaidEndpoint, assertOperationCost } from "./policy.ts";
-import { requireAuth } from "./auth.ts";
+import { dispatchWithBudget, loadPolicy, PolicyError } from "./policy.ts";
+import { budgetScope, readBudget } from "./budget.ts";
+import { credentialsDir, requireAuth } from "./auth.ts";
+import { resolve } from "node:path";
 import { getConvexUrl } from "./config.ts";
 
 let clientSingleton: ConvexHttpClient | null = null;
+const budgetScopes = new WeakMap<object, { backend: string; account: string; directory: string }>();
+
+export async function localBudgetStatus(client: object, challengeId: string): Promise<unknown> {
+  const limit = loadPolicy().tokens.challenge_budget;
+  if (limit === null) return { enabled: false, scope: "local", challengeId };
+  const context = budgetScopes.get(client);
+  try {
+    if (!context) throw new Error("Local budget scope is unavailable");
+    return { enabled: true, challengeId, ...await readBudget({ directory: context.directory, scope: budgetScope(context.backend, context.account, challengeId), limit }) };
+  } catch (error) {
+    return { enabled: true, scope: "local", challengeId, limit, error: error instanceof Error ? error.message : "Local budget state is unavailable" };
+  }
+}
 
 export async function getClient(): Promise<ConvexHttpClient> {
   if (clientSingleton) return clientSingleton;
-  const { token } = requireAuth();
+  const { token, identity } = requireAuth();
   let convexUrl: string;
   try {
     convexUrl = await retryTransient(() => getConvexUrl());
@@ -18,16 +33,56 @@ export async function getClient(): Promise<ConvexHttpClient> {
   }
   const client = new ConvexHttpClient(convexUrl);
   client.setAuth(token);
-  for (const method of ["action", "mutation"] as const) {
-    const invoke = client[method].bind(client);
-    Object.defineProperty(client, method, { value: async (reference: any, args: any = {}, ...options: any[]) => {
-      assertPaidEndpoint(getFunctionName(reference), args);
-      await assertOperationCost(client, getFunctionName(reference), args);
-      return (invoke as any)(reference, args, ...options);
-    } });
-  }
+  installPolicyGuards(client, convexUrl, identity.sub);
   clientSingleton = client;
   return client;
+}
+
+export function installPolicyGuards(client: any, backend: string, account: string, directory = resolve(credentialsDir(), "challenge-budgets")): void {
+  budgetScopes.set(client, { backend, account, directory });
+  const versions = new Map<string, string>();
+  const references = new Map<string, string>();
+  const valid = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+  const remember = (map: Map<string, string>, key: unknown, problem: unknown) => {
+    if (valid(key) && valid(problem)) {
+      map.set(key, map.has(key) && map.get(key) !== problem ? "" : problem);
+    }
+  };
+  const query = client.query.bind(client);
+  Object.defineProperty(client, "query", { value: async (reference: any, args: any = {}, ...options: any[]) => {
+    const result = await query(reference, args, ...options);
+    const name = getFunctionName(reference);
+    if (name === "problems:getWithLatestVersion") remember(versions, result?.latestVersion?._id, args.problemId);
+    if (name === "problems:getWithVersion") remember(versions, result?.version?._id, args.problemId);
+    if (name === "problems:listVersions" && Array.isArray(result)) for (const version of result) remember(versions, version?._id, args.problemId);
+    if (name === "problemVersions:getByVersion") remember(versions, result?._id, args.problemId);
+    const problem = args.problemId ?? versions.get(args.versionId);
+    if (name === "runAgentRuns:getAgentRuns" && Array.isArray(result)) {
+      for (const run of result) { remember(references, run?.id ?? run?._id, problem); remember(references, run?.jobId, problem); }
+    }
+    if (name === "jobs:get") remember(references, args.id, result?.problemId ?? versions.get(result?.versionId));
+    return result;
+  } });
+  const resolveChallenge = async (args: Record<string, any>): Promise<string> => {
+    let problem = valid(args.problemId) ? args.problemId : undefined;
+    if (valid(args.versionId)) {
+      const fromVersion = versions.get(args.versionId);
+      if (problem && fromVersion && problem !== fromVersion) throw new PolicyError("tokens.challenge_budget", "Challenge and version scope do not match");
+      problem ??= fromVersion;
+    }
+    problem ??= references.get(args.runId) ?? references.get(args.jobId);
+    if (!problem && valid(args.jobId)) {
+      const job = await client.query(anyApi.jobs.get, { id: args.jobId });
+      problem = references.get(args.jobId) ?? versions.get(job?.versionId);
+    }
+    if (!problem) throw new PolicyError("tokens.challenge_budget", "Cannot resolve the challenge scope; read the challenge version before dispatch");
+    return problem;
+  };
+  for (const method of ["action", "mutation"] as const) {
+    const invoke = client[method].bind(client);
+    Object.defineProperty(client, method, { value: (reference: any, args: any = {}, ...options: any[]) =>
+      dispatchWithBudget(client, getFunctionName(reference), args, () => invoke(reference, args, ...options), { directory, backend, account, resolveChallenge }) });
+  }
 }
 
 // Untyped by necessity: this fork does not contain the private Convex source
