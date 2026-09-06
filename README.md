@@ -411,6 +411,21 @@ olympus problems submit <challenge-id> --json
 and validation in editors with YAML Language Server support (such as VS Code with
 the Red Hat YAML extension).
 
+`olympus policy edit` opens a staged copy in `$VISUAL`, `$EDITOR`, or `vi` on a
+TTY (editor arguments such as `code --wait` are supported), validates it, then
+saves it. Editing requires `flock` (util-linux); its OS lock is released on process exit,
+including crashes. The `.policy-edit.flock` file is persistent, not a stale lock;
+do not delete it while editing. For non-interactive edits, use YAML-typed values or `null`:
+
+```bash
+olympus policy edit tokens.challenge_budget 100 --json
+olympus policy edit tokens.min_remaining_balance 20 --json
+```
+
+`--json` requires a key and value. Comments and other settings are preserved;
+a missing file starts with the defaults. Existing disabled settings are not
+automatically enabled.
+
 A minimum-balance rejection reports the required balance, shortfall, and an
 estimated wait/retry time using the account's reported next drip and current
 hourly tier rate. This is not a guarantee: spending, tier/cap changes, pauses,
