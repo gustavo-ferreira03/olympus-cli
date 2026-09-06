@@ -482,6 +482,15 @@ const quickSolvers: Record<string, string> = {
   castorVega1: "taiga", castorOrion1: "taiga",
 };
 
+// Official frontend base tariff (u0/Cqt), main-eJso4KfB.js on shipd.ai.
+// Remote overrides replace these values; missing overrides retain the base price.
+const baseCheckCosts: Record<string, number> = {
+  verifyBuild: 0.5, verifyTests: 0.5, verifySolution: 0.5,
+  verifyFairness: 1.25, verifyFlakiness: 0.5, taskQuality: 3,
+  solutionQuality: 2.5, descriptionQuality: 2, crossRunAnalysis: 6,
+  verifierIncompleteness: 8, autoReview: 8,
+};
+
 async function quoteCost(client: Reader, name: string, args: Record<string, any>): Promise<number | undefined> {
   if (name === "reEvalRuns:triggerReEvalRuns") {
     const offer = await client.query(api.reEvalRuns.getReEvalOffer, { versionId: args.versionId });
@@ -505,14 +514,16 @@ async function quoteCost(client: Reader, name: string, args: Record<string, any>
     const pricing = config?.agentRunPricing;
     prices = solvers.map((solver) => solver && record(pricing) && Object.hasOwn(pricing, solver) ? pricing[solver] : undefined);
   } else {
-    const overrides = config?.checkTokenCostOverrides;
+    if (!record(config)) return undefined;
+    const overrides = config.checkTokenCostOverrides;
+    if (overrides !== undefined && overrides !== null && !record(overrides)) return undefined;
     prices = keys.map((key) => {
       const backendKey = toBackendCheckKey(key);
-      if (!record(overrides)) return undefined;
-      // Sparse overrides are the only known tariff. Never invent a default price.
-      if (Object.hasOwn(overrides, backendKey)) return overrides[backendKey];
-      if (Object.hasOwn(overrides, key)) return overrides[key];
-      return undefined;
+      if (!Object.hasOwn(baseCheckCosts, backendKey)) return undefined;
+      const override = record(overrides) && Object.hasOwn(overrides, backendKey)
+        ? overrides[backendKey] : undefined;
+      // Match the frontend: only finite overrides in [0, 500] replace defaults.
+      return amount(override) && override <= 500 ? override : baseCheckCosts[backendKey];
     });
   }
   if (!prices.every(amount)) return undefined;
