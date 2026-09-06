@@ -112,15 +112,20 @@ else {
         await runCommand(main, { rawArgs });
     }
     catch (error) {
-        const message = errorMessage(error);
-        if (rawArgs.includes("--json")) {
-            printJson(error instanceof PolicyError || error instanceof BudgetError
-                ? { status: "blocked", error: message, rule: error.rule, ...error.details }
-                : { status: "error", error: message });
+        if (error && typeof error === "object" && "code" in error && error.code === "E_NO_COMMAND") {
+            await runMain(main, { rawArgs: [...rawArgs, "--help"] });
         }
         else {
-            console.error(`Error: ${message}`);
+            const message = errorMessage(error);
+            if (rawArgs.includes("--json")) {
+                printJson(error instanceof PolicyError || error instanceof BudgetError
+                    ? { status: "blocked", error: message, rule: error.rule, ...error.details }
+                    : { status: "error", error: message });
+            }
+            else {
+                console.error(`Error: ${message}`);
+            }
+            process.exitCode = 1;
         }
-        process.exitCode = 1;
     }
 }
