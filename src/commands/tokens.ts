@@ -3,6 +3,7 @@ import { api, getClient } from "../convex.ts";
 import { printJson } from "../format.ts";
 import { omitEmpty } from "../output.ts";
 import { resolveCommandContext } from "../command-utils.ts";
+import { resolveCostCatalog } from "../pricing.ts";
 
 function number(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -126,7 +127,7 @@ const usage = defineCommand({
 });
 
 const costs = defineCommand({
-  meta: { name: "tokens costs", description: "Show token costs returned by current challenge records" },
+  meta: { name: "tokens costs", description: "Show live official prospective tariffs and version offers" },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     version: { type: "string", description: "Version number (default: latest)" },
@@ -134,24 +135,8 @@ const costs = defineCommand({
   },
   run: async ({ args }) => {
     const { client, version, versionNumber } = await resolveCommandContext(args);
-    const [runs, dynamic, fp] = await Promise.all([
-      client.query(api.runAgentRuns.getAgentRuns, { versionId: version._id }),
-      client.query(api.runDynamicChecks.getDynamicChecks, { versionId: version._id }),
-      client.query(api.fpReview.getFpCheckForVersion, { versionId: version._id }),
-    ]);
-    const runCosts = (Array.isArray(runs) ? runs : []).map((run: any) => ({
-      type: "run",
-      id: run.id,
-      costTokens: number(run.costTokens ?? run.output?.costTokens ?? run.output?.tokenCost),
-    })).filter((item) => item.costTokens !== undefined);
-    const checkCosts = Object.entries(dynamic && typeof dynamic === "object" ? dynamic : {}).map(([key, value]: [string, any]) => ({
-      type: "check",
-      key,
-      costTokens: number(value?.costTokens ?? value?.tokenCost),
-    })).filter((item) => item.costTokens !== undefined);
-    const fpCost = number((fp as any)?.tokenCost);
-    const items = [...runCosts, ...checkCosts, ...(fpCost === undefined ? [] : [{ type: "fp-check", costTokens: fpCost }])];
-    const result = { version: versionNumber, estimated: true, items, totalCostTokens: items.reduce((sum, item) => sum + (item.costTokens ?? 0), 0) };
+    const catalog = await resolveCostCatalog(client, version._id);
+    const result = { version: versionNumber, ...catalog };
     if (args.json) return printJson(result);
     console.log(JSON.stringify(result, null, 2));
   },
