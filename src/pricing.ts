@@ -5,7 +5,7 @@ import { getBaseUrl } from "./config.ts";
 
 // Data retrieval only. Budget enforcement and operation selection live in policy.ts.
 type Node = any;
-type Scope = { parent?: Scope; bindings: Map<string, Node | null> };
+type Scope = { parent?: Scope; functionScope?: boolean; bindings: Map<string, Node | null> };
 export interface OfficialPrices {
   checks: Record<string, number>;
   scopeGate: number;
@@ -41,8 +41,9 @@ export function parseOfficialPrices(source: string): OfficialPrices {
   const walk = (n: Node, scope: Scope, parent?: Node) => {
     if (!n || typeof n.type !== "string") return;
     if (n.type === "FunctionDeclaration" && n.id) scope.bindings.set(n.id.name, n);
-    if (/^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression|BlockStatement|CatchClause)$/.test(n.type)) {
-      scope = { parent: scope, bindings: new Map() };
+    if (/^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression|BlockStatement|CatchClause|ForStatement|ForInStatement|ForOfStatement|SwitchStatement)$/.test(n.type)) {
+      scope = { parent: scope, functionScope: /^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(n.type), bindings: new Map() };
+      if (n.type === "FunctionExpression" && n.id) bindPattern(n.id, scope);
       n.params?.forEach((p: Node) => bindPattern(p, scope));
       if (n.type === "CatchClause") bindPattern(n.param, scope);
     }
@@ -50,15 +51,17 @@ export function parseOfficialPrices(source: string): OfficialPrices {
     if (parent) parents.set(n, parent);
     nodes.push(n);
     if (n.type === "VariableDeclaration") for (const d of n.declarations) {
-      bindPattern(d.id, scope);
-      if (d.id.type === "Identifier" && n.kind === "const") scope.bindings.set(d.id.name, d.init);
+      let declarationScope = scope;
+      if (n.kind === "var") while (declarationScope.parent && !declarationScope.functionScope) declarationScope = declarationScope.parent;
+      bindPattern(d.id, declarationScope);
+      if (d.id.type === "Identifier" && n.kind === "const") declarationScope.bindings.set(d.id.name, d.init);
     }
     for (const v of Object.values(n)) {
       if (Array.isArray(v)) v.forEach(c => { if (c?.type) walk(c, scope, n); });
       else if (v && typeof v === "object" && "type" in v) walk(v, scope, n);
     }
   };
-  walk(ast, { bindings: new Map() });
+  walk(ast, { functionScope: true, bindings: new Map() });
   const binding = (n: Node): Node | null | undefined => {
     for (let s = scopes.get(n); s; s = s.parent) if (s.bindings.has(n.name)) return s.bindings.get(n.name);
   };
@@ -148,16 +151,26 @@ async function readText(url: URL, limit: number): Promise<string> {
 }
 
 export async function fetchOfficialPrices() {
-  const pageUrl = new URL(getBaseUrl().replace(/\/$/, ""));
+  // Public sign-in renders the same current module entry without CLI cookies.
+  const baseUrl = new URL(`${getBaseUrl().replace(/\/$/, "")}/`);
+  const pageUrl = new URL("sign-in", baseUrl);
   const html = await readText(pageUrl, 2 * 1024 * 1024);
   // Only the module entry actually referenced by HTML, not a guessed hashed URL.
-  const scripts = [...html.matchAll(/<script\b([^>]*)>/gi)].map(m => {
+  const scripts: string[] = [];
+  for (const m of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
     const attrs = new Map([...m[1].matchAll(/([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)].map(a => [a[1].toLowerCase(), a[2] ?? a[3]]));
-    return attrs.get("type") === "module" ? attrs.get("src") : undefined;
-  }).filter((s): s is string => Boolean(s));
+    if (attrs.get("type") !== "module") continue;
+    if (attrs.has("src")) { scripts.push(attrs.get("src")!); continue; }
+    const inline = parse(m[2], { ecmaVersion: "latest", sourceType: "module" });
+    if (inline.body.length !== 1) return fail("unsupported inline module entry");
+    const statement: Node = inline.body[0];
+    const expression = statement.type === "ExpressionStatement" ? statement.expression : undefined;
+    if (expression?.type !== "ImportExpression" || expression.source.type !== "Literal" || typeof expression.source.value !== "string") return fail("unsupported inline module import");
+    scripts.push(expression.source.value);
+  }
   if (scripts.length !== 1) return fail("expected one HTML module entry");
-  const assetUrl = new URL(scripts[0], `${pageUrl.href}/`);
-  if (assetUrl.origin !== pageUrl.origin || !assetUrl.pathname.startsWith(`${pageUrl.pathname}/`) || assetUrl.username || assetUrl.password || assetUrl.search || !["http:", "https:"].includes(assetUrl.protocol)) return fail("frontend asset is not same-origin HTTP(S)");
+  const assetUrl = new URL(scripts[0], pageUrl);
+  if (assetUrl.origin !== pageUrl.origin || !assetUrl.pathname.startsWith(baseUrl.pathname) || assetUrl.username || assetUrl.password || assetUrl.search || !["http:", "https:"].includes(assetUrl.protocol)) return fail("frontend asset is not same-origin HTTP(S)");
   const source = await readText(assetUrl, 16 * 1024 * 1024);
   return { ...parseOfficialPrices(source), source: { pageUrl: pageUrl.href, assetUrl: assetUrl.href, sha256: createHash("sha256").update(source).digest("hex"), fetchedAt: new Date().toISOString() } };
 }
@@ -165,12 +178,31 @@ export async function fetchOfficialPrices() {
 export interface Price { tokens: number | null; source: string; baseTokens?: number; reason?: string }
 const known = (tokens: unknown, source: string, baseTokens?: number): Price => amount(tokens) ? { tokens, source, ...(baseTokens === undefined ? {} : { baseTokens }) } : { tokens: null, source, reason: "No valid prospective price returned" };
 export type PricingReader = { query: (ref: any, args: any) => Promise<any> };
+export async function resolveVersionOffer(client: PricingReader, kind: "fp" | "reevaluation", versionId?: string) {
+  const source = kind === "fp" ? "fpReview:getFpCheckForVersion.tokenCost" : "reEvalRuns:getReEvalOffer.tokenCost";
+  let offer: any;
+  if (versionId) {
+    try { offer = await client.query(kind === "fp" ? anyApi.fpReview.getFpCheckForVersion : anyApi.reEvalRuns.getReEvalOffer, { versionId }); }
+    catch { /* Read failure is unknown, never a free offer or a historical fallback. */ }
+  }
+  return {
+    ...known(kind === "fp" || offer?.eligible === true ? offer?.tokenCost : undefined, source),
+    versionId: versionId ?? null,
+    ...(kind === "fp" ? { canRun: offer?.canRun ?? null } : { eligible: offer?.eligible ?? null, runCount: offer?.runCount ?? null }),
+  };
+}
+function runPrices(config: any): Record<string, Price> {
+  return Object.fromEntries(["claude_code", "codex_cli", "gemini_cli", "taiga"].map(k => [k, known(object(config?.agentRunPricing) && Object.hasOwn(config.agentRunPricing, k) ? config.agentRunPricing[k] : undefined, `questConfig.agentRunPricing.${k}`)]));
+}
+export async function resolveRunPrices(client: PricingReader) {
+  return runPrices(await client.query(anyApi.questConfig.getConfig, { slug: "olympus" }));
+}
 export async function resolveCostCatalog(client: PricingReader, versionId?: string) {
   const [ui, config, fp, reeval] = await Promise.all([
     fetchOfficialPrices(),
     client.query(anyApi.questConfig.getConfig, { slug: "olympus" }),
-    versionId ? client.query(anyApi.fpReview.getFpCheckForVersion, { versionId }) : undefined,
-    versionId ? client.query(anyApi.reEvalRuns.getReEvalOffer, { versionId }) : undefined,
+    resolveVersionOffer(client, "fp", versionId),
+    resolveVersionOffer(client, "reevaluation", versionId),
   ]);
   if (!object(config)) return fail("quest config is missing");
   const overrides = config.checkTokenCostOverrides;
@@ -182,7 +214,7 @@ export async function resolveCostCatalog(client: PricingReader, versionId?: stri
     const accepted = amount(override) && override <= 500;
     checks[k] = known(accepted ? override : base, accepted ? `questConfig.checkTokenCostOverrides.${k}` : "official-ui:check-base", base);
   }
-  const runs = Object.fromEntries(["claude_code", "codex_cli", "gemini_cli", "taiga"].map(k => [k, known(object(config.agentRunPricing) && Object.hasOwn(config.agentRunPricing, k) ? config.agentRunPricing[k] : undefined, `questConfig.agentRunPricing.${k}`)]));
+  const runs = runPrices(config);
   const diamond = Object.fromEntries(Object.entries(ui.diamond).map(([field, base]) => [field, known(config[field] ?? base, config[field] == null ? "official-ui:diamond-default" : `questConfig.${field}`, base)]));
   const unknown = { tokens: null, source: "unknown", reason: "No official prospective tariff established; not assumed free" } satisfies Price;
   return {
@@ -195,8 +227,8 @@ export async function resolveCostCatalog(client: PricingReader, versionId?: stri
       finalQaPerItem: known(ui.finalQaPerItem, "official-ui:final-qa-rerun-item"),
     }, diamond,
     offers: {
-      fp: { ...known(fp?.tokenCost, "fpReview:getFpCheckForVersion.tokenCost"), versionId: versionId ?? null, canRun: fp?.canRun ?? null },
-      reevaluation: { ...known(reeval?.eligible === true ? reeval.tokenCost : undefined, "reEvalRuns:getReEvalOffer.tokenCost"), versionId: versionId ?? null, eligible: reeval?.eligible ?? null, runCount: reeval?.runCount ?? null },
+      fp,
+      reevaluation: reeval,
     },
     formulas: { runs: "sum(solver price per requested run)", finalQa: "finalQaPerItem * selected or default eligible item count", finalQaRetry: "finalQaPerItem * failed/cancelled/stale-success item count", reevaluation: "total version offer, not a per-run tariff", bundledPrechecks: "one charge per bundled dispatch, not per stage" },
     unknown: Object.fromEntries(["orchestratorReview:triggerOrchestratorReview", "fairnessContest:contestVerifyFairness", "solutionQualityContest:contestSolutionQuality", "systemComments:contestDescriptionQuality", "taskQualityContest:contestTaskQualityAsMars", "fpReview:contestFpCheck", "verifierIncompleteness:submitVerifierIncompletenessDecision", "dockerImage:cancelBuildJob", "runAgentRuns:cancelRun", "runAgentRuns:scratchRun"].map(k => [k, unknown])),
