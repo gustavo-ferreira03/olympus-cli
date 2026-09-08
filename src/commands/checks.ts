@@ -234,6 +234,8 @@ const run = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
+        const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
+        const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
         if (!args.list && !args.check) {
             throw new CliError("Missing --check.", {
                 kind: "usage", code: "input.missing_check", retryable: false, hint: "Run olympus checks run <id> --list to see available keys, or olympus checks run --help.",
@@ -288,8 +290,8 @@ const run = defineCommand({
                 version,
                 jobId: result?.jobId,
                 requestedKeys: result?.jobId ? undefined : [checkKey],
-                intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-                timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+                intervalMs,
+                timeoutMs,
                 json: Boolean(args.json),
                 full: Boolean(args.full),
             });
@@ -325,6 +327,8 @@ const runAll = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
+        const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
+        const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
         assertTokenPolicy({ useGeneralTokens: args["use-general-tokens"] });
         let checkKeys: string[] = [...DEFAULT_RUN_ALL_CHECK_KEYS];
         if (args.checks !== undefined) {
@@ -368,8 +372,8 @@ const runAll = defineCommand({
                 version,
                 jobId: undefined,
                 requestedKeys: checkKeys,
-                intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-                timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+                intervalMs,
+                timeoutMs,
                 json: Boolean(args.json),
                 full: Boolean(args.full),
             });

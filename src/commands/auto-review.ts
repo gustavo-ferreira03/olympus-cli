@@ -243,6 +243,8 @@ const run = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
+    const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
+    const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
     const { client, problemId, version, versionId, versionNumber } =
       await resolveCommandContext(args);
     const state: any = await client.query(
@@ -272,8 +274,8 @@ const run = defineCommand({
         versionId,
         versionNumber,
         jobId: result?.jobId,
-        intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-        timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+        intervalMs,
+        timeoutMs,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });

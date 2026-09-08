@@ -18,6 +18,12 @@ async function waitForScopeGate({ client, versionId, versionNumber, intervalMs, 
   while (true) {
     const state: any = await client.query(api.scopeGate.getScopeGate, { versionId });
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    if (state == null) {
+      const result = { status: "idle", version: versionNumber };
+      if (json) printJson(result);
+      else console.log("\n  No Scope Gate exists for this version.\n");
+      return result;
+    }
     const status = scopeStatus(state);
     if (!isActive(status) && !state?.inFlight) {
       const result = { status: status === "fail" || status === "failed" ? "failed" : "completed", version: versionNumber, elapsedSeconds, state };
@@ -90,6 +96,8 @@ const run = defineCommand({
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
   },
   run: async ({ args }) => {
+    const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
+    const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
     const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
     const [scopeState, readiness] = await Promise.all([
       client.query(api.scopeGate.getScopeGate, { versionId }),
@@ -111,8 +119,8 @@ const run = defineCommand({
         client,
         versionId,
         versionNumber,
-        intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-        timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+        intervalMs,
+        timeoutMs,
         json: Boolean(args.json),
       });
       return;

@@ -72,6 +72,12 @@ async function waitForFpCheck({
   const startedAt = Date.now();
   while (true) {
     const state: any = await queryFpStateWithRetry(client, versionId);
+    if (state == null) {
+      const result = { status: "idle", version: versionNumber };
+      if (json) printJson(result);
+      else console.log("\n  No FP check exists for this version.\n");
+      return result;
+    }
     const currentJobId = state?.jobId ?? state?.job?.id;
     if (jobId && currentJobId && currentJobId !== jobId) {
       throw new Error(`FP check ${jobId} was replaced by ${currentJobId}`);
@@ -184,6 +190,8 @@ const run = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
+    const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
+    const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000 : undefined;
     const { client, versionId, versionNumber } =
       await resolveCommandContext(args);
     const state: any = await client.query(api.fpReview.getFpCheckForVersion, {
@@ -208,8 +216,8 @@ const run = defineCommand({
         versionId,
         versionNumber,
         jobId: result?.jobId,
-        intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-        timeoutMs: parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000,
+        intervalMs,
+        timeoutMs,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });

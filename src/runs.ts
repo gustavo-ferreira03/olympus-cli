@@ -519,6 +519,8 @@ const run = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
+        const intervalMs = args.wait ? parseRunWaitNumber(args.interval, 10, "--interval") * 1000 : undefined;
+        const timeoutMs = args.wait ? parseRunWaitNumber(args.timeout, 120, "--timeout") * 60 * 1000 : undefined;
         const { result, version, configs } = await triggerBatch({
             problemId: args.id,
             solver: args.solver,
@@ -539,8 +541,8 @@ const run = defineCommand({
                 runSelector: undefined,
                 batch: batchTag,
                 includeStale: false,
-                intervalMs: parseRunWaitNumber(args.interval, 10, "--interval") * 1000,
-                timeoutMs: parseRunWaitNumber(args.timeout, 120, "--timeout") * 60 * 1000,
+                intervalMs,
+                timeoutMs,
                 json: Boolean(args.json),
                 full: Boolean(args.full),
             });
@@ -882,6 +884,8 @@ const reEvaluateRun = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
+        const intervalMs = args.wait ? parseRunWaitNumber(args.interval, 10, "--interval") * 1000 : undefined;
+        const timeoutMs = args.wait ? parseRunWaitNumber(args.timeout, 120, "--timeout") * 60 * 1000 : undefined;
         const client = await getClient();
         const { version } = await requireProblemVersion(client, args.id);
         const offer: any = await client.query(api.reEvalRuns.getReEvalOffer, {
@@ -904,8 +908,8 @@ const reEvaluateRun = defineCommand({
                 runSelector: undefined,
                 batch: batchTag,
                 includeStale: false,
-                intervalMs: parseRunWaitNumber(args.interval, 10, "--interval") * 1000,
-                timeoutMs: parseRunWaitNumber(args.timeout, 120, "--timeout") * 60 * 1000,
+                intervalMs,
+                timeoutMs,
                 json: Boolean(args.json),
                 full: Boolean(args.full),
             });

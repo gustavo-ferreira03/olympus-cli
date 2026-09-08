@@ -178,6 +178,8 @@ const build = defineCommand({
     full: { type: "boolean", description: "Include complete backend payloads when waiting" },
   },
   run: async ({ args }) => {
+    const intervalMs = args.wait ? parsePositiveNumber(args.interval, 5, "--interval") * 1000 : undefined;
+    const timeoutMs = args.wait ? parsePositiveNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
     const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
     let { image, build: latestBuild } = await readImageState(client, versionId);
 
@@ -206,8 +208,8 @@ const build = defineCommand({
         versionId,
         versionNumber,
         expectedJobId: jobId,
-        intervalMs: parsePositiveNumber(args.interval, 5, "--interval") * 1000,
-        timeoutMs: parsePositiveNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+        intervalMs,
+        timeoutMs,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });
