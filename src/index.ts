@@ -14,6 +14,7 @@ import scopeGate from "./commands/scope-gate.ts";
 import verifierAudit from "./commands/verifier-audit.ts";
 import tokens from "./commands/tokens.ts";
 import policy from "./commands/policy.ts";
+import dashboard from "./commands/dashboard.ts";
 import { PolicyError } from "./policy.ts";
 import { BudgetError } from "./budget.ts";
 import { printJson } from "./format.ts";
@@ -67,6 +68,7 @@ const main = defineCommand({
         runs,
         tokens,
         policy,
+        dashboard,
         update,
         view: defineCommand({
             meta: { name: "view", description: "Shortcut for `olympus problems view <id>`" },
@@ -112,7 +114,7 @@ else {
     const versionCheck = new AbortController();
     let versionCheckTimeout: ReturnType<typeof setTimeout> | undefined;
     const versionCheckStart = setImmediate(() => {
-        if (jsonOutput) return;
+        if (jsonOutput || rawArgs[0] === "dashboard") return;
         versionCheckTimeout = setTimeout(() => versionCheck.abort(), 2000);
         versionCheckTimeout.unref();
         void checkVersion(versionCheck.signal);
