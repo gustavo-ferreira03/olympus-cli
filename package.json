@@ -11,7 +11,7 @@
     "convex"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "bin": {
     "olympus": "dist/index.js"
