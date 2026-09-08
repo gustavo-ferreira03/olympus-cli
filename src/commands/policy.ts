@@ -13,7 +13,7 @@ const show = defineCommand({
   run: ({ args }) => {
     const path = policyPath();
     const policy = loadPolicy();
-    const result = { path, source: existsSync(path) ? "file" : "defaults", policy };
+    const result = { path, source: existsSync(path) ? "file" : "missing", policy };
     if (args.json) return printJson(result);
     console.log(JSON.stringify(result, null, 2));
   },
@@ -67,7 +67,7 @@ const edit = defineCommand({
       if (acquired.status === 1) throw new Error("Another policy edit is in progress; close that editor before retrying");
       if (existsSync(path) && !lstatSync(path).isFile()) throw new Error("Policy path must be a regular file");
       const original = existsSync(path) ? readFileSync(path, "utf8") : undefined;
-      let text = original ?? defaultPolicyYaml;
+      let text = original ?? "# yaml-language-server: $schema=./policy.schema.json\n{}\n";
       if (direct) {
         const keys = args.key!.split(".");
         if (keys.some(key => !/^[a-zA-Z][a-zA-Z0-9_]*$/.test(key) || ["__proto__", "prototype", "constructor"].includes(key))) throw new Error("Invalid dotted policy key");

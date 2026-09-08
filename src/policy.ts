@@ -19,25 +19,25 @@ export interface Policy {
     max_runs: Partial<
       Record<"nova" | "vega" | "orion" | "castor", number | null>
     >;
-    allow_full_preset: boolean;
-    allow_manual_batch_name: boolean;
-    allow_cancellations: boolean;
-    allow_contests: boolean;
-    re_evaluation: { enabled: boolean; max_attempts: number | null };
+    allow_full_preset: boolean | null;
+    allow_manual_batch_name: boolean | null;
+    allow_cancellations: boolean | null;
+    allow_contests: boolean | null;
+    re_evaluation: { enabled: boolean | null; max_attempts: number | null };
   };
   tokens: {
-    allow_general_tokens: boolean;
+    allow_general_tokens: boolean | null;
     min_remaining_balance: number | null;
     challenge_budget: number | null;
   };
   checks: {
-    allowed: string[];
-    require_explicit_selection: boolean;
-    max_checks_per_request: number;
+    allowed: string[] | null;
+    require_explicit_selection: boolean | null;
+    max_checks_per_request: number | null;
     max_active: number | null;
-    allow_contests: boolean;
+    allow_contests: boolean | null;
   };
-  auto_review: { allow_force_refresh: boolean };
+  auto_review: { allow_force_refresh: boolean | null };
 }
 
 export const defaultPolicyYaml = `# yaml-language-server: $schema=./policy.schema.json
@@ -104,12 +104,12 @@ export function parsePolicy(text: string): Policy {
         [...doc.errors, ...doc.warnings].map((item) => item.message).join("; "),
       );
     const root = object(
-      doc.toJS({ maxAliasCount: 0 }),
+      doc.toJS({ maxAliasCount: 0 }) ?? {},
       ["runs", "tokens", "checks", "auto_review"],
       "policy",
     );
     const group = (key: string, keys: string[]) =>
-      object(root[key] === undefined ? {} : root[key], keys, key);
+      object(root[key] ?? {}, keys, key);
     const runs = group("runs", [
       "max_runs",
       "allow_full_preset",
@@ -132,47 +132,41 @@ export function parsePolicy(text: string): Policy {
     ]);
     const review = group("auto_review", ["allow_force_refresh"]);
     const reeval = object(
-      runs.re_evaluation === undefined ? {} : runs.re_evaluation,
+      runs.re_evaluation ?? {},
       ["enabled", "max_attempts"],
       "runs.re_evaluation",
     );
-    const value = (group: Record<string, any>, key: string, fallback: any) =>
-      group[key] === undefined ? fallback : group[key];
+    const value = (group: Record<string, any>, key: string) =>
+      group[key] ?? null;
     const result: Policy = {
       runs: {
-        max_runs: value(runs, "max_runs", {
-          nova: 10,
-          vega: 0,
-          orion: 0,
-          castor: 0,
-        }),
-        allow_full_preset: value(runs, "allow_full_preset", false),
-        allow_manual_batch_name: value(runs, "allow_manual_batch_name", false),
-        allow_cancellations: value(runs, "allow_cancellations", false),
-        allow_contests: value(runs, "allow_contests", false),
+        max_runs: runs.max_runs ?? {},
+        allow_full_preset: value(runs, "allow_full_preset"),
+        allow_manual_batch_name: value(runs, "allow_manual_batch_name"),
+        allow_cancellations: value(runs, "allow_cancellations"),
+        allow_contests: value(runs, "allow_contests"),
         re_evaluation: {
-          enabled: value(reeval, "enabled", true),
-          max_attempts: value(reeval, "max_attempts", 1),
+          enabled: value(reeval, "enabled"),
+          max_attempts: value(reeval, "max_attempts"),
         },
       },
       tokens: {
-        allow_general_tokens: value(tokens, "allow_general_tokens", false),
-        min_remaining_balance: value(tokens, "min_remaining_balance", null),
-        challenge_budget: value(tokens, "challenge_budget", null),
+        allow_general_tokens: value(tokens, "allow_general_tokens"),
+        min_remaining_balance: value(tokens, "min_remaining_balance"),
+        challenge_budget: value(tokens, "challenge_budget"),
       },
       checks: {
-        allowed: value(checks, "allowed", [...TRIGGERABLE_CHECK_KEYS]),
+        allowed: value(checks, "allowed"),
         require_explicit_selection: value(
           checks,
           "require_explicit_selection",
-          true,
         ),
-        max_checks_per_request: value(checks, "max_checks_per_request", 3),
-        max_active: value(checks, "max_active", 3),
-        allow_contests: value(checks, "allow_contests", false),
+        max_checks_per_request: value(checks, "max_checks_per_request"),
+        max_active: value(checks, "max_active"),
+        allow_contests: value(checks, "allow_contests"),
       },
       auto_review: {
-        allow_force_refresh: value(review, "allow_force_refresh", false),
+        allow_force_refresh: value(review, "allow_force_refresh"),
       },
     };
     const caps = object(
@@ -187,10 +181,11 @@ export function parsePolicy(text: string): Policy {
         );
     }
     if (
-      !Array.isArray(result.checks.allowed) ||
-      result.checks.allowed.some(
-        (key) => !TRIGGERABLE_CHECK_KEYS.includes(key as any),
-      )
+      result.checks.allowed !== null &&
+      (!Array.isArray(result.checks.allowed) ||
+        result.checks.allowed.some(
+          (key) => !TRIGGERABLE_CHECK_KEYS.includes(key as any),
+        ))
     ) {
       throw new Error(
         `checks.allowed must contain public dynamic check keys: ${TRIGGERABLE_CHECK_KEYS.join(", ")}`,
@@ -200,8 +195,8 @@ export function parsePolicy(text: string): Policy {
       "checks.max_checks_per_request": result.checks.max_checks_per_request,
     };
     for (const [key, n] of Object.entries(integers))
-      if (!Number.isSafeInteger(n) || n < 0)
-        throw new Error(`${key} must be a non-negative integer`);
+      if (n !== null && (!Number.isSafeInteger(n) || n < 0))
+        throw new Error(`${key} must be null or a non-negative integer`);
     const attempts = result.runs.re_evaluation.max_attempts;
     if (attempts !== null && (!Number.isSafeInteger(attempts) || attempts < 0))
       throw new Error(
@@ -236,7 +231,7 @@ export function parsePolicy(text: string): Policy {
       "checks.allow_contests": result.checks.allow_contests,
       "runs.allow_contests": result.runs.allow_contests,
     }))
-      if (typeof v !== "boolean") throw new Error(`${key} must be a boolean`);
+      if (v !== null && typeof v !== "boolean") throw new Error(`${key} must be null or a boolean`);
     return result;
   } catch (error) {
     if (error instanceof PolicyError) throw error;
@@ -247,11 +242,10 @@ export function parsePolicy(text: string): Policy {
   }
 }
 
-/** Editor schema shares runtime defaults and model/check choices. */
 export function policySchema(): Record<string, unknown> {
   const defaults = parsePolicy(defaultPolicyYaml);
   const mapping = (properties: Record<string, any>) => ({
-    type: "object",
+    type: ["object", "null"],
     additionalProperties: false,
     properties,
   });
@@ -271,7 +265,7 @@ export function policySchema(): Record<string, unknown> {
                 ...integer,
                 default: cap,
                 description:
-                  "Maximum current original runs; zero, null or omission blocks this model.",
+                  "Maximum current original runs; zero blocks this model, null or omission disables its limit.",
               },
             ]),
           ),
@@ -280,7 +274,7 @@ export function policySchema(): Record<string, unknown> {
       };
     if (path === "checks.allowed")
       return {
-        type: "array",
+        type: ["array", "null"],
         items: { type: "string", enum: [...TRIGGERABLE_CHECK_KEYS] },
         default: value,
       };
@@ -292,10 +286,10 @@ export function policySchema(): Record<string, unknown> {
       path === "runs.re_evaluation.max_attempts"
     )
       return { ...integer, default: value };
-    if (typeof value === "boolean") return { type: "boolean", default: value };
+    if (typeof value === "boolean") return { type: ["boolean", "null"], default: value };
     if (typeof value === "number")
       return {
-        type: "integer",
+        type: ["integer", "null"],
         minimum: 0,
         maximum: Number.MAX_SAFE_INTEGER,
         default: value,
@@ -322,7 +316,7 @@ export function loadPolicy(): Policy {
     text = readFileSync(policyPath(), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return parsePolicy(defaultPolicyYaml);
+      return parsePolicy("{}");
     }
     throw new PolicyError("policy.unreadable", `Cannot read ${policyPath()}`);
   }
@@ -333,7 +327,7 @@ export function assertTokenPolicy(
   args: { useGeneralTokens?: unknown },
   policy = loadPolicy(),
 ): void {
-  if (args.useGeneralTokens && !policy.tokens.allow_general_tokens)
+  if (args.useGeneralTokens && policy.tokens.allow_general_tokens === false)
     throw new PolicyError(
       "tokens.allow_general_tokens",
       "Explicit use of general tokens is disabled by policy",
@@ -354,10 +348,10 @@ export function solverName(
   return Object.hasOwn(names, type) ? names[type] : undefined;
 }
 
-export function runLimit(model: string, policy = loadPolicy()): number {
+export function runLimit(model: string, policy = loadPolicy()): number | null {
   const name = solverName(model);
   if (!name) throw new PolicyError("runs.max_runs", "Unknown requested model");
-  return policy.runs.max_runs[name] ?? 0;
+  return policy.runs.max_runs[name] ?? null;
 }
 
 export function assertRunCount(
@@ -366,7 +360,7 @@ export function assertRunCount(
   policy = loadPolicy(),
 ): void {
   const limit = runLimit(model, policy);
-  if (count > limit)
+  if (limit !== null && count > limit)
     throw new PolicyError(
       "runs.max_runs",
       "Requested runs exceed the limit for current inputs",
@@ -380,7 +374,7 @@ export function assertRunRequest(
   batchName: unknown,
   policy = loadPolicy(),
 ): void {
-  if (batchName !== undefined && !policy.runs.allow_manual_batch_name)
+  if (batchName !== undefined && policy.runs.allow_manual_batch_name === false)
     throw new PolicyError(
       "runs.allow_manual_batch_name",
       "Manual batch names are disabled by policy",
@@ -396,6 +390,15 @@ export function assertRunCapacity(
   requested: RunConfig[],
   policy = loadPolicy(),
 ): void {
+  const requests = new Map<string, number>();
+  for (const config of requested) {
+    const model = solverName(config.taskAgentType);
+    if (!model)
+      throw new PolicyError("runs.max_runs", "Unknown requested model");
+    if (runLimit(model, policy) !== null)
+      requests.set(model, (requests.get(model) ?? 0) + 1);
+  }
+  if (!requests.size) return;
   const unavailable = (message: string): never => {
     throw new PolicyError("runs.state_unavailable", message);
   };
@@ -436,17 +439,10 @@ export function assertRunCapacity(
     seen.set(run.id, identity);
     if (!tagged) counts.set(model, (counts.get(model) ?? 0) + 1);
   }
-  const requests = new Map<string, number>();
-  for (const config of requested) {
-    const model = solverName(config.taskAgentType);
-    if (!model)
-      throw new PolicyError("runs.max_runs", "Unknown requested model");
-    requests.set(model, (requests.get(model) ?? 0) + 1);
-  }
   for (const [model, count] of requests) {
     const limit = runLimit(model, policy),
       existing = counts.get(model) ?? 0;
-    if (existing + count > limit)
+    if (limit !== null && existing + count > limit)
       throw new PolicyError(
         "runs.max_runs",
         "Requested runs exceed the model limit for current inputs",
@@ -487,7 +483,7 @@ export function isPolicyEndpoint(
 }
 
 export function assertRunPreset(preset: unknown, policy = loadPolicy()): void {
-  if (preset === "full" && !policy.runs.allow_full_preset)
+  if (preset === "full" && policy.runs.allow_full_preset === false)
     throw new PolicyError(
       "runs.allow_full_preset",
       "The full rollout preset is disabled by policy",
@@ -538,13 +534,14 @@ export function assertCheckSelection(
       "Select at least one check",
     );
   const unique = [...new Set(keys.map(toPublicCheckKey))];
-  if (unique.some((key) => !policy.checks.allowed.includes(key)))
+  const allowed = policy.checks.allowed;
+  if (allowed !== null && unique.some((key) => !allowed.includes(key)))
     throw new PolicyError(
       "checks.allowed",
       "The request contains a disallowed check",
       { allowed: policy.checks.allowed, requested: unique },
     );
-  if (unique.length > policy.checks.max_checks_per_request)
+  if (policy.checks.max_checks_per_request !== null && unique.length > policy.checks.max_checks_per_request)
     throw new PolicyError(
       "checks.max_checks_per_request",
       "Too many checks in one request",
@@ -560,7 +557,7 @@ export function assertPaidEndpoint(
   if (!isPolicyEndpoint(name, args)) return;
   const effective = policy ?? loadPolicy();
   assertTokenPolicy(args, effective);
-  if (name === "runAgentRuns:cancelRun" && !effective.runs.allow_cancellations)
+  if (name === "runAgentRuns:cancelRun" && effective.runs.allow_cancellations === false)
     throw new PolicyError(
       "runs.allow_cancellations",
       "Run cancellations are disabled by guardrails",
@@ -568,20 +565,20 @@ export function assertPaidEndpoint(
   if (
     name === "runAgentRuns:scratchRun" &&
     args.scratched !== false &&
-    !effective.runs.allow_contests
+    effective.runs.allow_contests === false
   )
     throw new PolicyError(
       "runs.allow_contests",
       "Run contests are disabled by policy",
     );
-  if (contestEndpoints.has(name) && !effective.checks.allow_contests)
+  if (contestEndpoints.has(name) && effective.checks.allow_contests === false)
     throw new PolicyError(
       "checks.allow_contests",
       "Check contests are disabled by policy",
     );
   if (
     name === "reEvalRuns:triggerReEvalRuns" &&
-    !effective.runs.re_evaluation.enabled
+    effective.runs.re_evaluation.enabled === false
   )
     throw new PolicyError(
       "runs.re_evaluation.enabled",
@@ -592,7 +589,7 @@ export function assertPaidEndpoint(
   if (
     name === "orchestratorReview:triggerOrchestratorReview" &&
     args.forceFresh &&
-    !effective.auto_review.allow_force_refresh
+    effective.auto_review.allow_force_refresh === false
   )
     throw new PolicyError(
       "auto_review.allow_force_refresh",

@@ -1,6 +1,6 @@
 import { CliError } from "./errors.ts";
 import { defineCommand } from "citty";
-import { assertRemoteReevaluationAttempts, inspectReevaluationHistory, assertRunCount, assertPaidEndpoint, assertRunCapacity, assertRunPreset, assertRunRequest, assertTokenPolicy, loadPolicy } from "./policy.ts";
+import { assertRemoteReevaluationAttempts, inspectReevaluationHistory, assertRunCount, assertPaidEndpoint, assertRunCapacity, assertRunPreset, assertRunRequest, assertTokenPolicy, loadPolicy, runLimit } from "./policy.ts";
 import { api, getClient, requireProblemVersion } from "./convex.ts";
 import { printJson, printKeyValue, printTable, statusBadge, truncate } from "./format.ts";
 import { omitEmpty, paginate, parsePositiveInteger, sliceText } from "./output.ts";
@@ -231,8 +231,10 @@ async function triggerBatch(args) {
         ? await getPresetConfigs(client, args.preset, isDiamond)
         : buildConfigs(args);
     assertRunRequest(configs, args.batchName, policy);
-    const records = await client.query(api.runAgentRuns.getAgentRuns, { versionId: version._id });
-    assertRunCapacity(records, configs, policy);
+    if (configs.some(config => runLimit(config.taskAgentType, policy) !== null)) {
+        const records = await client.query(api.runAgentRuns.getAgentRuns, { versionId: version._id });
+        assertRunCapacity(records, configs, policy);
+    }
     if (args.preset === "quick") {
         if (configs.length !== 1) {
             throw new Error(`Quick preset must resolve to exactly one run, got ${configs.length}.`);
