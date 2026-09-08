@@ -10,6 +10,7 @@ Use it to inspect and edit challenges, run prechecks and quality checks, manage 
 - [Get started](#get-started)
 - [Command overview](#command-overview)
 - [Inspect a challenge](#inspect-a-challenge)
+- [Live terminal dashboard](#live-terminal-dashboard)
 - [Build the version image](#build-the-version-image)
 - [Prechecks and quality checks](#prechecks-and-quality-checks)
 - [Scope Gate and later-stage reviews](#scope-gate-and-later-stage-reviews)
@@ -23,6 +24,8 @@ Use it to inspect and edit challenges, run prechecks and quality checks, manage 
 - [Development](#development)
 
 ## Installation
+
+Requires Node.js 20 or newer and pnpm. This repository is installed from source; the package is marked private and self-update is disabled unless explicitly configured. `policy edit` additionally requires `flock` (util-linux), so use Linux/WSL or a Linux SSH host for that command.
 
 ```bash
 git clone https://github.com/gustavo-ferreira03/olympus-cli.git
@@ -75,9 +78,15 @@ olympus contest          Quality-check contests
 olympus runs             Rollout batches, runs, artifacts, and re-evaluation
 olympus tokens           Token balance, usage history, and challenge costs
 olympus policy           Local guardrails
+olympus dashboard        Read-only terminal dashboard with polling
+olympus schema           JSON command discovery from the running CLI
 ```
 
 Run `olympus <command> --help` for the exact arguments accepted by a command.
+Groups without an action display their own help. `olympus schema` emits the
+declared command tree as JSON; `olympus schema runs run` selects one command.
+The manifest includes paths, metadata, argument definitions, declared defaults,
+aliases, flags and child names. Undeclared response schemas and examples are not invented.
 
 ## Inspect a challenge
 
@@ -108,6 +117,20 @@ Request the complete backend payload only when necessary:
 ```bash
 olympus problems view <challenge-id> --json --full
 ```
+
+## Live terminal dashboard
+
+```bash
+olympus dashboard <challenge-id>
+olympus dashboard <challenge-id> --interval=5
+olympus dashboard <challenge-id> --json
+```
+
+The interactive dashboard follows the latest version and polls automatically (1–300 seconds; default 5). It only reads data: it never starts checks, rollouts, builds, or submissions. Both stdin and stdout must be a TTY; use `--json` for a single snapshot in scripts. Interactive fetch failures retain the last data and retry silently; `--json` retains per-source diagnostics and exits non-zero on partial failure.
+
+Status badges stay abbreviated (`PASS`, `FAIL`, `WARN`); full verdicts remain in details. Auto Review bands appear as `1/3`, `2/3`, and `3/3`. The terminal background is preserved.
+
+Keys: `q` or Ctrl-C exits, `r` refreshes, Tab switches selection between checks, runs and readiness, Up/Down selects an item, and Enter toggles details. PgUp/PgDn moves by ten items, or scrolls the text while details are open. `h` toggles run history. Resize does not stop polling. On very small screens the viewport follows the selected item without changing the section order.
 
 ## Build the version image
 
@@ -362,12 +385,24 @@ Machine-readable commands follow these rules:
 
 - stdout contains exactly one JSON document;
 - polling progress is suppressed in JSON mode;
-- expected failures return `{ "status": "error", "error": "..." }` with a non-zero exit code;
+- command exceptions preserve `status`, the text `error`, and guardrail `rule`/details, and add `kind`, `code`, `retryable` and `hint`;
 - empty waits return `status: "idle"` instead of historical payloads;
 - null and empty fields are removed from compact responses;
 - large raw payloads require `--full`;
 - paginated responses include `nextCommand` when more data exists;
-- transient connection failures are retried automatically.
+- wait commands retry transient connection failures while polling.
+
+Error kinds include `usage`, `auth`, `permission`, `not_found`, `rate_limit`,
+`network`, `config`, `policy`, `budget` and `unknown`. Classification uses typed
+errors, known codes and HTTP statuses, not message wording. Unknown failures
+have `retryable: null`. A transient error is not proof that a paid request was
+rejected: inspect remote state before retrying. Existing exit codes and explicit
+`--json` behavior are unchanged; schema is always JSON except its help.
+
+Diagnostic stderr and top-level error messages are stripped of terminal control,
+bidi and zero-width characters. Artifact content and successful stdout data are
+not rewritten. Sanitization is not a prompt-injection defense for ordinary prose.
+Version checks are skipped for JSON output and help, and cancelled on completion.
 
 This removes the need for ad-hoc `sleep`, polling loops, `jq`, grep, head, or tail in normal agent workflows.
 
@@ -405,7 +440,7 @@ olympus problems submit <challenge-id> --json
 ## Guardrails
 
 `olympus policy show --json` shows and validates the guardrails.
-`olympus policy init` creates `~/.shipd/olympus/policy.yml` without overwriting it.
+`olympus policy init` explicitly creates `~/.shipd/olympus/policy.yml` with the suggested rules below, without overwriting it.
 `policy init` also creates `policy.schema.json` beside the `.yml` file. The
 `# yaml-language-server: $schema=./policy.schema.json` directive enables autocomplete
 and validation in editors with YAML Language Server support (such as VS Code with
@@ -423,7 +458,7 @@ olympus policy edit tokens.min_remaining_balance 20 --json
 ```
 
 `--json` requires a key and value. Comments and other settings are preserved;
-a missing file starts with the defaults. Existing disabled settings are not
+a missing file starts with no rules. Existing disabled settings are not
 automatically enabled.
 
 A minimum-balance rejection reports the required balance, shortfall, and an
@@ -433,7 +468,11 @@ and server timing can change it. Unknown or stale schedules report an unknown
 wait; a required balance above the current cap cannot be reached by drip alone.
 The CLI does not wait, refresh tokens, or submit a paid operation on rejection.
 
-Edit that file to configure the rules; omitted fields use these defaults, also active when the file is absent:
+Every omitted or explicit `null` rule is disabled. Missing or `null` groups disable all rules inside them, including `runs.re_evaluation` and `runs.max_runs`. A missing, empty, or `null` policy file leaves every local policy guard inactive; malformed values and unknown keys still fail validation. Platform eligibility and basic request validation remain independent of local policy.
+
+Explicit `false` values for `allow_*` and re-evaluation `enabled` prohibit the operation; `true` permits it. `require_explicit_selection: true` requires selection, while `false` does not. Numeric `0` is an active limit, not a disabled rule: zero run/check/attempt limits block requests, a zero challenge budget blocks positive costs, and a zero minimum balance prevents spending below zero. `checks.allowed: []` permits no checks. An omitted or `null` model under `runs.max_runs` has no local run cap, even when another model has a cap.
+
+`policy show --json` normalizes disabled leaves to `null` and reports `source: "missing"` when no file exists. The following is the optional `policy init` template, not runtime defaults; editor schema defaults are suggestions only:
 
 ```yaml
 # yaml-language-server: $schema=./policy.schema.json
