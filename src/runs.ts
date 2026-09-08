@@ -944,6 +944,10 @@ const artifact = defineCommand({
     },
     run: async ({ args }) => {
         if (!args.key) {
+            if (args.json) {
+                printJson(COMMON_RUN_ARTIFACT_KEYS.map((key) => ({ key })));
+                return;
+            }
             console.log("\n  Common rollout artifact keys:");
             for (const key of COMMON_RUN_ARTIFACT_KEYS) {
                 console.log(`    - ${key}`);

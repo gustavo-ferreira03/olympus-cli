@@ -730,6 +730,10 @@ const artifact = defineCommand({
         const artifactKey = args.key;
         if (!artifactKey) {
             const available = CHECK_ARTIFACTS[checkKey];
+            if (args.json) {
+                printJson((available ?? []).map((key) => ({ key })));
+                return;
+            }
             if (!available) {
                 console.log(`\n  No curated artifact list for ${checkKey}.`);
                 console.log("  Pass `--key <artifact-key>` if you already know the artifact name.\n");

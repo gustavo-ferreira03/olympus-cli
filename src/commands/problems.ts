@@ -260,6 +260,10 @@ const mine = defineCommand({
             queryArgs.status = args.status;
         const problems = (await client.query(api.problems.listByUser, queryArgs));
         if (!problems || problems.length === 0) {
+            if (args.json) {
+                printJson([]);
+                return;
+            }
             console.log("  No challenges found.");
             return;
         }
@@ -297,6 +301,10 @@ const queue = defineCommand({
         const limit = Number.parseInt(args.limit ?? "", 10) || DEFAULT_LIMIT;
         const problems = (await client.query(api.problems.listForReview, {}));
         if (!problems || problems.length === 0) {
+            if (args.json) {
+                printJson([]);
+                return;
+            }
             console.log("  Review queue is empty.");
             return;
         }
