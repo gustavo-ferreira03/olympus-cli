@@ -155,17 +155,28 @@ function inferRepoDirName(repoUrl) {
     const cleaned = lastSegment.replace(/\.git$/i, "") || "repo";
     return cleaned;
 }
+function makeShellArgument(value: unknown): string {
+    const text = String(value);
+    if (/[\r\n\0]/.test(text)) {
+        throw new Error("Cannot generate Makefile: metadata contains a line break or NUL byte");
+    }
+    const quoted = "'" + text.replace(/'/g, "'\"'\"'") + "'";
+    return quoted.replace(/\$/g, "$$$$").replace(/(\\*)#/g, (_, slashes) => slashes + slashes + "\\#");
+}
 function buildMakefile(problem, version) {
     const metadata = buildDownloadMetadata(problem, version);
     const repoUrl = metadata.repoUrl ?? "";
     const commitHash = metadata.commitHash ?? "";
-    const repoDir = inferRepoDirName(metadata.repoUrl);
-    return `PROBLEM_ID := ${metadata.problemId}
-VERSION := ${metadata.version}
-REPO_URL := ${repoUrl}
-COMMIT := ${commitHash}
-IMAGE_TAG := olympus-$(PROBLEM_ID)-v$(VERSION)
-REPO_DIR := ${repoDir}
+    if (String(commitHash).startsWith("-")) {
+        throw new Error("Cannot generate Makefile: commit must not start with a dash");
+    }
+    const repoDir = `./${inferRepoDirName(metadata.repoUrl)}`;
+    return `PROBLEM_ID := ${makeShellArgument(metadata.problemId)}
+VERSION := ${makeShellArgument(metadata.version)}
+REPO_URL := ${makeShellArgument(repoUrl)}
+COMMIT := ${makeShellArgument(commitHash)}
+IMAGE_TAG := ${makeShellArgument(`olympus-${metadata.problemId}-v${metadata.version}`)}
+REPO_DIR := ${makeShellArgument(repoDir)}
 
 .PHONY: help clone checkout apply-test-patch apply-solution-patch build-image
 
@@ -177,25 +188,25 @@ help:
 	@echo "build-image          Build from the checked-out repo context on linux/amd64"
 
 clone:
-	@if [ -z "$(REPO_URL)" ]; then echo "REPO_URL is empty"; exit 1; fi
-	@if [ -z "$(COMMIT)" ]; then echo "COMMIT is empty"; exit 1; fi
-	@if [ ! -d "$(REPO_DIR)/.git" ]; then git clone --recursive "$(REPO_URL)" "$(REPO_DIR)"; else echo "repo already exists at $(REPO_DIR)"; fi
-	@cd "$(REPO_DIR)" && git fetch --all --tags && git checkout "$(COMMIT)" && git submodule update --init --recursive
+	@if [ -z $(REPO_URL) ]; then echo "REPO_URL is empty"; exit 1; fi
+	@if [ -z $(COMMIT) ]; then echo "COMMIT is empty"; exit 1; fi
+	@if [ ! -d $(REPO_DIR)/.git ]; then git clone --recursive -- $(REPO_URL) $(REPO_DIR); else printf 'repo already exists at %s\\n' $(REPO_DIR); fi
+	@cd $(REPO_DIR) && git fetch --all --tags && git checkout $(COMMIT) -- && git submodule update --init --recursive
 
 checkout:
-	@if [ -z "$(COMMIT)" ]; then echo "COMMIT is empty"; exit 1; fi
-	@if [ ! -d "$(REPO_DIR)/.git" ]; then echo "repo not present at $(REPO_DIR); run make clone"; exit 1; fi
-	@cd "$(REPO_DIR)" && git fetch --all --tags && git checkout "$(COMMIT)" && git submodule update --init --recursive
+	@if [ -z $(COMMIT) ]; then echo "COMMIT is empty"; exit 1; fi
+	@if [ ! -d $(REPO_DIR)/.git ]; then printf 'repo not present at %s; run make clone\\n' $(REPO_DIR); exit 1; fi
+	@cd $(REPO_DIR) && git fetch --all --tags && git checkout $(COMMIT) -- && git submodule update --init --recursive
 
 apply-test-patch: checkout
-	@if [ -f test.patch ]; then cd "$(REPO_DIR)" && git apply ../test.patch; else echo "test.patch not present"; fi
+	@if [ -f test.patch ]; then cd $(REPO_DIR) && git apply ../test.patch; else echo "test.patch not present"; fi
 
 apply-solution-patch: checkout
-	@if [ -f solution.patch ]; then cd "$(REPO_DIR)" && git apply ../solution.patch; else echo "solution.patch not present"; fi
+	@if [ -f solution.patch ]; then cd $(REPO_DIR) && git apply ../solution.patch; else echo "solution.patch not present"; fi
 
 build-image: checkout
 	@if [ ! -f Dockerfile ]; then echo "Dockerfile not present"; exit 1; fi
-	@cd "$(REPO_DIR)" && rm -f .dockerignore && docker build --platform linux/amd64 -f ../Dockerfile -t "$(IMAGE_TAG)" .
+	@cd $(REPO_DIR) && rm -f .dockerignore && docker build --platform linux/amd64 -f ../Dockerfile -t $(IMAGE_TAG) .
 `;
 }
 const create = defineCommand({
@@ -324,7 +335,7 @@ const view = defineCommand({
         });
         if (!data) {
             throw new CliError(`Challenge not found: ${args.id}`, {
-                kind: "not_found", code: "resource.not_found", retryable: false, hint: "Verify the challenge ID with olympus problems list.",
+                kind: "not_found", code: "resource.not_found", retryable: false, hint: "Verify the challenge ID with olympus problems mine or olympus problems queue.",
             });
         }
         const latestVersion = data.latestVersion;
@@ -488,7 +499,7 @@ const download = defineCommand({
         });
         if (!data) {
             throw new CliError(`Challenge not found: ${args.id}`, {
-                kind: "not_found", code: "resource.not_found", retryable: false, hint: "Verify the challenge ID with olympus problems list.",
+                kind: "not_found", code: "resource.not_found", retryable: false, hint: "Verify the challenge ID with olympus problems mine or olympus problems queue.",
             });
         }
         const latestVersion = data.latestVersion;
