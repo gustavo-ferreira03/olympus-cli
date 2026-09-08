@@ -5,6 +5,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { CliError } from "./errors.ts";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
@@ -87,8 +88,9 @@ export function clearCredentials(): boolean {
 export function requireAuth(): Credentials {
   const credentials = loadCredentials();
   if (!credentials) {
-    console.error("Not logged in. Run: olympus auth login");
-    process.exit(1);
+    throw new CliError("Not logged in. Run: olympus auth login", {
+      kind: "auth", code: "auth.required", retryable: false, hint: "Run: olympus auth login",
+    });
   }
   return credentials;
 }

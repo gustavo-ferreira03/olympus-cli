@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { CliError } from "../errors.ts";
 import { defineCommand } from "citty";
 import { api, asId, getClient, parseVersionNumber, requireProblemVersion, resolveProblemVersion } from "../convex.ts";
 import { printJson, printKeyValue, printTable, statusBadge, truncate } from "../format.ts";
@@ -122,9 +123,9 @@ function ensureDownloadDirectory(directory, force) {
     }
     const entries = readdirSync(directory);
     if (entries.length > 0 && !force) {
-        console.error(`  Refusing to write into non-empty directory: ${directory}`);
-        console.error("  Re-run with --force or choose --out <dir>.");
-        process.exit(1);
+        throw new CliError(`Refusing to write into non-empty directory: ${directory}`, {
+            kind: "usage", code: "input.directory_not_empty", retryable: false, hint: "Re-run with --force or choose --out <dir>.",
+        });
     }
 }
 function buildDownloadMetadata(problem, version) {
@@ -322,8 +323,9 @@ const view = defineCommand({
             problemId: asId(args.id),
         });
         if (!data) {
-            console.error(`  Challenge not found: ${args.id}`);
-            process.exit(1);
+            throw new CliError(`Challenge not found: ${args.id}`, {
+                kind: "not_found", code: "resource.not_found", retryable: false, hint: "Verify the challenge ID with olympus problems list.",
+            });
         }
         const latestVersion = data.latestVersion;
         if (args.json && !args.full) {
@@ -485,13 +487,15 @@ const download = defineCommand({
             problemId: asId(args.id),
         });
         if (!data) {
-            console.error(`  Challenge not found: ${args.id}`);
-            process.exit(1);
+            throw new CliError(`Challenge not found: ${args.id}`, {
+                kind: "not_found", code: "resource.not_found", retryable: false, hint: "Verify the challenge ID with olympus problems list.",
+            });
         }
         const latestVersion = data.latestVersion;
         if (!latestVersion) {
-            console.error("  No version found.");
-            process.exit(1);
+            throw new CliError("No version found.", {
+                kind: "not_found", code: "resource.not_found", retryable: false, hint: "Verify that the challenge has a version.",
+            });
         }
         const outDir = resolve(args.out ?? `olympus-${String(data._id)}-v${latestVersion.version}`);
         ensureDownloadDirectory(outDir, !!args.force);
@@ -633,9 +637,9 @@ const edit = defineCommand({
         if (args["github-issue-url"] !== undefined)
             updates.githubIssueUrl = args["github-issue-url"];
         if (Object.keys(updates).length === 0) {
-            console.error("  No fields to update. Use flags like --title or --test-patch <file>.");
-            console.error("  Run: olympus problems edit --help");
-            process.exit(1);
+            throw new CliError("No fields to update. Use flags like --title or --test-patch <file>.", {
+                kind: "usage", code: "input.missing_update", retryable: false, hint: "Run: olympus problems edit --help",
+            });
         }
         const result = await client.mutation(api.problems.updateDraft, {
             problemId: asId(args.id),

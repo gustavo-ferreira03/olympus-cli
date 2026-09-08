@@ -1,3 +1,4 @@
+import { CliError } from "../errors.ts";
 import { exec, execFile } from "node:child_process";
 import { createInterface } from "node:readline";
 import { defineCommand } from "citty";
@@ -31,8 +32,9 @@ const login = defineCommand({
         openBrowser(authUrl);
         const token = await prompt("  Paste your token: ");
         if (!token) {
-            console.error("  No token provided.");
-            process.exit(1);
+            throw new CliError("No token provided.", {
+                kind: "auth", code: "auth.missing_token", retryable: false, hint: "Run olympus auth login and paste your token.",
+            });
         }
         try {
             const identity = saveCredentials(token);
@@ -43,8 +45,9 @@ const login = defineCommand({
             console.log(`  Expires:   ${expiresAt}\n`);
         }
         catch {
-            console.error("  Invalid token.");
-            process.exit(1);
+            throw new CliError("Invalid token.", {
+                kind: "auth", code: "auth.invalid_token", retryable: false, hint: "Run olympus auth login and provide a valid token.",
+            });
         }
     },
 });

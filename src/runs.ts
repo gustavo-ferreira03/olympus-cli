@@ -1,3 +1,4 @@
+import { CliError } from "./errors.ts";
 import { defineCommand } from "citty";
 import { assertRemoteReevaluationAttempts, inspectReevaluationHistory, assertRunCount, assertPaidEndpoint, assertRunCapacity, assertRunPreset, assertRunRequest, assertTokenPolicy, loadPolicy } from "./policy.ts";
 import { api, getClient, requireProblemVersion } from "./convex.ts";
@@ -60,9 +61,9 @@ function summarizeConfigMix(configs) {
 function parseAgentTypeOrExit(value, flag) {
     const parsed = parseAgentTypeInput(value);
     if (!parsed) {
-        console.error(`  Invalid --${flag} value: ${value ?? "(missing)"}`);
-        console.error(`  Use one of: ${AGENT_INPUT_HELP}`);
-        process.exit(1);
+        throw new CliError(`Invalid --${flag} value: ${value ?? "(missing)"}`, {
+            kind: "usage", code: "input.invalid_agent", retryable: false, hint: `Use one of: ${AGENT_INPUT_HELP}`,
+        });
     }
     return parsed;
 }

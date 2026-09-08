@@ -18,30 +18,32 @@ import { PolicyError } from "./policy.ts";
 import { BudgetError } from "./budget.ts";
 import { printJson } from "./format.ts";
 import { checkVersion, UPDATE_PACKAGE_NAME } from "./config.ts";
+import { CliError, describeError, sanitizeDiagnostic } from "./errors.ts";
+import { installDiagnosticOutput } from "./diagnostics.ts";
+import { createSchemaCommand } from "./schema.ts";
+installDiagnosticOutput();
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
 const update = defineCommand({
     meta: { name: "update", description: "Update the CLI to the latest version" },
     args: {
         version: { type: "string", description: "Target version (default: latest)" },
+        json: { type: "boolean", description: "Output JSON" },
     },
     run: async ({ args }) => {
         if (!UPDATE_PACKAGE_NAME) {
-            console.error("\n  Self-update is disabled for this private fork.");
-            console.error("  Update from your repository and run: pnpm install && pnpm build");
-            console.error("  If you publish under your own npm scope, set OLYMPUS_UPDATE_PACKAGE.\n");
-            process.exit(1);
+            throw new CliError("Self-update is disabled for this private fork.", { kind: "config", code: "update.disabled", retryable: false, hint: "Update from your repository and run pnpm install && pnpm build, or configure OLYMPUS_UPDATE_PACKAGE for your published fork." });
         }
         const target = args.version ?? "latest";
         const spec = `${UPDATE_PACKAGE_NAME}@${target}`;
-        console.log(`\n  Updating to ${spec}...`);
+        if (!args.json) console.log(`\n  Updating to ${spec}...`);
         try {
-            execFileSync("npm", ["install", "-g", spec], { stdio: "inherit" });
-            console.log(`\n  Updated successfully.`);
+            execFileSync("npm", ["install", "-g", spec], { stdio: args.json ? "pipe" : "inherit" });
+            if (args.json) printJson({ status: "updated", package: UPDATE_PACKAGE_NAME, version: target });
+            else console.log(`\n  Updated successfully.`);
         }
         catch {
-            console.error(`\n  Update failed. Try manually: npm install -g ${spec}`);
-            process.exit(1);
+            throw new CliError("Update failed.", { kind: "unknown", code: "update.failed", retryable: null, hint: `Inspect the npm failure before retrying npm install -g ${spec}.` });
         }
     },
 });
@@ -88,6 +90,7 @@ const main = defineCommand({
         }),
     },
 });
+Object.assign(main.subCommands!, { schema: createSchemaCommand(main) });
 function errorMessage(error: unknown): string {
     if (error && typeof error === "object" && "data" in error) {
         const data = (error as { data?: unknown }).data;
@@ -98,6 +101,7 @@ function errorMessage(error: unknown): string {
 }
 
 const rawArgs = process.argv.slice(2);
+const jsonOutput = rawArgs.includes("--json") || rawArgs[0] === "schema";
 const usesBuiltinOutput = rawArgs.some((arg) => arg === "--help" || arg === "-h") ||
     (rawArgs.length === 1 && (rawArgs[0] === "--version" || rawArgs[0] === "-v"));
 
@@ -108,6 +112,7 @@ else {
     const versionCheck = new AbortController();
     let versionCheckTimeout: ReturnType<typeof setTimeout> | undefined;
     const versionCheckStart = setImmediate(() => {
+        if (jsonOutput) return;
         versionCheckTimeout = setTimeout(() => versionCheck.abort(), 2000);
         versionCheckTimeout.unref();
         void checkVersion(versionCheck.signal);
@@ -122,10 +127,10 @@ else {
         }
         else {
             const message = errorMessage(error);
-            if (rawArgs.includes("--json")) {
-                printJson(error instanceof PolicyError || error instanceof BudgetError
-                    ? { status: "blocked", error: message, rule: error.rule, ...error.details }
-                    : { status: "error", error: message });
+            if (jsonOutput) {
+                printJson({ ...(error instanceof PolicyError || error instanceof BudgetError
+                    ? { status: "blocked", rule: sanitizeDiagnostic(error.rule), ...error.details }
+                    : { status: "error" }), error: sanitizeDiagnostic(message), ...describeError(error) });
             }
             else {
                 console.error(`Error: ${message}`);

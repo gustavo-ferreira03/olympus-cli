@@ -1,3 +1,4 @@
+import { CliError } from "./errors.ts";
 import { requireAuth } from "./auth.ts";
 
 const DEFAULT_API_URL =
@@ -38,10 +39,11 @@ export async function api<T>(path: string, opts: RequestOptions = {}): Promise<T
   if (!response.ok) {
     const text = await response.text();
     if (response.status === 401) {
-      console.error("Session expired. Run: olympus auth login");
-      process.exit(1);
+      throw new CliError("Session expired. Run: olympus auth login", {
+        kind: "auth", code: "auth.session_expired", retryable: false, hint: "Run: olympus auth login",
+      });
     }
-    throw new Error(`API error (${response.status}): ${text}`);
+    throw Object.assign(new Error(`API error (${response.status}): ${text}`), { status: response.status });
   }
   return (await response.json()) as T;
 }

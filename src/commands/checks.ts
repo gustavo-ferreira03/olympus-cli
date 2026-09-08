@@ -1,3 +1,4 @@
+import { CliError } from "../errors.ts";
 import { defineCommand } from "citty";
 import { assertCheckCapacity, assertCheckSelection, assertPaidEndpoint, assertTokenPolicy } from "../policy.ts";
 import { api, asId, getClient, requireProblemVersion } from "../convex.ts";
@@ -233,9 +234,18 @@ const run = defineCommand({
         json: { type: "boolean", description: "Output as JSON" },
     },
     run: async ({ args }) => {
-        if (args.list || !args.check) {
-            if (!args.list) {
-                console.error("\n  Missing --check.");
+        if (!args.list && !args.check) {
+            throw new CliError("Missing --check.", {
+                kind: "usage", code: "input.missing_check", retryable: false, hint: "Run olympus checks run <id> --list to see available keys, or olympus checks run --help.",
+            });
+        }
+        if (args.list) {
+            if (args.json) {
+                printJson({
+                    checks: TRIGGERABLE_CHECK_KEYS.map(key => ({ key, label: formatDynamicCheckLabel(key), includedInRunAll: includesKey(DEFAULT_RUN_ALL_CHECK_KEYS, key) })),
+                    laterStageChecks: NON_GATING_CHECK_KEYS.map(key => ({ key, label: formatDynamicCheckLabel(key) })),
+                });
+                return;
             }
             console.log("\n  Available check keys:");
             for (const key of TRIGGERABLE_CHECK_KEYS) {
@@ -248,8 +258,6 @@ const run = defineCommand({
                 console.log(`    \x1b[90m${key.padEnd(24)} ${formatDynamicCheckLabel(key)}\x1b[0m`);
             }
             console.log("");
-            if (!args.list)
-                process.exit(1);
             return;
         }
         const checkKey = toPublicCheckKey(args.check);
@@ -338,8 +346,9 @@ const runAll = defineCommand({
                 );
             }
             if (requested.length === 0) {
-                console.error("\n  --checks was empty.\n");
-                process.exit(1);
+                throw new CliError("--checks was empty.", {
+                    kind: "usage", code: "input.empty_checks", retryable: false, hint: "Provide comma-separated check keys; run olympus checks run <id> --list for options.",
+                });
             }
             checkKeys = [...new Set(requested)];
         }
