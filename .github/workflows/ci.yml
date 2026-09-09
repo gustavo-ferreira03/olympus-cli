@@ -30,35 +30,37 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
+        id: install
         run: pnpm install --frozen-lockfile
 
-      # Each step runs even if an earlier one failed, so a PR gets the full
-      # picture in one run instead of one failure at a time.
+      # Each check runs even if an earlier check failed, so a PR gets the full
+      # picture in one run instead of one failure at a time. They are all gated
+      # on the install, since without it every step just reports "pnpm: not found".
       - name: Formatting (oxfmt)
         id: format
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm format:check
 
       - name: Lint (oxlint)
         id: lint
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm lint:ci
 
       - name: Types (tsc --strict)
         id: types
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm typecheck
 
       - name: Duplication (jscpd)
         id: dupes
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm dupes
 
       - name: Dead code (knip)
         id: deadcode
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm deadcode
 
       - name: Build
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm build
