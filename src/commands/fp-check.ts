@@ -1,25 +1,18 @@
 import { defineCommand } from "citty";
-import { api } from "../convex.ts";
-import { parseWaitNumber } from "./checks.ts";
-import { printJson } from "../format.ts";
-import {
-  commonArgs,
-  printResult,
-  resolveCommandContext,
-} from "../command-utils.ts";
+import { api } from "../platform/convex.ts";
+import { resolveWaitWindow, waitWindow } from "../shared/wait.ts";
 
-export function fpReviewStatus(state: any): "running" | "failed" | "completed" {
+import { printJson } from "../terminal/format.ts";
+import { commonArgs, printResult, resolveCommandContext } from "./command-utils.ts";
+
+/** FP checks run longer than ordinary quality checks. */
+const FP_CHECK_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 45 } as const;
+
+function fpReviewStatus(state: any): "running" | "failed" | "completed" {
   const status = String(
-    state?.state ??
-      state?.status ??
-      state?.job?.status ??
-      state?.jobStatus ??
-      "",
+    state?.state ?? state?.status ?? state?.job?.status ?? state?.jobStatus ?? "",
   ).toLowerCase();
-  if (
-    state?.inFlight ||
-    ["pending", "running", "queued", "processing"].includes(status)
-  ) {
+  if (state?.inFlight || ["pending", "running", "queued", "processing"].includes(status)) {
     return "running";
   }
   if (["failed", "error", "cancelled", "canceled"].includes(status)) {
@@ -36,7 +29,7 @@ function failedState(state: any): boolean {
   return fpReviewStatus(state) === "failed";
 }
 
-export async function queryFpStateWithRetry(
+async function queryFpStateWithRetry(
   client: any,
   versionId: string,
   sleep: (milliseconds: number) => Promise<void> = (milliseconds) =>
@@ -108,15 +101,11 @@ async function waitForFpCheck({
         jobId: currentJobId,
       };
       if (json) printJson(result);
-      else
-        console.error(
-          `\n  Timed out waiting for FP check ${currentJobId ?? ""}.\n`,
-        );
+      else console.error(`\n  Timed out waiting for FP check ${currentJobId ?? ""}.\n`);
       process.exitCode = 2;
       return result;
     }
-    if (!json)
-      process.stderr.write(`\r  waiting FP check elapsed=${elapsedSeconds}s`);
+    if (!json) process.stderr.write(`\r  waiting FP check elapsed=${elapsedSeconds}s`);
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
@@ -155,15 +144,16 @@ const wait = defineCommand({
     },
   },
   run: async ({ args }) => {
-    const { client, versionId, versionNumber } =
-      await resolveCommandContext(args);
+    // Validate the wait flags before dispatching, so a bad --interval
+    // fails locally instead of after a round trip.
+    const window = waitWindow(args, FP_CHECK_WAIT_DEFAULTS);
+    const { client, versionId, versionNumber } = await resolveCommandContext(args);
     await waitForFpCheck({
       client,
       versionId,
       versionNumber,
       jobId: args.job,
-      intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-      timeoutMs: parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000,
+      ...window,
       json: Boolean(args.json),
       full: Boolean(args.full),
     });
@@ -190,10 +180,8 @@ const run = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
-    const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000 : undefined;
-    const { client, versionId, versionNumber } =
-      await resolveCommandContext(args);
+    const wait = resolveWaitWindow(args, FP_CHECK_WAIT_DEFAULTS);
+    const { client, versionId, versionNumber } = await resolveCommandContext(args);
     const state: any = await client.query(api.fpReview.getFpCheckForVersion, {
       versionId,
     });
@@ -202,22 +190,19 @@ const run = defineCommand({
         state.hasEligiblePasses === false ? "no eligible passing runs" : null,
         state.canRun === false ? "backend reports this check cannot run" : null,
       ].filter(Boolean);
-      throw new Error(
-        `FP check is blocked: ${reasons.join("; ") || "unknown reason"}`,
-      );
+      throw new Error(`FP check is blocked: ${reasons.join("; ") || "unknown reason"}`);
     }
     const result: any = await client.action(api.fpReview.requestFpCheck, {
       versionId,
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
-    if (args.wait) {
+    if (wait) {
       await waitForFpCheck({
         client,
         versionId,
         versionNumber,
         jobId: result?.jobId,
-        intervalMs,
-        timeoutMs,
+        ...wait,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });

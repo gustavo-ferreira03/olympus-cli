@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A newer push to the same PR cancels the older run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Lint, format, types
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Each step runs even if an earlier one failed, so a PR gets the full
+      # picture in one run instead of one failure at a time.
+      - name: Formatting (oxfmt)
+        id: format
+        if: ${{ !cancelled() }}
+        run: pnpm format:check
+
+      - name: Lint (oxlint)
+        id: lint
+        if: ${{ !cancelled() }}
+        run: pnpm lint:ci
+
+      - name: Types (tsc --strict)
+        id: types
+        if: ${{ !cancelled() }}
+        run: pnpm typecheck
+
+      - name: Duplication (jscpd)
+        id: dupes
+        if: ${{ !cancelled() }}
+        run: pnpm dupes
+
+      - name: Dead code (knip)
+        id: deadcode
+        if: ${{ !cancelled() }}
+        run: pnpm deadcode
+
+      - name: Build
+        if: ${{ !cancelled() }}
+        run: pnpm build

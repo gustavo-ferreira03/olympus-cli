@@ -17,16 +17,10 @@ export const GATING_CHECK_KEYS = [
 ] as const;
 
 /** Triggerable checks that belong to later/optional workflow stages. */
-export const NON_GATING_CHECK_KEYS = [
-  "autoReview",
-  "verifierIncompleteness",
-] as const;
+export const NON_GATING_CHECK_KEYS = ["autoReview", "verifierIncompleteness"] as const;
 
 /** Keys `checks run` and `checks run-all --checks` may send. */
-export const TRIGGERABLE_CHECK_KEYS = [
-  ...GATING_CHECK_KEYS,
-  ...NON_GATING_CHECK_KEYS,
-] as const;
+export const TRIGGERABLE_CHECK_KEYS = [...GATING_CHECK_KEYS, ...NON_GATING_CHECK_KEYS] as const;
 
 /** Map public CLI names to the backend's stored/trigger keys. */
 export function toBackendCheckKey(key: string): string {
@@ -39,10 +33,7 @@ export function toPublicCheckKey(key: string): string {
 }
 
 /** Every current key that may need a label when rendering backend payloads. */
-export const RENDERABLE_CHECK_KEYS = [
-  ...TRIGGERABLE_CHECK_KEYS,
-  "verifyFairness",
-] as const;
+export const RENDERABLE_CHECK_KEYS = [...TRIGGERABLE_CHECK_KEYS, "verifyFairness"] as const;
 
 export type GatingCheckKey = (typeof GATING_CHECK_KEYS)[number];
 export type NonGatingCheckKey = (typeof NON_GATING_CHECK_KEYS)[number];

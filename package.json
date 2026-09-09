@@ -20,6 +20,15 @@
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "tsc && node -e \"require('node:fs').chmodSync('dist/index.js',0o755)\"",
     "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix --fix-suggestions",
+    "lint:ci": "oxlint --max-warnings=113",
+    "format": "oxfmt src",
+    "format:check": "oxfmt --check src",
+    "dupes": "jscpd src",
+    "deadcode": "knip",
+    "deadcode:all": "knip --include files,dependencies,unlisted,binaries,exports,types",
+    "verify": "pnpm format:check && pnpm lint:ci && pnpm typecheck && pnpm dupes && pnpm deadcode",
     "cli": "node dist/index.js"
   },
   "files": [
@@ -33,7 +42,10 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "prettier": "^3.9.6",
+    "jscpd": "^5.2.0",
+    "knip": "^6.35.1",
+    "oxfmt": "^0.67.0",
+    "oxlint": "^1.82.0",
     "tsx": "^4.21.0",
     "typescript": "~5.7.0"
   },

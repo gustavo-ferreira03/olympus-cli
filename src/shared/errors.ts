@@ -1,5 +1,4 @@
-import { BudgetError } from "./budget.ts";
-import { PolicyError } from "./policy.ts";
+import { BudgetError, PolicyError } from "./error-types.ts";
 
 export type ErrorKind =
   | "usage"
@@ -13,12 +12,12 @@ export type ErrorKind =
   | "budget"
   | "unknown";
 
-export interface ErrorDescription {
+export type ErrorDescription = {
   kind: ErrorKind;
   code: string;
   retryable: boolean | null;
   hint: string;
-}
+};
 
 export class CliError extends Error {
   readonly kind: ErrorKind;
@@ -28,25 +27,19 @@ export class CliError extends Error {
 
   constructor(
     message: string,
-    options: Pick<ErrorDescription, "kind" | "code"> &
-      Partial<Pick<ErrorDescription, "retryable" | "hint">>,
+    options: Pick<ErrorDescription, "kind" | "code">
+      & Partial<Pick<ErrorDescription, "retryable" | "hint">>,
   ) {
     super(message);
     this.name = "CliError";
     this.kind = options.kind;
     this.code = options.code;
-    this.retryable =
-      options.retryable === undefined ? false : options.retryable;
+    this.retryable = options.retryable === undefined ? false : options.retryable;
     this.hint = options.hint ?? "Review the command and try again.";
   }
 }
 
-const usageCodes = new Set([
-  "EARG",
-  "E_UNKNOWN_COMMAND",
-  "E_NO_COMMAND",
-  "E_MISSING_ARGS",
-]);
+const usageCodes = new Set(["EARG", "E_UNKNOWN_COMMAND", "E_NO_COMMAND", "E_MISSING_ARGS"]);
 const transientCodes = new Set([
   "ETIMEDOUT",
   "ECONNRESET",
@@ -171,30 +164,31 @@ function classify(error: object): ErrorDescription | undefined {
   return undefined;
 }
 
+/**
+ * Strip terminal escape sequences and invisible characters from text that is
+ * about to be printed as a diagnostic.
+ *
+ * Matching control characters is the entire point here, so `no-control-regex`
+ * is suppressed deliberately rather than worked around.
+ */
+/* eslint-disable no-control-regex -- stripping control characters is the purpose of this function */
 export function sanitizeDiagnostic(text: string): string {
   return text
-    .replace(
+    .replaceAll(
       /(?:\u001b[\]PX^_]|[\u0090\u0098\u009d-\u009f])[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/g,
       "",
     )
-    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\u001b[ -/]*[@-~]/g, "")
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")
-    .replace(
-      /[\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]/g,
-      "",
-    );
+    .replaceAll(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "")
+    .replaceAll(/\u001b[ -/]*[@-~]/g, "")
+    .replaceAll(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")
+    .replaceAll(/[\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]/g, "");
 }
+/* eslint-enable no-control-regex */
 
 export function describeError(error: unknown): ErrorDescription {
   const seen = new Set<object>();
   let current = error;
-  while (
-    current !== null &&
-    typeof current === "object" &&
-    !seen.has(current) &&
-    seen.size < 32
-  ) {
+  while (current !== null && typeof current === "object" && !seen.has(current) && seen.size < 32) {
     seen.add(current);
     try {
       const description = classify(current);

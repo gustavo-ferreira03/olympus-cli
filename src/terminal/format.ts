@@ -5,11 +5,11 @@ import { withBudgetFeedback } from "./output.ts";
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
 type Cell = string | number | boolean | null | undefined;
-export interface TableColumn {
+export type TableColumn = {
   key: string;
   label: string;
   width?: number;
-}
+};
 
 function stripAnsi(str: string): string {
   return str.replace(ANSI_RE, "");
@@ -24,38 +24,27 @@ export function printJson(data: unknown): void {
   console.log(JSON.stringify(withBudgetFeedback(data), null, 2));
 }
 
-export function printTable(
-  rows: Record<string, Cell>[],
-  columns: TableColumn[],
-): void {
+export function printTable(rows: Array<Record<string, Cell>>, columns: TableColumn[]): void {
   if (rows.length === 0) {
     console.log("  (no results)");
     return;
   }
   const widths = columns.map((column) => {
-    const maxData = Math.max(
-      ...rows.map((row) => stripAnsi(String(row[column.key] ?? "")).length),
-    );
+    const maxData = Math.max(...rows.map((row) => stripAnsi(String(row[column.key] ?? "")).length));
     return column.width ?? Math.max(column.label.length, maxData);
   });
-  const header = columns
-    .map((column, index) => column.label.padEnd(widths[index] ?? 0))
-    .join("  ");
+  const header = columns.map((column, index) => column.label.padEnd(widths[index] ?? 0)).join("  ");
   console.log(`  ${header}`);
   console.log(`  ${widths.map((width) => "─".repeat(width)).join("  ")}`);
   for (const row of rows) {
     const line = columns
-      .map((column, index) =>
-        padVisible(String(row[column.key] ?? ""), widths[index] ?? 0),
-      )
+      .map((column, index) => padVisible(String(row[column.key] ?? ""), widths[index] ?? 0))
       .join("  ");
     console.log(`  ${line}`);
   }
 }
 
-export function printKeyValue(
-  pairs: Array<[string, string | undefined | null]>,
-): void {
+export function printKeyValue(pairs: Array<[string, string | undefined | null]>): void {
   const maxKey = Math.max(...pairs.map(([key]) => key.length));
   for (const [key, value] of pairs) {
     if (value !== undefined && value !== null) {
@@ -89,6 +78,6 @@ export function statusBadge(status: string): string {
 }
 
 export function truncate(str: string, max: number): string {
-  const oneLine = str.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+  const oneLine = str.replaceAll("\n", " ").replaceAll(/\s+/g, " ").trim();
   return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 3)}...`;
 }

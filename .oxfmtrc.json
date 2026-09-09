@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxfmt/configuration_schema.json",
+  "experimentalOperatorPosition": "start",
+  "objectWrap": "preserve",
+  "printWidth": 100,
+  "quoteProps": "as-needed",
+  "semi": true,
+  "singleQuote": false,
+  "tabWidth": 2,
+  "trailingComma": "all",
+  "useTabs": false
+}

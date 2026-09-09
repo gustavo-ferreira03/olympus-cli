@@ -1,7 +1,7 @@
 import { ConvexHttpClient } from "convex/browser";
 import { anyApi, getFunctionName } from "convex/server";
-import { dispatchWithBudget, loadPolicy, PolicyError } from "./policy.ts";
-import { budgetScope, readBudget } from "./budget.ts";
+import { dispatchWithBudget, loadPolicy, PolicyError } from "../core/policy.ts";
+import { budgetScope, readBudget } from "../core/budget.ts";
 import { credentialsDir, requireAuth } from "./auth.ts";
 import { resolve } from "node:path";
 import { getConvexUrl } from "./config.ts";
@@ -15,9 +15,23 @@ export async function localBudgetStatus(client: object, challengeId: string): Pr
   const context = budgetScopes.get(client);
   try {
     if (!context) throw new Error("Local budget scope is unavailable");
-    return { enabled: true, challengeId, ...await readBudget({ directory: context.directory, scope: budgetScope(context.backend, context.account, challengeId), limit }) };
+    return {
+      enabled: true,
+      challengeId,
+      ...(await readBudget({
+        directory: context.directory,
+        scope: budgetScope(context.backend, context.account, challengeId),
+        limit,
+      })),
+    };
   } catch (error) {
-    return { enabled: true, scope: "local", challengeId, limit, error: error instanceof Error ? error.message : "Local budget state is unavailable" };
+    return {
+      enabled: true,
+      scope: "local",
+      challengeId,
+      limit,
+      error: error instanceof Error ? error.message : "Local budget state is unavailable",
+    };
   }
 }
 
@@ -29,7 +43,7 @@ export async function getClient(): Promise<ConvexHttpClient> {
     convexUrl = await retryTransient(() => getConvexUrl());
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(message);
+    throw new Error(message, { cause: error });
   }
   const client = new ConvexHttpClient(convexUrl);
   client.setAuth(token);
@@ -38,7 +52,12 @@ export async function getClient(): Promise<ConvexHttpClient> {
   return client;
 }
 
-export function installPolicyGuards(client: any, backend: string, account: string, directory = resolve(credentialsDir(), "challenge-budgets")): void {
+export function installPolicyGuards(
+  client: any,
+  backend: string,
+  account: string,
+  directory = resolve(credentialsDir(), "challenge-budgets"),
+): void {
   budgetScopes.set(client, { backend, account, directory });
   const versions = new Map<string, string>();
   const references = new Map<string, string>();
@@ -49,25 +68,38 @@ export function installPolicyGuards(client: any, backend: string, account: strin
     }
   };
   const query = client.query.bind(client);
-  Object.defineProperty(client, "query", { value: async (reference: any, args: any = {}, ...options: any[]) => {
-    const result = await query(reference, args, ...options);
-    const name = getFunctionName(reference);
-    if (name === "problems:getWithLatestVersion") remember(versions, result?.latestVersion?._id, args.problemId);
-    if (name === "problems:getWithVersion") remember(versions, result?.version?._id, args.problemId);
-    if (name === "problems:listVersions" && Array.isArray(result)) for (const version of result) remember(versions, version?._id, args.problemId);
-    if (name === "problemVersions:getByVersion") remember(versions, result?._id, args.problemId);
-    const problem = args.problemId ?? versions.get(args.versionId);
-    if (name === "runAgentRuns:getAgentRuns" && Array.isArray(result)) {
-      for (const run of result) { remember(references, run?.id ?? run?._id, problem); remember(references, run?.jobId, problem); }
-    }
-    if (name === "jobs:get") remember(references, args.id, result?.problemId ?? versions.get(result?.versionId));
-    return result;
-  } });
+  Object.defineProperty(client, "query", {
+    value: async (reference: any, args: any = {}, ...options: any[]) => {
+      const result = await query(reference, args, ...options);
+      const name = getFunctionName(reference);
+      if (name === "problems:getWithLatestVersion")
+        remember(versions, result?.latestVersion?._id, args.problemId);
+      if (name === "problems:getWithVersion")
+        remember(versions, result?.version?._id, args.problemId);
+      if (name === "problems:listVersions" && Array.isArray(result))
+        for (const version of result) remember(versions, version?._id, args.problemId);
+      if (name === "problemVersions:getByVersion") remember(versions, result?._id, args.problemId);
+      const problem = args.problemId ?? versions.get(args.versionId);
+      if (name === "runAgentRuns:getAgentRuns" && Array.isArray(result)) {
+        for (const run of result) {
+          remember(references, run?.id ?? run?._id, problem);
+          remember(references, run?.jobId, problem);
+        }
+      }
+      if (name === "jobs:get")
+        remember(references, args.id, result?.problemId ?? versions.get(result?.versionId));
+      return result;
+    },
+  });
   const resolveChallenge = async (args: Record<string, any>): Promise<string> => {
     let problem = valid(args.problemId) ? args.problemId : undefined;
     if (valid(args.versionId)) {
       const fromVersion = versions.get(args.versionId);
-      if (problem && fromVersion && problem !== fromVersion) throw new PolicyError("tokens.challenge_budget", "Challenge and version scope do not match");
+      if (problem && fromVersion && problem !== fromVersion)
+        throw new PolicyError(
+          "tokens.challenge_budget",
+          "Challenge and version scope do not match",
+        );
       problem ??= fromVersion;
     }
     problem ??= references.get(args.runId) ?? references.get(args.jobId);
@@ -75,13 +107,25 @@ export function installPolicyGuards(client: any, backend: string, account: strin
       const job = await client.query(anyApi.jobs.get, { id: args.jobId });
       problem = references.get(args.jobId) ?? versions.get(job?.versionId);
     }
-    if (!problem) throw new PolicyError("tokens.challenge_budget", "Cannot resolve the challenge scope; read the challenge version before dispatch");
+    if (!problem)
+      throw new PolicyError(
+        "tokens.challenge_budget",
+        "Cannot resolve the challenge scope; read the challenge version before dispatch",
+      );
     return problem;
   };
   for (const method of ["action", "mutation"] as const) {
     const invoke = client[method].bind(client);
-    Object.defineProperty(client, method, { value: (reference: any, args: any = {}, ...options: any[]) =>
-      dispatchWithBudget(client, getFunctionName(reference), args, () => invoke(reference, args, ...options), { directory, backend, account, resolveChallenge }) });
+    Object.defineProperty(client, method, {
+      value: (reference: any, args: any = {}, ...options: any[]) =>
+        dispatchWithBudget({
+          client,
+          name: getFunctionName(reference),
+          args,
+          invoke: () => invoke(reference, args, ...options),
+          scope: { directory, backend, account, resolveChallenge },
+        }),
+    });
   }
 }
 
@@ -106,14 +150,20 @@ async function retryTransient<T>(operation: () => Promise<T>): Promise<T> {
   throw lastError;
 }
 
-export function asId<TableName extends string>(value: string): string {
+/**
+ * Marker for values the backend treats as document ids.
+ *
+ * Convex is reached through `anyApi`, so ids are plain strings here; this keeps
+ * call sites self-documenting without pretending the value is validated.
+ */
+export function asId(value: string): string {
   return value;
 }
 
-export interface ProblemWithVersion {
+export type ProblemWithVersion = {
   problem: any;
   version: any;
-}
+};
 
 export async function resolveProblemVersion(
   client: ConvexHttpClient,
@@ -123,10 +173,12 @@ export async function resolveProblemVersion(
   if (versionNumber === undefined) {
     return requireProblemVersion(client, problemId);
   }
-  const data: any = await retryTransient(() => client.query(api.problems.getWithVersion, {
-    problemId,
-    versionNumber,
-  }));
+  const data: any = await retryTransient(() =>
+    client.query(api.problems.getWithVersion, {
+      problemId,
+      versionNumber,
+    }),
+  );
   if (!data?.version) {
     throw new Error(`Version v${versionNumber} was not found for problem ${problemId}`);
   }
@@ -147,9 +199,11 @@ export async function requireProblemVersion(
   client: ConvexHttpClient,
   problemId: string,
 ): Promise<ProblemWithVersion> {
-  const data: any = await retryTransient(() => client.query(api.problems.getWithLatestVersion, {
-    problemId,
-  }));
+  const data: any = await retryTransient(() =>
+    client.query(api.problems.getWithLatestVersion, {
+      problemId,
+    }),
+  );
   if (!data) {
     throw new Error(`Problem not found: ${problemId}`);
   }

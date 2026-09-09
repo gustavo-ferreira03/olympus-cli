@@ -1,0 +1,17 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": ["src/index.ts"],
+  "project": ["src/**/*.ts"],
+
+  // Shelled out to at runtime, not installed by us: `start` opens a browser
+  // during auth, `flock` serialises the local budget ledger.
+  "ignoreBinaries": ["start", "flock"],
+
+  // Kept for ad-hoc `tsx src/index.ts` runs during development.
+  "ignoreDependencies": ["tsx"],
+
+  // CI fails on dead files and dependencies, which are unambiguous signals.
+  // Unused exports and types still show up in `pnpm deadcode` but do not block:
+  // a module may legitimately expose more than today's callers happen to use.
+  "include": ["files", "dependencies", "unlisted", "binaries"]
+}

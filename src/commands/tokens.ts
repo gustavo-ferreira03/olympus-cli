@@ -1,15 +1,16 @@
 import { defineCommand } from "citty";
-import { api, getClient, localBudgetStatus } from "../convex.ts";
-import { printJson } from "../format.ts";
-import { omitEmpty } from "../output.ts";
-import { resolveCommandContext } from "../command-utils.ts";
-import { resolveCostCatalog } from "../pricing.ts";
-import { toPublicCheckKey } from "../expected.ts";
-import { sumBudgetAmounts } from "../budget.ts";
+import { api, getClient, localBudgetStatus } from "../platform/convex.ts";
+import { printJson } from "../terminal/format.ts";
+import { omitEmpty } from "../terminal/output.ts";
+import { resolveCommandContext } from "./command-utils.ts";
+import { resolveCostCatalog } from "../core/pricing.ts";
+import { toPublicCheckKey } from "../core/expected.ts";
+import { sumBudgetAmounts } from "../core/budget.ts";
 
 function number(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value)))
+    return Number(value);
   return undefined;
 }
 
@@ -33,7 +34,8 @@ function transactionDate(item: any): number | undefined {
 
 function transactionAmount(item: any): number {
   const value = number(item?.amount);
-  if (value === undefined) throw new Error("Backend transaction amount is missing or invalid; usage cannot be summarized");
+  if (value === undefined)
+    throw new Error("Backend transaction amount is missing or invalid; usage cannot be summarized");
   return value;
 }
 
@@ -41,8 +43,9 @@ function transactionChallengeId(item: any): string | undefined {
   return item?.challengeId ?? item?.problemId ?? item?.itemId;
 }
 
-export function summarizeTransactions(transactions: any[], full = false) {
-  if (!Array.isArray(transactions)) throw new Error("Backend transactions response is not an array; usage is unavailable");
+function summarizeTransactions(transactions: any[], full = false) {
+  if (!Array.isArray(transactions))
+    throw new Error("Backend transactions response is not an array; usage is unavailable");
   const byReason = new Map<string, { count: number; spent: number; granted: number }>();
   const byChallenge = new Map<string, { count: number; spent: number; granted: number }>();
   type Entry = { count: number; spent: number; granted: number };
@@ -67,14 +70,25 @@ export function summarizeTransactions(transactions: any[], full = false) {
     spent = sumBudgetAmounts([spent, spentAmount]);
     granted = sumBudgetAmounts([granted, grantedAmount]);
     const check = label(item?.checkKey) ? toPublicCheckKey(item.checkKey) : undefined;
-    const knownReasons: Record<string, string> = { agent_reeval_spent: "runs:reEvaluation", fp_check_spent: "reviews:fpCheck" };
-    const operation = label(item?.operation) ? item.operation
-      : Object.hasOwn(knownReasons, item?.reason) ? knownReasons[item.reason] : undefined;
+    const knownReasons: Record<string, string> = {
+      agent_reeval_spent: "runs:reEvaluation",
+      fp_check_spent: "reviews:fpCheck",
+    };
+    const operation = label(item?.operation)
+      ? item.operation
+      : Object.hasOwn(knownReasons, item?.reason)
+        ? knownReasons[item.reason]
+        : undefined;
     if (check) group(byCheck, check, spentAmount, grantedAmount);
     if (operation) group(byOperation, operation, spentAmount, grantedAmount);
     if (!check && !operation) {
       unclassifiedCount++;
-      group(unclassifiedReasons, label(item?.reason) ? item.reason : "unknown", spentAmount, grantedAmount);
+      group(
+        unclassifiedReasons,
+        label(item?.reason) ? item.reason : "unknown",
+        spentAmount,
+        grantedAmount,
+      );
     }
     const reason = String(item?.reason ?? "unknown");
     const reasonEntry = byReason.get(reason) ?? { count: 0, spent: 0, granted: 0 };
@@ -98,15 +112,16 @@ export function summarizeTransactions(transactions: any[], full = false) {
     byCheck: Object.fromEntries(byCheck),
     byOperation: Object.fromEntries(byOperation),
     attribution: {
-      source: "explicit-backend-metadata-or-unambiguous-reason", coverage: unclassifiedCount ? "partial" : "complete",
+      source: "explicit-backend-metadata-or-unambiguous-reason",
+      coverage: unclassifiedCount ? "partial" : "complete",
       classifiedCount: transactions.length - unclassifiedCount,
       note: "Counts are backend transactions, not executions. Raw reasons are not check identities. No attribution is inferred from prices, timestamps or job IDs. Local prospective quotes are separate from backend charges.",
     },
     historyCoverage: { scope: "returned-transactions", completeness: "unknown" },
     unclassified: {
       count: unclassifiedCount,
-      spent: sumBudgetAmounts([...unclassifiedReasons.values()].map(entry => entry.spent)),
-      granted: sumBudgetAmounts([...unclassifiedReasons.values()].map(entry => entry.granted)),
+      spent: sumBudgetAmounts([...unclassifiedReasons.values()].map((entry) => entry.spent)),
+      granted: sumBudgetAmounts([...unclassifiedReasons.values()].map((entry) => entry.granted)),
       ...(full ? { backendReasons: Object.fromEntries(unclassifiedReasons) } : {}),
     },
     ...(full ? { backendReasons: Object.fromEntries(byReason) } : {}),
@@ -137,7 +152,10 @@ const balance = defineCommand({
 const usage = defineCommand({
   meta: { name: "tokens usage", description: "Show token grants and spending history" },
   args: {
-    challenge: { type: "string", description: "Filter backend usage and show separate local budget for one challenge" },
+    challenge: {
+      type: "string",
+      description: "Filter backend usage and show separate local budget for one challenge",
+    },
     from: { type: "string", description: "Include transactions from this ISO date" },
     to: { type: "string", description: "Include transactions through this ISO date" },
     json: { type: "boolean", description: "Output compact JSON" },
@@ -146,7 +164,8 @@ const usage = defineCommand({
   run: async ({ args }) => {
     const client = await getClient();
     let transactions: any[] = await client.query(api.contributorTokens.getTransactions, {});
-    if (!Array.isArray(transactions)) throw new Error("Backend transactions response is not an array; usage is unavailable");
+    if (!Array.isArray(transactions))
+      throw new Error("Backend transactions response is not an array; usage is unavailable");
     const from = args.from ? Date.parse(args.from) : undefined;
     const to = args.to ? Date.parse(args.to) + 86_399_999 : undefined;
     if (args.from && !Number.isFinite(from)) throw new Error("--from must be a valid ISO date");
@@ -159,7 +178,9 @@ const usage = defineCommand({
       return true;
     });
     const result: any = {
-      scope: args.challenge ? { challengeId: args.challenge, source: "ledger-filter" } : { source: "ledger" },
+      scope: args.challenge
+        ? { challengeId: args.challenge, source: "ledger-filter" }
+        : { source: "ledger" },
       ...summarizeTransactions(transactions, args.full),
     };
     if (args.full) (result as any).raw = transactions;
@@ -170,7 +191,10 @@ const usage = defineCommand({
 });
 
 const costs = defineCommand({
-  meta: { name: "tokens costs", description: "Show live official prospective tariffs and version offers" },
+  meta: {
+    name: "tokens costs",
+    description: "Show live official prospective tariffs and version offers",
+  },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     version: { type: "string", description: "Version number (default: latest)" },
