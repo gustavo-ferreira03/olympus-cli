@@ -14,7 +14,10 @@ import {
 } from "./command-utils.ts";
 
 /** Verifier audits run longer than ordinary quality checks. */
-const VERIFIER_AUDIT_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 45 } as const;
+const VERIFIER_AUDIT_WAIT_DEFAULTS = {
+  intervalSeconds: 5,
+  timeoutMinutes: 45,
+} as const;
 
 const view = defineCommand({
   meta: {
@@ -53,15 +56,24 @@ const view = defineCommand({
 });
 
 const run = defineCommand({
-  meta: { name: "verifier-audit run", description: "Run verifier completeness audit" },
+  meta: {
+    name: "verifier-audit run",
+    description: "Run verifier completeness audit",
+  },
   args: {
     ...commonArgs,
     "use-general-tokens": {
       type: "boolean",
       description: "Charge general tokens instead of revision tokens",
     },
-    wait: { type: "boolean", description: "Wait for the verifier audit to finish" },
-    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    wait: {
+      type: "boolean",
+      description: "Wait for the verifier audit to finish",
+    },
+    interval: {
+      type: "string",
+      description: "Poll interval in seconds (default 5)",
+    },
     timeout: { type: "string", description: "Timeout in minutes (default 45)" },
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
@@ -110,7 +122,7 @@ const run = defineCommand({
     const waitCommand = result?.jobId
       ? `olympus checks wait ${problemId} --job=${result.jobId} --json`
       : `olympus checks wait ${problemId} --check=verifierIncompleteness --json`;
-    if (args.json) return printJson({ ...result, waitCommand });
+    if (args.json) return printJson({ ...result, version: versionNumber, waitCommand });
     console.log(`\n  Verifier completeness audit triggered on v${versionNumber}.`);
     console.log(`  Wait: ${waitCommand}\n`);
   },
@@ -123,7 +135,10 @@ const decide = defineCommand({
   },
   args: {
     ...commonArgs,
-    job: { type: "string", description: "Verifier audit job ID (default: current job)" },
+    job: {
+      type: "string",
+      description: "Verifier audit job ID (default: current job)",
+    },
     decision: {
       type: "string",
       description: "accepted, accepted_with_edits, or rejected",
@@ -180,6 +195,9 @@ const decide = defineCommand({
 });
 
 export default defineCommand({
-  meta: { name: "verifier-audit", description: "Verifier completeness audit operations" },
+  meta: {
+    name: "verifier-audit",
+    description: "Verifier completeness audit operations",
+  },
   subCommands: { view, run, decide },
 });

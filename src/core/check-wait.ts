@@ -1,3 +1,5 @@
+import { type CoverageOutput } from "./coverage.ts";
+import { type CheckInputs, type CheckInputsDiagnostic } from "./check-inputs.ts";
 /**
  * Polling for dynamic quality checks.
  *
@@ -5,6 +7,7 @@
  * scope-gate, verifier-audit) all poll the same backend endpoint and print the
  * same summaries, so the loop lives here rather than in any one command.
  */
+import { toPublicCheckKey } from "./expected.ts";
 import { api, asId } from "../platform/convex.ts";
 import { printJson, statusBadge, truncate } from "../terminal/format.ts";
 import {
@@ -15,7 +18,10 @@ import {
 import { type Client, type ProblemVersion } from "../shared/types.ts";
 
 /** Quality checks settle faster than rollouts, so they poll more often. */
-export const CHECK_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 30 } as const;
+export const CHECK_WAIT_DEFAULTS = {
+  intervalSeconds: 5,
+  timeoutMinutes: 30,
+} as const;
 
 export function formatCheckMessage(check: DynamicCheckEntry): string | null {
   const message =
@@ -34,6 +40,9 @@ export function isActiveStatus(status: unknown): boolean {
 }
 
 type CheckWaitSummary = {
+  output?: Partial<CoverageOutput>;
+  checkInputs?: CheckInputs;
+  checkInputsDiagnostics?: CheckInputsDiagnostic[];
   key: string;
   label: string;
   jobId?: string;
@@ -51,6 +60,18 @@ type CheckWaitSummary = {
 export function summarizeCheck(check: DynamicCheckEntry): CheckWaitSummary {
   return {
     key: check.key,
+    ...(toPublicCheckKey(check.key) === "testQuality"
+      ? {
+          output: {
+            coverageSummary: check.output?.coverageSummary,
+            coverageDiagnostics: check.output?.coverageDiagnostics,
+          },
+        }
+      : {}),
+    ...(check.checkInputs ? { checkInputs: check.checkInputs } : {}),
+    ...(check.checkInputsDiagnostics?.length
+      ? { checkInputsDiagnostics: check.checkInputsDiagnostics }
+      : {}),
     label: formatDynamicCheckLabel(check.key),
     jobId: check.jobId,
     status: check.status,
@@ -69,7 +90,9 @@ async function queryDynamicChecksWithRetry(client: Client, versionId: string) {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      return await client.query(api.runDynamicChecks.getDynamicChecks, { versionId });
+      return await client.query(api.runDynamicChecks.getDynamicChecks, {
+        versionId,
+      });
     } catch (error) {
       lastError = error;
       if (attempt < 3) {
@@ -124,7 +147,11 @@ export async function waitForChecks({
           .filter((check) => !check.stale && isActiveStatus(check.status))
           .map((check) => check.key);
         if (targetKeys.length === 0) {
-          const result = { status: "idle", version: version.version, checks: [] };
+          const result = {
+            status: "idle",
+            version: version.version,
+            checks: [],
+          };
           if (json) printJson(result);
           else console.log(`\n  No active current checks on v${version.version}.\n`);
           return result;

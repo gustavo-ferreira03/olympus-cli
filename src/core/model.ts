@@ -1,4 +1,6 @@
+import { type CheckInputs, type CheckInputsDiagnostic } from "./check-inputs.ts";
 import { RENDERABLE_CHECK_KEYS, toPublicCheckKey } from "./expected.ts";
+import { normalizeCoverageOutput, type CoverageOutput } from "./coverage.ts";
 
 export type SubmissionReadiness = {
   criteria: Array<{
@@ -14,12 +16,14 @@ export type SubmissionReadiness = {
 };
 
 export type DynamicCheck = {
+  checkInputs?: CheckInputs;
+  checkInputsDiagnostics?: CheckInputsDiagnostic[];
   jobId?: string;
   status: string;
   progress?: number;
   currentStep?: string;
   error?: string;
-  output?: Record<string, any>;
+  output?: Record<string, any> & Partial<CoverageOutput>;
   createdAt?: number;
   completedAt?: number;
   stale?: boolean;
@@ -145,16 +149,26 @@ export function normalizeDynamicChecks(dynamicChecks: unknown): DynamicCheckReco
     return {};
   }
   return Object.fromEntries(
-    Object.entries(dynamicChecks).filter(([key, value]) => {
-      return (
-        RENDERABLE_CHECK_KEYS.includes(key as any)
-        && !key.startsWith("_")
-        && !!value
-        && typeof value === "object"
-        && !Array.isArray(value)
-        && "status" in value
-      );
-    }),
+    Object.entries(dynamicChecks)
+      .filter(([key, value]) => {
+        return (
+          RENDERABLE_CHECK_KEYS.includes(key as any)
+          && !key.startsWith("_")
+          && !!value
+          && typeof value === "object"
+          && !Array.isArray(value)
+          && "status" in value
+        );
+      })
+      .map(([key, value]) => [
+        key,
+        toPublicCheckKey(key) === "testQuality"
+          ? {
+              ...(value as Record<string, unknown>),
+              output: normalizeCoverageOutput((value as Record<string, unknown>).output),
+            }
+          : value,
+      ]),
   ) as DynamicCheckRecord;
 }
 export function getDynamicCheckEntries(dynamicChecks: unknown): DynamicCheckEntry[] {

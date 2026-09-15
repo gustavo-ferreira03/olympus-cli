@@ -6,7 +6,10 @@ import { statusBadge, truncate, printJson } from "../terminal/format.ts";
 import { commonArgs, resolveCommandContext } from "./command-utils.ts";
 
 /** Scope Gate shares the quality-check cadence. */
-const SCOPE_GATE_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 30 } as const;
+const SCOPE_GATE_WAIT_DEFAULTS = {
+  intervalSeconds: 5,
+  timeoutMinutes: 30,
+} as const;
 
 function isActive(status: unknown): boolean {
   return status === "pending" || status === "running";
@@ -27,7 +30,9 @@ async function waitForScopeGate({
 }: any) {
   const startedAt = Date.now();
   while (true) {
-    const state: any = await client.query(api.scopeGate.getScopeGate, { versionId });
+    const state: any = await client.query(api.scopeGate.getScopeGate, {
+      versionId,
+    });
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
     if (state == null) {
       const result = { status: "idle", version: versionNumber };
@@ -52,7 +57,12 @@ async function waitForScopeGate({
       return result;
     }
     if (Date.now() - startedAt >= timeoutMs) {
-      const result = { status: "timeout", version: versionNumber, elapsedSeconds, state };
+      const result = {
+        status: "timeout",
+        version: versionNumber,
+        elapsedSeconds,
+        state,
+      };
       if (json) printJson(result);
       else console.error(`\n  Timed out waiting for Scope Gate.\n`);
       process.exitCode = 2;
@@ -64,11 +74,16 @@ async function waitForScopeGate({
 }
 
 const view = defineCommand({
-  meta: { name: "scope-gate view", description: "View Scope Gate state and history" },
+  meta: {
+    name: "scope-gate view",
+    description: "View Scope Gate state and history",
+  },
   args: commonArgs,
   run: async ({ args }) => {
     const { client, versionId, versionNumber } = await resolveCommandContext(args);
-    const result: any = await client.query(api.scopeGate.getScopeGate, { versionId });
+    const result: any = await client.query(api.scopeGate.getScopeGate, {
+      versionId,
+    });
     if (args.json) return printJson(result);
     console.log(`\n  Scope Gate for v${versionNumber}`);
     console.log(
@@ -83,10 +98,16 @@ const view = defineCommand({
 });
 
 const wait = defineCommand({
-  meta: { name: "scope-gate wait", description: "Wait for the current Scope Gate" },
+  meta: {
+    name: "scope-gate wait",
+    description: "Wait for the current Scope Gate",
+  },
   args: {
     ...commonArgs,
-    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    interval: {
+      type: "string",
+      description: "Poll interval in seconds (default 5)",
+    },
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
   },
   run: async ({ args }) => {
@@ -113,7 +134,10 @@ const run = defineCommand({
       description: "Charge general tokens instead of revision tokens",
     },
     wait: { type: "boolean", description: "Wait for Scope Gate to finish" },
-    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    interval: {
+      type: "string",
+      description: "Poll interval in seconds (default 5)",
+    },
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
   },
   run: async ({ args }) => {
@@ -121,7 +145,9 @@ const run = defineCommand({
     const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
     const [scopeState, readiness] = await Promise.all([
       client.query(api.scopeGate.getScopeGate, { versionId }),
-      client.query(api.submissionReadiness.getSubmissionReadiness, { problemId }),
+      client.query(api.submissionReadiness.getSubmissionReadiness, {
+        problemId,
+      }),
     ]);
     const prechecks = (readiness as any)?.criteria?.find(
       (criterion: any) => criterion.id === "prechecks",
@@ -145,9 +171,13 @@ const run = defineCommand({
       return;
     }
     if (args.json)
-      return printJson({ ...result, waitCommand: `olympus scope-gate wait ${args.id} --json` });
+      return printJson({
+        ...result,
+        version: versionNumber,
+        waitCommand: `olympus scope-gate wait ${args.id} --version=${versionNumber} --json`,
+      });
     console.log(`\n  Scope Gate triggered on v${versionNumber}.`);
-    console.log(`  Wait: olympus scope-gate wait ${args.id} --json\n`);
+    console.log(`  Wait: olympus scope-gate wait ${args.id} --version=${versionNumber} --json\n`);
   },
 });
 

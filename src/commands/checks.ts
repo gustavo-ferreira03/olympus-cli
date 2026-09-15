@@ -1,4 +1,5 @@
 import { CliError } from "../shared/errors.ts";
+import { enrichCheckResults } from "../core/check-inputs.ts";
 import { defineCommand } from "citty";
 import {
   assertCheckCapacity,
@@ -6,7 +7,14 @@ import {
   assertPaidEndpoint,
   assertTokenPolicy,
 } from "../core/policy.ts";
-import { api, asId, getClient, requireProblemVersion } from "../platform/convex.ts";
+import {
+  api,
+  asId,
+  getClient,
+  parseVersionNumber,
+  requireProblemVersion,
+  resolveProblemVersion,
+} from "../platform/convex.ts";
 import {
   GATING_CHECK_KEYS,
   NON_GATING_CHECK_KEYS,
@@ -23,8 +31,8 @@ import {
   normalizeDynamicChecks,
 } from "../core/model.ts";
 import { type SubmissionReadiness } from "../core/model.ts";
-import { type Problem, type ProblemVersion } from "../shared/types.ts";
-import { resolveWaitWindow, waitWindow } from "../shared/wait.ts";
+import { type Client, type Problem, type ProblemVersion } from "../shared/types.ts";
+import { parseWaitNumber, resolveWaitWindow, waitWindow } from "../shared/wait.ts";
 import { printArtifact } from "../core/artifacts.ts";
 import {
   CHECK_WAIT_DEFAULTS,
@@ -125,7 +133,10 @@ function printNextCommands(problemId: string): void {
   console.log(`    olympus runs view ${problemId}                Rollout batches + criteria`);
 }
 const view = defineCommand({
-  meta: { name: "checks view", description: "View prechecks, quality checks, and readiness" },
+  meta: {
+    name: "checks view",
+    description: "View prechecks, quality checks, and readiness",
+  },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     check: { type: "string", description: "Return one check key" },
@@ -133,9 +144,15 @@ const view = defineCommand({
       type: "string",
       description: "Filter checks: failed, passing, running, stale, actionable",
     },
-    limit: { type: "string", description: "Maximum checks returned (default 20)" },
+    limit: {
+      type: "string",
+      description: "Maximum checks returned (default 20)",
+    },
     offset: { type: "string", description: "Check offset (default 0)" },
-    full: { type: "boolean", description: "Include complete raw backend payloads" },
+    full: {
+      type: "boolean",
+      description: "Include complete raw backend payloads",
+    },
     json: { type: "boolean", description: "Output compact JSON" },
   },
   run: async ({ args }) => {
@@ -147,14 +164,22 @@ const view = defineCommand({
     }
     const client = await getClient();
     const { version } = await requireProblemVersion(client, args.id);
-    const [stages, dynamicChecks, readiness] = await Promise.all([
+    const [stages, rawDynamicChecks, readiness] = await Promise.all([
       client.query(api.stages.getByVersion, { versionId: version._id }),
-      client.query(api.runDynamicChecks.getDynamicChecks, { versionId: version._id }),
+      client.query(api.runDynamicChecks.getDynamicChecks, {
+        versionId: version._id,
+      }),
       client.query(api.submissionReadiness.getSubmissionReadiness, {
         problemId: asId(args.id),
       }),
     ]);
-    const result = { prechecks: stages, dynamicChecks, readiness, version: version.version };
+    const dynamicChecks = enrichCheckResults(rawDynamicChecks, version);
+    const result = {
+      prechecks: stages,
+      dynamicChecks,
+      readiness,
+      version: version.version,
+    };
     if (args.json) {
       if (args.full) {
         printJson(result);
@@ -253,7 +278,10 @@ const run = defineCommand({
     },
     wait: { type: "boolean", description: "Wait for this check to finish" },
     full: { type: "boolean", description: "Include raw result when waiting" },
-    list: { type: "boolean", description: "List available check keys and exit" },
+    list: {
+      type: "boolean",
+      description: "List available check keys and exit",
+    },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
@@ -342,7 +370,10 @@ const run = defineCommand({
   },
 });
 const runAll = defineCommand({
-  meta: { name: "checks run-all", description: "Run the default production quality-check set" },
+  meta: {
+    name: "checks run-all",
+    description: "Run the default production quality-check set",
+  },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     checks: {
@@ -353,8 +384,14 @@ const runAll = defineCommand({
       type: "boolean",
       description: "Charge general tokens instead of revision tokens",
     },
-    wait: { type: "boolean", description: "Wait for all triggered checks to finish" },
-    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    wait: {
+      type: "boolean",
+      description: "Wait for all triggered checks to finish",
+    },
+    interval: {
+      type: "string",
+      description: "Poll interval in seconds (default 5)",
+    },
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
     full: { type: "boolean", description: "Include raw results when waiting" },
     json: { type: "boolean", description: "Output as JSON" },
@@ -423,16 +460,34 @@ const runAll = defineCommand({
   },
 });
 const wait = defineCommand({
-  meta: { name: "checks wait", description: "Wait for current quality-check jobs" },
+  meta: {
+    name: "checks wait",
+    description: "Wait for current quality-check jobs",
+  },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     job: { type: "string", description: "Wait for one exact job ID" },
-    check: { type: "string", description: "Wait for the current result of one check key" },
-    checks: { type: "string", description: "Comma-separated current check keys" },
-    interval: { type: "string", description: "Poll interval in seconds (default 5)" },
+    check: {
+      type: "string",
+      description: "Wait for the current result of one check key",
+    },
+    checks: {
+      type: "string",
+      description: "Comma-separated current check keys",
+    },
+    interval: {
+      type: "string",
+      description: "Poll interval in seconds (default 5)",
+    },
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
-    full: { type: "boolean", description: "Include raw payloads and readiness" },
-    json: { type: "boolean", description: "Output one compact JSON document to stdout" },
+    full: {
+      type: "boolean",
+      description: "Include raw payloads and readiness",
+    },
+    json: {
+      type: "boolean",
+      description: "Output one compact JSON document to stdout",
+    },
   },
   run: async ({ args }) => {
     if (args.job && (args.check || args.checks)) {
@@ -514,7 +569,10 @@ const show = defineCommand({
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     check: { type: "positional", description: "Check key", required: true },
-    full: { type: "boolean", description: "Include the complete raw check payload" },
+    full: {
+      type: "boolean",
+      description: "Include the complete raw check payload",
+    },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
@@ -524,7 +582,9 @@ const show = defineCommand({
       versionId: version._id,
     });
     const checkKey = args.check;
-    const check = getDynamicCheckEntries(dynamic).find((entry) => entry.key === checkKey);
+    const check = getDynamicCheckEntries(enrichCheckResults(dynamic, version)).find(
+      (entry) => entry.key === checkKey,
+    );
     if (!check) throw new Error(`Check ${checkKey} has not been started on v${version.version}`);
     if (args.full) {
       if (args.json) return printJson(check);
@@ -546,12 +606,22 @@ const show = defineCommand({
 });
 
 const finding = defineCommand({
-  meta: { name: "checks finding", description: "Show one finding from a current quality check" },
+  meta: {
+    name: "checks finding",
+    description: "Show one finding from a current quality check",
+  },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     check: { type: "positional", description: "Check key", required: true },
-    finding: { type: "positional", description: "One-based finding index", required: true },
-    "max-chars": { type: "string", description: "Maximum serialized finding characters" },
+    finding: {
+      type: "positional",
+      description: "One-based finding index",
+      required: true,
+    },
+    "max-chars": {
+      type: "string",
+      description: "Maximum serialized finding characters",
+    },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
@@ -564,7 +634,9 @@ const finding = defineCommand({
       versionId: version._id,
     });
     const checkKey = args.check;
-    const check = getDynamicCheckEntries(dynamic).find((entry) => entry.key === checkKey);
+    const check = getDynamicCheckEntries(enrichCheckResults(dynamic, version)).find(
+      (entry) => entry.key === checkKey,
+    );
     if (!check) throw new Error(`Check ${checkKey} has not been started on v${version.version}`);
     const findings = extractCheckFindings(check.output);
     const selected = findings[index - 1];
@@ -600,14 +672,20 @@ const finding = defineCommand({
 });
 
 const artifact = defineCommand({
-  meta: { name: "checks artifact", description: "Fetch an artifact from a quality check" },
+  meta: {
+    name: "checks artifact",
+    description: "Fetch an artifact from a quality check",
+  },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
     check: { type: "positional", description: "Check key", required: true },
     key: { type: "string", description: "Artifact key" },
     head: { type: "string", description: "Return the first N lines" },
     tail: { type: "string", description: "Return the last N lines" },
-    contains: { type: "string", description: "Return lines containing text (case-insensitive)" },
+    contains: {
+      type: "string",
+      description: "Return lines containing text (case-insensitive)",
+    },
     "max-chars": {
       type: "string",
       description: "Maximum returned characters (JSON default 12000)",
@@ -685,27 +763,303 @@ const runPrechecks = defineCommand({
   meta: { name: "checks run-prechecks", description: "Run all prechecks" },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
+    wait: {
+      type: "boolean",
+      description: "Wait for the current-version prechecks to finish",
+    },
+    interval: {
+      type: "string",
+      description: "Poll interval in seconds (default 5)",
+    },
+    timeout: {
+      type: "string",
+      description: "Wait timeout in minutes (default 30)",
+    },
+    full: {
+      type: "boolean",
+      description: "Include raw stages and readiness when waiting",
+    },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
     const client = await getClient();
     const { problem, version } = await requireProblemVersion(client, args.id);
+    const window = resolveWaitWindow(args, CHECK_WAIT_DEFAULTS);
+    const baseline = createPrecheckBaseline(
+      await client.query(api.stages.getByVersion, { versionId: version._id }),
+    );
     const result = await client.action(api.contributorTokens.runAllChecksWithToken, {
       problemId: asId(args.id),
       versionId: version._id,
       input: readStageInput(problem, version),
       stageIds: PRECHECK_STAGES,
     });
+    if (window) {
+      await waitForPrechecks({
+        client,
+        problemId: args.id,
+        version,
+        baseline,
+        ...window,
+        json: Boolean(args.json),
+        full: Boolean(args.full),
+      });
+      return;
+    }
+    const waitCommand = `olympus checks wait-prechecks ${args.id} --version=${version.version} --baseline=${baseline} --json`;
     if (args.json) {
-      printJson(result);
+      printJson({ result, version: version.version, baseline, waitCommand });
       return;
     }
     console.log(`\n  Triggered ${PRECHECK_STAGES.length} precheck stages on v${version.version}`);
-    console.log("  \x1b[90mUse `olympus checks view <id>` to inspect stage results.\x1b[0m\n");
+    console.log(`  \x1b[90mWait: ${waitCommand}\x1b[0m\n`);
+  },
+});
+
+function precheckStageId(stage: any): string | undefined {
+  const id = stage?.stageId ?? stage?.id;
+  return PRECHECK_STAGES.includes(id) ? id : undefined;
+}
+function precheckStageTime(stage: any): number {
+  const value = stage?.createdAt ?? stage?._creationTime ?? stage?.completedAt;
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function precheckStageIdentity(stage: any): string | undefined {
+  const stageId = precheckStageId(stage);
+  if (!stageId) return undefined;
+  const identity = stage?.jobId ?? stage?._id ?? (stage?.id === stageId ? undefined : stage?.id);
+  if (typeof identity === "string" && identity) return `${stageId}:id:${identity}`;
+  const timestamp = precheckStageTime(stage);
+  return timestamp ? `${stageId}:time:${timestamp}` : undefined;
+}
+function latestPrecheckStages(stages: unknown): Map<string, any> {
+  const latest = new Map<string, any>();
+  for (const stage of Array.isArray(stages) ? stages : []) {
+    const id = precheckStageId(stage);
+    if (!id) continue;
+    if (!latest.has(id) || precheckStageTime(stage) >= precheckStageTime(latest.get(id)))
+      latest.set(id, stage);
+  }
+  return latest;
+}
+export function createPrecheckBaseline(stages: unknown): string {
+  const latest = latestPrecheckStages(stages);
+  const value = Object.fromEntries(
+    PRECHECK_STAGES.map((id) => [
+      id,
+      {
+        identity: precheckStageIdentity(latest.get(id)) ?? null,
+        time: precheckStageTime(latest.get(id)),
+      },
+    ]),
+  );
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+function parsePrecheckBaseline(
+  value: string,
+): Record<string, { identity: string | null; time: number }> {
+  if (typeof value !== "string" || value.length > 16_384)
+    throw new Error("Invalid precheck baseline handle");
+  let parsed: any;
+  try {
+    parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Invalid precheck baseline handle");
+  }
+  if (
+    !parsed
+    || typeof parsed !== "object"
+    || Array.isArray(parsed)
+    || Object.keys(parsed).length !== PRECHECK_STAGES.length
+    || PRECHECK_STAGES.some(
+      (id) =>
+        !Object.hasOwn(parsed, id)
+        || !parsed[id]
+        || typeof parsed[id] !== "object"
+        || (parsed[id].identity !== null
+          && (typeof parsed[id].identity !== "string" || !parsed[id].identity))
+        || typeof parsed[id].time !== "number"
+        || !Number.isFinite(parsed[id].time)
+        || parsed[id].time < 0,
+    )
+  )
+    throw new Error("Invalid precheck baseline handle");
+  return parsed;
+}
+
+export async function waitForPrechecks({
+  client,
+  problemId,
+  version,
+  baseline,
+  intervalMs,
+  timeoutMs,
+  json,
+  full,
+}: {
+  client: Client;
+  problemId: string;
+  version: ProblemVersion;
+  baseline: string;
+  intervalMs: number;
+  timeoutMs: number;
+  json?: boolean;
+  full?: boolean;
+}) {
+  const startedAt = Date.now();
+  const prior = parsePrecheckBaseline(baseline);
+  const targets = new Map<string, string>();
+  const terminal = new Set([
+    "pass",
+    "passed",
+    "warn",
+    "completed",
+    "fail",
+    "failed",
+    "error",
+    "cancelled",
+    "canceled",
+  ]);
+  const failed = new Set(["fail", "failed", "error", "cancelled", "canceled"]);
+  while (true) {
+    const current = await requireProblemVersion(client, problemId);
+    if (current.version._id !== version._id)
+      throw new Error(
+        `Current version changed from v${version.version} while waiting for prechecks`,
+      );
+    const [stages, readiness] = await Promise.all([
+      client.query(api.stages.getByVersion, { versionId: version._id }),
+      client.query(api.submissionReadiness.getSubmissionReadiness, {
+        problemId,
+      }),
+    ]);
+    const list = Array.isArray(stages) ? stages : [];
+    for (const id of PRECHECK_STAGES) {
+      if (targets.has(id)) continue;
+      const candidates = list.filter((stage) => {
+        const identity = precheckStageIdentity(stage),
+          time = precheckStageTime(stage);
+        return (
+          precheckStageId(stage) === id
+          && identity
+          && identity !== prior[id].identity
+          && (time >= prior[id].time || time === 0 || prior[id].time === 0)
+        );
+      });
+      candidates.sort((a, b) => precheckStageTime(a) - precheckStageTime(b));
+      const identity = precheckStageIdentity(candidates[0]);
+      if (identity) targets.set(id, identity);
+    }
+    const selected = PRECHECK_STAGES.map((id) =>
+      list.find((stage) => precheckStageIdentity(stage) === targets.get(id)),
+    ).filter(Boolean);
+    if (targets.size === PRECHECK_STAGES.length && selected.length !== PRECHECK_STAGES.length)
+      throw new Error("A scoped precheck stage was replaced or disappeared while waiting");
+    const statuses = selected.map((stage) =>
+      typeof stage.status === "string" ? stage.status.toLowerCase() : "unknown",
+    );
+    const complete =
+      selected.length === PRECHECK_STAGES.length
+      && statuses.every((status) => terminal.has(status));
+    const criterion = Array.isArray(readiness?.criteria)
+      ? readiness.criteria.find((item: any) => item?.id === "prechecks")
+      : undefined;
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    if (complete) {
+      const executionFailed = statuses.some((status) => failed.has(status));
+      const result: Record<string, unknown> = {
+        status: executionFailed ? "failed" : "completed",
+        version: version.version,
+        baseline,
+        elapsedSeconds,
+        stages: selected.map((stage) => ({
+          id: stage.stageId ?? stage.id,
+          identity: precheckStageIdentity(stage),
+          status: stage.status,
+        })),
+        criterion,
+      };
+      if (full) Object.assign(result, { stages, readiness });
+      if (json) printJson(result);
+      else
+        console.log(
+          `\n  Precheck execution ${executionFailed ? "failed" : "completed"} on v${version.version}.\n`,
+        );
+      if (executionFailed) process.exitCode = 1;
+      return result;
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      const result = {
+        status: "timeout",
+        version: version.version,
+        elapsedSeconds,
+        criterion: criterion ?? null,
+      };
+      if (json) printJson(result);
+      else console.error("\n  Timed out waiting for prechecks.");
+      process.exitCode = 2;
+      return result;
+    }
+    if (!json)
+      process.stderr.write(
+        `\r  waiting prechecks elapsed=${elapsedSeconds}s currentStages=${selected.length}/${PRECHECK_STAGES.length}`,
+      );
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+const waitPrechecks = defineCommand({
+  meta: {
+    name: "checks wait-prechecks",
+    description: "Wait for prechecks on one exact challenge version",
+  },
+  args: {
+    id: { type: "positional", description: "Challenge ID", required: true },
+    version: {
+      type: "string",
+      description: "Exact version number returned by run-prechecks",
+      required: true,
+    },
+    baseline: {
+      type: "string",
+      description: "Exact stage baseline handle returned by run-prechecks",
+      required: true,
+    },
+    interval: {
+      type: "string",
+      description: "Poll interval in seconds (default 5)",
+    },
+    timeout: {
+      type: "string",
+      description: "Wait timeout in minutes (default 30)",
+    },
+    full: { type: "boolean", description: "Include raw stages and readiness" },
+    json: { type: "boolean", description: "Output as JSON" },
+  },
+  run: async ({ args }) => {
+    const client = await getClient();
+    const { version } = await resolveProblemVersion(
+      client,
+      args.id,
+      parseVersionNumber(args.version),
+    );
+    await waitForPrechecks({
+      client,
+      problemId: args.id,
+      version,
+      baseline: args.baseline,
+      intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
+      timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+      json: Boolean(args.json),
+      full: Boolean(args.full),
+    });
   },
 });
 export default defineCommand({
-  meta: { name: "checks", description: "Prechecks, quality checks, and readiness" },
+  meta: {
+    name: "checks",
+    description: "Prechecks, quality checks, and readiness",
+  },
   subCommands: {
     view,
     show,
@@ -715,5 +1069,6 @@ export default defineCommand({
     wait,
     artifact,
     "run-prechecks": runPrechecks,
+    "wait-prechecks": waitPrechecks,
   },
 });

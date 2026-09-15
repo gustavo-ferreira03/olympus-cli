@@ -6,7 +6,10 @@ import { printJson } from "../terminal/format.ts";
 import { commonArgs, printResult, resolveCommandContext } from "./command-utils.ts";
 
 /** FP checks run longer than ordinary quality checks. */
-const FP_CHECK_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 45 } as const;
+const FP_CHECK_WAIT_DEFAULTS = {
+  intervalSeconds: 5,
+  timeoutMinutes: 45,
+} as const;
 
 function fpReviewStatus(state: any): "running" | "failed" | "completed" {
   const status = String(
@@ -211,7 +214,7 @@ const run = defineCommand({
     const waitCommand = result?.jobId
       ? `olympus fp-check wait ${args.id} --job=${result.jobId} --json`
       : `olympus fp-check wait ${args.id} --json`;
-    if (args.json) return printJson({ ...result, waitCommand });
+    if (args.json) return printJson({ ...result, version: versionNumber, waitCommand });
     console.log(`\n  False-positive review triggered on v${versionNumber}.`);
     console.log(`  Wait: ${waitCommand}\n`);
   },

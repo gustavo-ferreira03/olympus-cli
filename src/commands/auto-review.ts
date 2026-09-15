@@ -7,7 +7,10 @@ import { printJson } from "../terminal/format.ts";
 import { commonArgs, printResult, resolveCommandContext } from "./command-utils.ts";
 
 /** Auto Review shares the quality-check cadence. */
-const AUTO_REVIEW_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 30 } as const;
+const AUTO_REVIEW_WAIT_DEFAULTS = {
+  intervalSeconds: 5,
+  timeoutMinutes: 30,
+} as const;
 
 type OrchestratorWaitStatus = "not_started" | "running" | "failed" | "completed";
 
@@ -247,7 +250,7 @@ const run = defineCommand({
     const waitCommand = result?.jobId
       ? `olympus auto-review wait ${problemId} --job=${result.jobId} --json`
       : `olympus auto-review wait ${problemId} --json`;
-    if (args.json) return printJson({ ...result, waitCommand });
+    if (args.json) return printJson({ ...result, version: versionNumber, waitCommand });
     console.log(`\n  Auto Review triggered on v${versionNumber}.`);
     console.log(`  Wait: ${waitCommand}\n`);
   },
