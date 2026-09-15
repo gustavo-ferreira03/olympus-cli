@@ -1,6 +1,13 @@
+import {
+  remoteArtifactHashes,
+  recordedCheckInputs,
+  saveObservedInputs,
+} from "../core/check-inputs.ts";
+import { toPublicCheckKey } from "../core/expected.ts";
 import { ConvexHttpClient } from "convex/browser";
+import { CliError, describeError } from "../shared/errors.ts";
 import { anyApi, getFunctionName } from "convex/server";
-import { dispatchWithBudget, loadPolicy, PolicyError } from "../core/policy.ts";
+import { dispatchWithPolicy, loadPolicy, PolicyError } from "../core/policy.ts";
 import { budgetScope, readBudget } from "../core/budget.ts";
 import { credentialsDir, requireAuth } from "./auth.ts";
 import { resolve } from "node:path";
@@ -38,16 +45,10 @@ export async function localBudgetStatus(client: object, challengeId: string): Pr
 export async function getClient(): Promise<ConvexHttpClient> {
   if (clientSingleton) return clientSingleton;
   const { token, identity } = requireAuth();
-  let convexUrl: string;
-  try {
-    convexUrl = await retryTransient(() => getConvexUrl());
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(message, { cause: error });
-  }
+  const convexUrl = await retryTransient(() => getConvexUrl());
   const client = new ConvexHttpClient(convexUrl);
   client.setAuth(token);
-  installPolicyGuards(client, convexUrl, identity.sub);
+  installPolicyGuards(client, convexUrl, identity.sub, undefined, token);
   clientSingleton = client;
   return client;
 }
@@ -57,8 +58,11 @@ export function installPolicyGuards(
   backend: string,
   account: string,
   directory = resolve(credentialsDir(), "challenge-budgets"),
+  confirmationSecret = account,
 ): void {
   budgetScopes.set(client, { backend, account, directory });
+  const inputDirectory = resolve(directory, "..", "check-inputs");
+  const inputScope = JSON.stringify([backend, account]);
   const versions = new Map<string, string>();
   const references = new Map<string, string>();
   const valid = (value: unknown): value is string => typeof value === "string" && value.length > 0;
@@ -70,7 +74,7 @@ export function installPolicyGuards(
   const query = client.query.bind(client);
   Object.defineProperty(client, "query", {
     value: async (reference: any, args: any = {}, ...options: any[]) => {
-      const result = await query(reference, args, ...options);
+      const result = await retryTransient<any>(() => query(reference, args, ...options));
       const name = getFunctionName(reference);
       if (name === "problems:getWithLatestVersion")
         remember(versions, result?.latestVersion?._id, args.problemId);
@@ -86,9 +90,25 @@ export function installPolicyGuards(
           remember(references, run?.jobId, problem);
         }
       }
+      if (
+        name === "runDynamicChecks:getDynamicChecks"
+        && result
+        && typeof result === "object"
+        && !Array.isArray(result)
+      ) {
+        for (const check of Object.values(result) as any[])
+          remember(references, check?.jobId, problem);
+      }
       if (name === "jobs:get")
         remember(references, args.id, result?.problemId ?? versions.get(result?.versionId));
-      return result;
+      return name === "runDynamicChecks:getDynamicChecks" && typeof args.versionId === "string"
+        ? recordedCheckInputs(
+            result,
+            inputDirectory,
+            JSON.stringify([inputScope, versions.get(args.versionId) ?? args.versionId]),
+            args.versionId,
+          )
+        : result;
     },
   });
   const resolveChallenge = async (args: Record<string, any>): Promise<string> => {
@@ -117,14 +137,94 @@ export function installPolicyGuards(
   for (const method of ["action", "mutation"] as const) {
     const invoke = client[method].bind(client);
     Object.defineProperty(client, method, {
-      value: (reference: any, args: any = {}, ...options: any[]) =>
-        dispatchWithBudget({
+      value: (reference: any, args: any = {}, ...options: any[]) => {
+        const name = getFunctionName(reference);
+        const policy = loadPolicy();
+        const dispatch = async () => {
+          const tracking =
+            name === "runDynamicChecks:triggerDynamicCheck"
+            || name === "runDynamicChecks:triggerAllDynamicChecks";
+          let before: Record<string, string> | undefined;
+          let problemId: string | undefined;
+          const existingJobs = new Set<string>();
+          const observedAt = Date.now();
+          if (tracking) {
+            try {
+              problemId = await resolveChallenge(args);
+              const snapshot = await client.query(api.problems.getWithLatestVersion, { problemId });
+              if (snapshot?.latestVersion?._id === args.versionId) {
+                const previous = await client.query(api.runDynamicChecks.getDynamicChecks, {
+                  versionId: args.versionId,
+                });
+                for (const check of Object.values(previous ?? {}) as any[])
+                  if (typeof check?.jobId === "string") existingJobs.add(check.jobId);
+                before = remoteArtifactHashes(snapshot.latestVersion);
+              }
+            } catch {
+              process.stderr.write(
+                "Input tracking unavailable; dispatch will proceed without causal hashes.\n",
+              );
+            }
+          }
+          const result = await invoke(reference, args, ...options);
+          if (tracking && before && problemId) {
+            try {
+              const snapshot = await client.query(api.problems.getWithLatestVersion, { problemId });
+              if (snapshot?.latestVersion?._id === args.versionId) {
+                const after = remoteArtifactHashes(snapshot.latestVersion);
+                const entries =
+                  name === "runDynamicChecks:triggerDynamicCheck"
+                    ? [{ checkKey: args.checkKey, jobId: result?.jobId }]
+                    : Array.isArray(result)
+                      ? result
+                      : [];
+                for (const entry of entries) {
+                  if (
+                    typeof entry?.jobId !== "string"
+                    || typeof entry?.checkKey !== "string"
+                    || existingJobs.has(entry.jobId)
+                  )
+                    continue;
+                  const requested =
+                    name === "runDynamicChecks:triggerDynamicCheck"
+                      ? [args.checkKey]
+                      : (args.checkKeys ?? []);
+                  if (
+                    !requested.some(
+                      (key: string) => toPublicCheckKey(key) === toPublicCheckKey(entry.checkKey),
+                    )
+                  )
+                    continue;
+                  saveObservedInputs({
+                    directory: inputDirectory,
+                    scope: JSON.stringify([inputScope, problemId]),
+                    versionId: args.versionId,
+                    jobId: entry.jobId,
+                    check: entry.checkKey,
+                    before,
+                    after,
+                    observedAt,
+                  });
+                }
+              }
+            } catch {
+              process.stderr.write(
+                "Check dispatched; input tracking unavailable. Do not redispatch.\n",
+              );
+            }
+          }
+          return result;
+        };
+        return dispatchWithPolicy({
           client,
-          name: getFunctionName(reference),
+          name,
           args,
-          invoke: () => invoke(reference, args, ...options),
+          invoke: dispatch,
           scope: { directory, backend, account, resolveChallenge },
-        }),
+          policy,
+          confirmationSecret,
+        });
+      },
     });
   }
 }
@@ -140,11 +240,19 @@ async function retryTransient<T>(operation: () => Promise<T>): Promise<T> {
       return await operation();
     } catch (error) {
       lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/fetch failed|EAI_AGAIN|ETIMEDOUT|ECONNRESET/i.test(message) || attempt === 3) {
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      const description = describeError(error);
+      if (description.retryable !== true || !["network", "rate_limit"].includes(description.kind))
         throw error;
+      if (attempt === 3) {
+        throw new CliError(error instanceof Error ? error.message : String(error), {
+          ...description,
+          hint: "Read-only request failed after 3 attempts with exponential backoff. No mutation was retried. Check backend connectivity before retrying this read.",
+        });
       }
-      await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+      await new Promise((resolve) =>
+        setTimeout(resolve, 500 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250)),
+      );
     }
   }
   throw lastError;
@@ -173,12 +281,10 @@ export async function resolveProblemVersion(
   if (versionNumber === undefined) {
     return requireProblemVersion(client, problemId);
   }
-  const data: any = await retryTransient(() =>
-    client.query(api.problems.getWithVersion, {
-      problemId,
-      versionNumber,
-    }),
-  );
+  const data: any = await client.query(api.problems.getWithVersion, {
+    problemId,
+    versionNumber,
+  });
   if (!data?.version) {
     throw new Error(`Version v${versionNumber} was not found for problem ${problemId}`);
   }
@@ -199,11 +305,9 @@ export async function requireProblemVersion(
   client: ConvexHttpClient,
   problemId: string,
 ): Promise<ProblemWithVersion> {
-  const data: any = await retryTransient(() =>
-    client.query(api.problems.getWithLatestVersion, {
-      problemId,
-    }),
-  );
+  const data: any = await client.query(api.problems.getWithLatestVersion, {
+    problemId,
+  });
   if (!data) {
     throw new Error(`Problem not found: ${problemId}`);
   }

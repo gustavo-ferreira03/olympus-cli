@@ -21,9 +21,28 @@ import { reportBudget } from "../terminal/output.ts";
 import { parseAgentTypeInput } from "./model.ts";
 import { resolveCostCatalog, resolveRunPrices, resolveVersionOffer } from "./pricing.ts";
 import { TRIGGERABLE_CHECK_KEYS, toPublicCheckKey, toBackendCheckKey } from "./expected.ts";
+import {
+  POLICY_ACTIONS,
+  type Predicate,
+  type PolicyAction,
+  type PolicyGraph,
+  type PolicyDecision,
+  type PolicyState,
+  evaluatePolicyGraph,
+  policyActionForEndpoint,
+  policyGovernsAction,
+  policyInvocation,
+  policyFingerprint,
+  policyRecommendedAction,
+  policyDecisionFeedback,
+  readStablePolicyState,
+  localPolicySecret,
+} from "./policy-graph.ts";
 
 // Re-exported so callers keep importing the error from the module that raises it.
-export { PolicyError };
+export { PolicyError, POLICY_ACTIONS, policyDecisionFeedback };
+export { setPolicyInvocation } from "./policy-graph.ts";
+export type { PolicyDecision, PolicyState, PolicyAction };
 
 export type Policy = {
   runs: {
@@ -41,12 +60,14 @@ export type Policy = {
   };
   checks: {
     allowed: string[] | null;
+    allow_rerun_passing: boolean | null;
     require_explicit_selection: boolean | null;
     max_checks_per_request: number | null;
     max_active: number | null;
     allow_contests: boolean | null;
   };
   auto_review: { allow_force_refresh: boolean | null };
+  graph: PolicyGraph;
 };
 
 export const defaultPolicyYaml = `# yaml-language-server: $schema=./policy.schema.json
@@ -70,10 +91,14 @@ checks:
   require_explicit_selection: true # Require explicit check selection
   max_checks_per_request: 3 # Maximum distinct checks submitted together
   max_active: 3 # Maximum active dynamic checks per challenge
+  allow_rerun_passing: false # Prevent rerunning completed, current PASS checks
   allow_contests: false # Allow check contests
 
 auto_review:
   allow_force_refresh: false # Allow forced reruns of all review dimensions
+
+# Policy sequencing is opt-in. Set graph to a configured mapping to enable it.
+graph: null
 `;
 
 export function policyPath(): string {
@@ -89,6 +114,253 @@ function object(value: unknown, keys: string[], name: string): Record<string, an
   return value as Record<string, any>;
 }
 
+function parsePolicyGraph(raw: unknown): PolicyGraph {
+  if (raw === undefined || raw === null) return null;
+  const source = object(
+    raw,
+    [
+      "mode",
+      "start",
+      "confirmation",
+      "gates",
+      "result_profiles",
+      "actions",
+      "notes",
+      "repair_first",
+    ],
+    "graph",
+  );
+  if (Object.hasOwn(source, "gates") && Object.hasOwn(source, "result_profiles"))
+    throw new Error("Use graph.gates only; do not combine gates and legacy result_profiles");
+  const graph: Record<string, any> = {
+    ...source,
+    gates: Object.hasOwn(source, "gates") ? source.gates : source.result_profiles,
+  };
+  if (!new Set(["off", "advise", "enforce"]).has(graph.mode))
+    throw new Error("graph.mode must be off, advise, or enforce");
+  if (
+    graph.repair_first !== undefined
+    && (!Array.isArray(graph.repair_first)
+      || graph.repair_first.some(
+        (key: unknown) => typeof key !== "string" || !TRIGGERABLE_CHECK_KEYS.includes(key as any),
+      ))
+  )
+    throw new Error("graph.repair_first must contain public dynamic check keys");
+  const action = (value: unknown, path: string): PolicyAction => {
+    if (typeof value !== "string" || !POLICY_ACTIONS.includes(value as PolicyAction))
+      throw new Error(`${path} must be one of: ${POLICY_ACTIONS.join(", ")}`);
+    return value as PolicyAction;
+  };
+  const parsePredicates = (rawPredicates: unknown, path: string): Predicate[] => {
+    if (!Array.isArray(rawPredicates)) throw new Error(`${path} must be an array`);
+    return rawPredicates.map((rawPredicate, index) => {
+      const name = `${path}[${index}]`;
+      const predicate = object(
+        rawPredicate,
+        ["path", "equals", "empty", "greater_than", "at_least"],
+        name,
+      );
+      if (
+        typeof predicate.path !== "string"
+        || !/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(predicate.path)
+      )
+        throw new Error(`${name}.path must be a safe dotted property path`);
+      const operators = ["equals", "empty", "greater_than", "at_least"].filter((key) =>
+        Object.hasOwn(predicate, key),
+      );
+      if (operators.length !== 1)
+        throw new Error(
+          `${name} must define exactly one of equals, empty, greater_than, or at_least`,
+        );
+      if (operators[0] === "empty" && typeof predicate.empty !== "boolean")
+        throw new Error(`${name}.empty must be a boolean`);
+      for (const operator of ["greater_than", "at_least"]) {
+        if (
+          operators[0] === operator
+          && (typeof predicate[operator] !== "number" || !Number.isFinite(predicate[operator]))
+        )
+          throw new Error(`${name}.${operator} must be a finite number`);
+      }
+      if (
+        operators[0] === "equals"
+        && predicate.equals !== null
+        && !["string", "number", "boolean"].includes(typeof predicate.equals)
+      )
+        throw new Error(`${name}.equals must be a scalar or null`);
+      if (typeof predicate.equals === "number" && !Number.isFinite(predicate.equals))
+        throw new Error(`${name}.equals must be finite`);
+      return predicate as Predicate;
+    });
+  };
+  const profilesRaw = object(graph.gates ?? {}, Object.keys(graph.gates ?? {}), "graph.gates");
+  const gates: Record<string, any> = {};
+  for (const [name, rawProfile] of Object.entries(profilesRaw)) {
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(name))
+      throw new Error(`Invalid graph result profile name: ${name}`);
+    const profile = object(rawProfile, ["check", "all"], `graph.gates.${name}`);
+    if (
+      profile.check != null
+      && (typeof profile.check !== "string"
+        || !TRIGGERABLE_CHECK_KEYS.includes(profile.check as any))
+    )
+      throw new Error(`graph.gates.${name}.check must be a public dynamic check key`);
+    gates[name] = {
+      check: profile.check ?? null,
+      all: parsePredicates(profile.all, `graph.gates.${name}.all`),
+    };
+  }
+  const actionsRaw = object(graph.actions ?? {}, [...POLICY_ACTIONS], "graph.actions");
+  const actions: Record<string, any> = {};
+  for (const [name, rawNode] of Object.entries(actionsRaw)) {
+    const node = object(
+      rawNode,
+      ["requires", "on_unmet", "next", "arguments", "unless", "enforce", "requires_when"],
+      `graph.actions.${name}`,
+    );
+    if (
+      node.requires !== undefined
+      && (!Array.isArray(node.requires)
+        || node.requires.some(
+          (item: unknown) => typeof item !== "string" || !Object.hasOwn(gates, item),
+        ))
+    )
+      throw new Error(`graph.actions.${name}.requires must contain defined result profile names`);
+    if (node.next !== undefined && !Array.isArray(node.next))
+      throw new Error(`graph.actions.${name}.next must be an array`);
+    if (node.arguments !== undefined) {
+      const values = object(
+        node.arguments,
+        Object.keys(node.arguments ?? {}),
+        `graph.actions.${name}.arguments`,
+      );
+      for (const value of Object.values(values)) {
+        if (
+          !["string", "boolean"].includes(typeof value)
+          && !(typeof value === "number" && Number.isFinite(value))
+          && !(Array.isArray(value) && value.every((item) => typeof item === "string"))
+        )
+          throw new Error(
+            `graph.actions.${name}.arguments must contain scalar values or string arrays`,
+          );
+      }
+    }
+    if (node.enforce !== undefined && typeof node.enforce !== "boolean")
+      throw new Error(`graph.actions.${name}.enforce must be boolean`);
+    if (
+      node.unless !== undefined
+      && (!Array.isArray(node.unless)
+        || node.unless.some((group: unknown) => !Array.isArray(group) || group.length === 0))
+    )
+      throw new Error(`graph.actions.${name}.unless must contain non-empty predicate groups`);
+    actions[name] = {
+      ...(node.requires_when === undefined
+        ? {}
+        : {
+            requires_when: parsePredicates(
+              node.requires_when,
+              `graph.actions.${name}.requires_when`,
+            ),
+          }),
+      ...(node.enforce === undefined ? {} : { enforce: node.enforce }),
+      ...(node.unless === undefined
+        ? {}
+        : {
+            unless: node.unless.map((group: unknown, index: number) =>
+              parsePredicates(group, `graph.actions.${name}.unless[${index}]`),
+            ),
+          }),
+      arguments: node.arguments ?? {},
+      requires: node.requires ?? [],
+      on_unmet:
+        node.on_unmet === undefined || node.on_unmet === null
+          ? null
+          : action(node.on_unmet, `graph.actions.${name}.on_unmet`),
+      next: (node.next ?? []).map((rawTransition: unknown, index: number) => {
+        const transition = object(
+          rawTransition,
+          ["action", "all"],
+          `graph.actions.${name}.next[${index}]`,
+        );
+        return {
+          action:
+            transition.action === null
+              ? null
+              : action(transition.action, `graph.actions.${name}.next[${index}].action`),
+          all: parsePredicates(transition.all, `graph.actions.${name}.next[${index}].all`),
+        };
+      }),
+    };
+  }
+  let confirmation: { method: "token"; expires_after: string } | null = null;
+  if (graph.confirmation !== undefined && graph.confirmation !== null) {
+    const configured = object(
+      graph.confirmation,
+      ["method", "expires_after"],
+      "graph.confirmation",
+    );
+    if (configured.method !== "token") throw new Error("graph.confirmation.method must be token");
+    if (
+      typeof configured.expires_after !== "string"
+      || !/^([1-9]\d*)(s|m|h)$/.test(configured.expires_after)
+    )
+      throw new Error("graph.confirmation.expires_after must be a duration such as 5m");
+    const durationMatch = /^([1-9]\d*)(s|m|h)$/.exec(configured.expires_after)!;
+    const durationMs =
+      Number(durationMatch[1])
+      * ({ s: 1_000, m: 60_000, h: 3_600_000 }[durationMatch[2]] as number);
+    if (!Number.isSafeInteger(durationMs))
+      throw new Error("graph confirmation expiration is too large");
+    confirmation = { method: "token", expires_after: configured.expires_after };
+  } else if (graph.mode === "advise")
+    throw new Error("graph.confirmation is required in advise mode");
+  const notesRaw = graph.notes ?? [];
+  if (!Array.isArray(notesRaw)) throw new Error("graph.notes must be an array");
+  const notes = notesRaw.map((rawNote: unknown, index: number) => {
+    const note = object(rawNote, ["id", "when", "severity", "message"], `graph.notes[${index}]`);
+    const when = object(note.when, ["check", "all"], `graph.notes[${index}].when`);
+    if (typeof note.id !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(note.id))
+      throw new Error(`graph.notes[${index}].id is invalid`);
+    if (!new Set(["info", "warning", "error"]).has(note.severity))
+      throw new Error(`graph.notes[${index}].severity is invalid`);
+    if (typeof note.message !== "string" || !note.message.trim())
+      throw new Error(`graph.notes[${index}].message must be non-empty`);
+    if (
+      when.check !== undefined
+      && when.check !== null
+      && (typeof when.check !== "string" || !TRIGGERABLE_CHECK_KEYS.includes(when.check as any))
+    )
+      throw new Error(
+        `graph.notes[${index}].when.check must be a public dynamic check key or null`,
+      );
+    return {
+      id: note.id,
+      when: {
+        check: when.check ?? null,
+        all: parsePredicates(when.all, `graph.notes[${index}].when.all`),
+      },
+      severity: note.severity,
+      message: note.message,
+    };
+  });
+  if (new Set(notes.map((note) => note.id)).size !== notes.length)
+    throw new Error("graph note IDs must be unique");
+  const start =
+    graph.start === undefined || graph.start === null ? null : action(graph.start, "graph.start");
+  if (start && !Object.hasOwn(actions, start))
+    throw new Error("graph.start must identify a configured graph action");
+  return {
+    mode: graph.mode,
+    start,
+    confirmation,
+    gates,
+    actions,
+    notes,
+    ...(graph.repair_first === undefined
+      ? {}
+      : { repair_first: [...new Set(graph.repair_first)] as string[] }),
+  } as PolicyGraph;
+}
+
 export function parsePolicy(text: string): Policy {
   try {
     const doc = parseDocument(text, { uniqueKeys: true, merge: false });
@@ -96,9 +368,11 @@ export function parsePolicy(text: string): Policy {
       throw new Error([...doc.errors, ...doc.warnings].map((item) => item.message).join("; "));
     const root = object(
       doc.toJS({ maxAliasCount: 0 }) ?? {},
-      ["runs", "tokens", "checks", "auto_review"],
+      ["runs", "tokens", "checks", "auto_review", "graph", "workflow"],
       "policy",
     );
+    if (Object.hasOwn(root, "graph") && Object.hasOwn(root, "workflow"))
+      throw new Error("Use graph only; do not combine graph and legacy workflow");
     const group = (key: string, keys: string[]) => object(root[key] ?? {}, keys, key);
     const runs = group("runs", [
       "max_runs",
@@ -115,6 +389,7 @@ export function parsePolicy(text: string): Policy {
     ]);
     const checks = group("checks", [
       "allowed",
+      "allow_rerun_passing",
       "require_explicit_selection",
       "max_checks_per_request",
       "max_active",
@@ -146,6 +421,7 @@ export function parsePolicy(text: string): Policy {
       },
       checks: {
         allowed: value(checks, "allowed"),
+        allow_rerun_passing: value(checks, "allow_rerun_passing"),
         require_explicit_selection: value(checks, "require_explicit_selection"),
         max_checks_per_request: value(checks, "max_checks_per_request"),
         max_active: value(checks, "max_active"),
@@ -154,6 +430,7 @@ export function parsePolicy(text: string): Policy {
       auto_review: {
         allow_force_refresh: value(review, "allow_force_refresh"),
       },
+      graph: parsePolicyGraph(Object.hasOwn(root, "graph") ? root.graph : root.workflow),
     };
     const caps = object(result.runs.max_runs, ["nova", "vega", "orion", "castor"], "runs.max_runs");
     for (const [model, cap] of Object.entries(caps)) {
@@ -200,6 +477,7 @@ export function parsePolicy(text: string): Policy {
       "auto_review.allow_force_refresh": result.auto_review.allow_force_refresh,
       "runs.re_evaluation.enabled": result.runs.re_evaluation.enabled,
       "checks.allow_contests": result.checks.allow_contests,
+      "checks.allow_rerun_passing": result.checks.allow_rerun_passing,
       "runs.allow_contests": result.runs.allow_contests,
     }))
       if (v !== null && typeof v !== "boolean") throw new Error(`${key} must be null or a boolean`);
@@ -222,7 +500,176 @@ export function policySchema(): Record<string, unknown> {
     minimum: 0,
     maximum: Number.MAX_SAFE_INTEGER,
   };
+  const predicateSchema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["path"],
+    properties: {
+      path: {
+        type: "string",
+        pattern: "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+      },
+      equals: { type: ["string", "number", "boolean", "null"] },
+      empty: { type: "boolean" },
+      greater_than: { type: "number" },
+      at_least: {
+        type: "number",
+        description:
+          "Inclusive numeric minimum; actual must be a finite number greater than or equal to this value.",
+      },
+    },
+    oneOf: ["equals", "empty", "greater_than", "at_least"].map((operator) => ({
+      required: [operator],
+    })),
+  };
+  const actionEnum = [...POLICY_ACTIONS];
+  const graphSchema = {
+    type: ["object", "null"],
+    default: null,
+    additionalProperties: false,
+    properties: {
+      mode: { type: "string", enum: ["off", "advise", "enforce"] },
+      repair_first: {
+        type: "array",
+        uniqueItems: true,
+        items: { enum: [...TRIGGERABLE_CHECK_KEYS] },
+        description:
+          "When a named check is stale with a last FAIL result, only those checks may execute first. Repairs bypass graph ordering, not technical guards or budgets.",
+      },
+      start: { type: ["string", "null"], enum: [...actionEnum, null] },
+      confirmation: {
+        type: ["object", "null"],
+        additionalProperties: false,
+        required: ["method", "expires_after"],
+        properties: {
+          method: { const: "token" },
+          expires_after: { type: "string", pattern: "^[1-9][0-9]*(s|m|h)$" },
+        },
+      },
+      gates: {
+        type: "object",
+        additionalProperties: {
+          type: "object",
+          additionalProperties: false,
+          required: ["all"],
+          properties: {
+            check: {
+              type: ["string", "null"],
+              enum: [...TRIGGERABLE_CHECK_KEYS, null],
+            },
+            all: { type: "array", items: predicateSchema },
+          },
+        },
+      },
+      actions: {
+        type: "object",
+        additionalProperties: false,
+        properties: Object.fromEntries(
+          actionEnum.map((name) => [
+            name,
+            {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                requires_when: {
+                  type: "array",
+                  items: predicateSchema,
+                  description: "Apply requirements only when all state predicates match.",
+                },
+                enforce: {
+                  type: "boolean",
+                  description: "Disallow advise confirmation for this action.",
+                },
+                unless: {
+                  type: "array",
+                  items: { type: "array", minItems: 1, items: predicateSchema },
+                  description:
+                    "Skip this action requirements if any non-empty group of state predicates all match. Unknown values never match absent fields.",
+                },
+                arguments: {
+                  type: "object",
+                  additionalProperties: {
+                    anyOf: [
+                      { type: ["string", "number", "boolean"] },
+                      { type: "array", items: { type: "string" } },
+                    ],
+                  },
+                },
+                requires: {
+                  type: "array",
+                  items: { type: "string" },
+                  uniqueItems: true,
+                },
+                on_unmet: {
+                  type: ["string", "null"],
+                  enum: [...actionEnum, null],
+                },
+                next: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["action", "all"],
+                    properties: {
+                      action: { type: ["string", "null"], enum: [...actionEnum, null] },
+                      all: { type: "array", items: predicateSchema },
+                    },
+                  },
+                },
+              },
+            },
+          ]),
+        ),
+      },
+      notes: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "when", "severity", "message"],
+          properties: {
+            id: { type: "string" },
+            severity: { enum: ["info", "warning", "error"] },
+            message: { type: "string", minLength: 1 },
+            when: {
+              type: "object",
+              additionalProperties: false,
+              required: ["all"],
+              properties: {
+                check: {
+                  type: ["string", "null"],
+                  enum: [...TRIGGERABLE_CHECK_KEYS, null],
+                },
+                all: { type: "array", items: predicateSchema },
+              },
+            },
+          },
+        },
+      },
+    },
+    required: ["mode"],
+    allOf: [
+      {
+        if: { properties: { mode: { const: "advise" } }, required: ["mode"] },
+        // eslint-disable-next-line unicorn/no-thenable -- JSON Schema keyword, not a thenable.
+        then: { required: ["confirmation"] },
+      },
+    ],
+  };
   const describe = (value: any, path: string): any => {
+    if (path === "graph")
+      return {
+        ...graphSchema,
+        not: { type: "object", required: ["gates", "result_profiles"] },
+        properties: {
+          ...graphSchema.properties,
+          result_profiles: {
+            ...graphSchema.properties.gates,
+            deprecated: true,
+            description: "Legacy alias for gates. Do not use both names.",
+          },
+        },
+      };
     if (path === "runs.max_runs")
       return {
         ...mapping(
@@ -268,10 +715,17 @@ export function policySchema(): Record<string, unknown> {
       ),
     );
   };
+  const schema = describe(defaults, "");
+  schema.properties.workflow = {
+    ...schema.properties.graph,
+    deprecated: true,
+    description: "Legacy alias for graph; normalized on load. Do not use both names.",
+  };
   return {
     $schema: "http://json-schema.org/draft-07/schema#",
-    title: "Olympus guardrails",
-    ...describe(defaults, ""),
+    title: "Olympus policy",
+    ...schema,
+    not: { type: "object", required: ["graph", "workflow"] },
   };
 }
 
@@ -526,6 +980,136 @@ const amount = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0;
 const id = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 
+function currentCheckPassed(value: unknown, key: string): boolean {
+  if (value == null) return false;
+  if (!record(value) || typeof value.status !== "string")
+    throw new Error(`Invalid result for ${key}`);
+  const status = value.status.toLowerCase();
+  if (!activeStatuses.has(status) && !inactiveStatuses.has(status))
+    throw new Error(`Unknown status for ${key}: ${value.status}`);
+  if (status !== "completed" || value.stale === true) return false;
+  const output = value.output;
+  if (output == null) return false;
+  if (!record(output) || (output.evaluation != null && !record(output.evaluation)))
+    throw new Error(`Invalid output for ${key}`);
+  const verdict =
+    output.verdict
+    ?? output.evaluation?.verdict
+    ?? (key === "autoReview" ? output.outcome : undefined);
+  if (verdict == null) return false;
+  if (typeof verdict !== "string") throw new Error(`Invalid verdict for ${key}`);
+  const passed =
+    verdict.toUpperCase() === "PASS"
+    || (key === "autoReview" && verdict.toUpperCase() === "APPROVED");
+  if (!passed) return false;
+  if (value.stale !== false) throw new Error(`Freshness is unknown for ${key}`);
+  return true;
+}
+
+function passingChecks(requested: string[], dynamic: unknown, review: unknown): string[] {
+  if (!record(dynamic)) throw new Error("Dynamic check results are unavailable");
+  const results = new Map<string, unknown>();
+  for (const key of requested) {
+    const matches = Object.entries(dynamic).filter(
+      ([candidate]) => toPublicCheckKey(candidate) === key,
+    );
+    if (matches.length > 1) throw new Error(`Ambiguous results for ${key}`);
+    results.set(key, matches[0]?.[1]);
+  }
+  if (requested.includes("autoReview")) {
+    if (review !== null && (!record(review) || !record(review.slots)))
+      throw new Error("Auto Review results are unavailable");
+    if (record(review) && review.slots.synthesis != null)
+      results.set("autoReview", review.slots.synthesis);
+  }
+  return requested.filter((key) => currentCheckPassed(results.get(key), key));
+}
+
+function currentPrechecksPassed(readiness: unknown): boolean {
+  if (!record(readiness) || !Array.isArray(readiness.criteria))
+    throw new Error("Submission readiness is unavailable");
+  const criterion = readiness.criteria.find((item: any) => item?.id === "prechecks");
+  if (!record(criterion) || typeof criterion.status !== "string")
+    throw new Error("Readiness has no prechecks criterion");
+  if (criterion.status.toLowerCase() !== "pass") return false;
+  if (criterion.stale !== false) throw new Error("Precheck freshness is unknown");
+  return true;
+}
+
+async function assertCheckRerunAllowed(
+  client: Reader,
+  name: string,
+  args: Record<string, any>,
+  policy: Policy,
+): Promise<void> {
+  if (policy.checks.allow_rerun_passing !== false) return;
+  if (name === "contributorTokens:runAllChecksWithToken") {
+    const details = {
+      endpoint: name,
+      problemId: args.problemId,
+      versionId: args.versionId,
+      dispatched: false,
+    };
+    let readiness: any;
+    try {
+      if (!id(args.problemId) || !id(args.versionId))
+        throw new Error("A challenge ID and version ID are required to inspect prechecks");
+      readiness = await client.query(api.submissionReadiness.getSubmissionReadiness, {
+        problemId: args.problemId,
+      });
+      const passed = currentPrechecksPassed(readiness);
+      if (passed)
+        throw new PolicyError(
+          "checks.allow_rerun_passing",
+          "Not dispatched: current prechecks already passed. Rerunning passing prechecks is disabled by policy.",
+          { ...details, alreadyPassed: ["prechecks"] },
+        );
+    } catch (error) {
+      if (error instanceof PolicyError) throw error;
+      throw new PolicyError(
+        "checks.state_unavailable",
+        `Cannot determine whether prechecks already passed: ${error instanceof Error ? error.message : String(error)}`,
+        details,
+      );
+    }
+    return;
+  }
+  const requested = checkKeysForEndpoint(name, args);
+  if (requested.length === 0) return;
+  const details = {
+    endpoint: name,
+    versionId: args.versionId,
+    requested,
+    dispatched: false,
+  };
+  let alreadyPassed: string[];
+  try {
+    if (!id(args.versionId)) throw new Error("A version ID is required to inspect check results");
+    const dynamic = await client.query(api.runDynamicChecks.getDynamicChecks, {
+      versionId: args.versionId,
+    });
+    const review = requested.includes("autoReview")
+      ? await client.query(api.orchestratorReview.getOrchestratorReview, {
+          versionId: args.versionId,
+        })
+      : null;
+    alreadyPassed = passingChecks(requested, dynamic, review);
+  } catch (error) {
+    throw new PolicyError(
+      "checks.state_unavailable",
+      `Cannot determine whether requested checks already passed: ${error instanceof Error ? error.message : String(error)}`,
+      details,
+    );
+  }
+  if (alreadyPassed.length > 0) {
+    throw new PolicyError(
+      "checks.allow_rerun_passing",
+      `Not dispatched: current checks already passed: ${alreadyPassed.join(", ")}. Remove them from the request.`,
+      { ...details, alreadyPassed },
+    );
+  }
+}
+
 // These are the exact quick-run keys supported in runs.ts, not a tariff fallback.
 const quickSolvers: Record<string, string> = {
   vegaVega: "claude_code",
@@ -560,7 +1144,10 @@ async function quoteCost(
       : {
           cost,
           parts: [
-            { operation: kind === "fp" ? "reviews:fpCheck" : "runs:reEvaluation", amount: cost },
+            {
+              operation: kind === "fp" ? "reviews:fpCheck" : "runs:reEvaluation",
+              amount: cost,
+            },
           ],
         };
   }
@@ -634,7 +1221,10 @@ function tokenUnits(values: number[]): { units: bigint[]; exponent: number } {
   const parts = values.map((value) => {
     const [mantissa, power = "0"] = String(value).split("e");
     const [whole, fraction = ""] = mantissa.split(".");
-    return { digits: BigInt(whole + fraction), exponent: Number(power) - fraction.length };
+    return {
+      digits: BigInt(whole + fraction),
+      exponent: Number(power) - fraction.length,
+    };
   });
   const exponent = Math.min(...parts.map((part) => part.exponent));
   return {
@@ -816,7 +1406,7 @@ export async function assertOperationCost(
   );
 }
 
-export type BudgetDispatchScope = {
+export type PolicyDispatchScope = {
   directory: string;
   backend: string;
   account: string;
@@ -836,8 +1426,232 @@ export function assertChallengeBudget(state: BudgetFeedback): void {
     );
 }
 
-/** One budgeted dispatch: which endpoint, with what arguments, and how to run it. */
-export type BudgetDispatch<T> = {
+/** One policy decision from declared rules, graph and canonical facts. */
+export function evaluatePolicy(
+  input: Omit<
+    Parameters<typeof evaluatePolicyGraph>[0],
+    "graph" | "policyHash" | "batchDecisions"
+  > & { policy: Policy },
+): PolicyDecision {
+  const { policy, state, action, args } = input;
+  const keys =
+    action === "checks.run_all"
+      ? Array.isArray(args.checkKeys)
+        ? args.checkKeys.map(String).map(toPublicCheckKey)
+        : []
+      : action.startsWith("checks.")
+        ? [action.slice("checks.".length)]
+        : action === "auto_review.orchestrate"
+          ? ["autoReview"]
+          : [];
+  let failure: PolicyError | undefined;
+  try {
+    assertTokenPolicy(args, policy);
+    if (action === "prechecks.run" && policy.checks.allow_rerun_passing === false) {
+      let passed: boolean;
+      try {
+        passed = currentPrechecksPassed(state.readiness);
+      } catch (error) {
+        throw new PolicyError(
+          "checks.state_unavailable",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      if (passed)
+        throw new PolicyError("checks.allow_rerun_passing", "Current prechecks already passed", {
+          alreadyPassed: ["prechecks"],
+        });
+    }
+    if (keys.length > 0) {
+      assertCheckSelection(keys, true, policy);
+      if (policy.checks.allow_rerun_passing === false) {
+        let passed: string[];
+        try {
+          passed = passingChecks(keys, state.checks, state.autoReview);
+        } catch (error) {
+          throw new PolicyError(
+            "checks.state_unavailable",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+        if (passed.length > 0)
+          throw new PolicyError("checks.allow_rerun_passing", "Current checks already passed", {
+            alreadyPassed: passed,
+          });
+      }
+    }
+    if (action === "re_evaluation.run" && policy.runs.re_evaluation.enabled === false)
+      throw new PolicyError("runs.re_evaluation.enabled", "Re-evaluation is disabled by policy");
+    if (
+      action === "auto_review.orchestrate"
+      && args.forceFresh
+      && policy.auto_review.allow_force_refresh === false
+    )
+      throw new PolicyError(
+        "auto_review.allow_force_refresh",
+        "Forced fresh Auto Review is disabled by policy",
+      );
+    if (action === "rollouts.run" && Array.isArray(args.configs))
+      assertRunCapacity(state.runs, args.configs, policy);
+  } catch (error) {
+    if (!(error instanceof PolicyError)) throw error;
+    failure = error;
+  }
+  const batchDecisions =
+    action === "checks.run_all"
+      ? keys.map((key) =>
+          evaluatePolicy({
+            ...input,
+            action: `checks.${key}` as PolicyAction,
+            preview: true,
+            confirmation: undefined,
+          }),
+        )
+      : [];
+  const decision = evaluatePolicyGraph({
+    ...input,
+    graph: policy.graph,
+    policyHash: policyFingerprint(policy),
+    confirmation: input.preview || failure ? undefined : input.confirmation,
+    preview: input.preview || Boolean(failure),
+    batchDecisions,
+  });
+  if (!failure) return decision;
+  const details = failure.details;
+  const expected = Object.hasOwn(details, "limit")
+    ? { at_most: details.limit }
+    : details.allowed
+      ? { one_of: details.allowed }
+      : {
+          equals:
+            failure.rule === "checks.allow_rerun_passing"
+              ? "not already passed"
+              : "permitted by policy",
+        };
+  return {
+    ...decision,
+    status: "blocked",
+    mode: "enforce",
+    rule: failure.rule,
+    confirmation: undefined,
+    cliContinuation: { command: input.cliCommand ?? null, append: [] },
+    unmetRequirements: [
+      {
+        profile: failure.rule,
+        check: null,
+        path: failure.rule,
+        expected,
+        actual: failure.rule.endsWith("state_unavailable")
+          ? null
+          : (details.alreadyPassed ?? details.requested ?? "denied"),
+        reason: failure.rule.endsWith("state_unavailable") ? "missing_field" : "predicate_failed",
+      },
+      ...decision.unmetRequirements,
+    ],
+  };
+}
+
+/** Read-only inspection. It never confirms, reserves tokens or dispatches. */
+export async function inspectPolicy(
+  client: Reader,
+  challengeId: string,
+  policy = loadPolicy(),
+  full = false,
+) {
+  const state = await readStablePolicyState(client, challengeId);
+  const recommended =
+    policy.graph && policy.graph.mode !== "off"
+      ? policyRecommendedAction(state, policy.graph)
+      : null;
+  const decisions = POLICY_ACTIONS.map((action) => {
+    const configured = policy.graph?.actions[action]?.arguments ?? {};
+    const args: Record<string, unknown> = {
+      ...configured,
+      ...(Array.isArray(configured.checks) ? { checkKeys: configured.checks } : {}),
+      useGeneralTokens: configured["use-general-tokens"],
+      forceFresh: configured["force-fresh"],
+    };
+    return evaluatePolicy({
+      policy,
+      state,
+      action,
+      args,
+      secret: "",
+      replayDirectory: "",
+      preview: true,
+    });
+  });
+  const decision = decisions.find((item) => item.action === recommended) ?? null;
+  const readiness = record(state.readiness) ? state.readiness : {};
+  return {
+    status: "inspected",
+    challengeId,
+    versionId: state.versionId,
+    actionCatalog: POLICY_ACTIONS,
+    decision,
+    decisions,
+    // Policy permission is not platform readiness or a paid-dispatch preflight.
+    executionPreflight: "required",
+    platform: { canSubmit: typeof readiness.canSubmit === "boolean" ? readiness.canSubmit : null },
+    ...(full ? { state } : {}),
+  };
+}
+
+async function authorizePolicy(
+  input: Pick<
+    PolicyDispatch<unknown>,
+    "client" | "name" | "args" | "scope" | "confirmationSecret"
+  > & { policy: Policy },
+): Promise<void> {
+  const { client, name, args, scope, policy, confirmationSecret } = input;
+  const action = policyActionForEndpoint(name, args);
+  const batchActions =
+    name === "runDynamicChecks:triggerAllDynamicChecks"
+      ? checkKeysForEndpoint(name, args).map((key) => `checks.${key}` as PolicyAction)
+      : [];
+  if (
+    !action
+    || !policy.graph
+    || policy.graph.mode === "off"
+    || ![action, ...batchActions].some((candidate) => policyGovernsAction(policy.graph!, candidate))
+  )
+    return;
+  let state: PolicyState;
+  let decision: PolicyDecision;
+  try {
+    const challengeId = await scope.resolveChallenge(args);
+    state = await readStablePolicyState(client, challengeId);
+    if (args.versionId !== undefined && args.versionId !== state.versionId)
+      throw new Error("Requested version is not the current policy state; refresh before dispatch");
+    const current = policyInvocation();
+    decision = evaluatePolicy({
+      policy,
+      state,
+      action,
+      args,
+      confirmation: current.confirmation,
+      secret: `${confirmationSecret ?? scope.account}\0${scope.backend}\0${scope.account}\0${localPolicySecret(credentialsDir())}`,
+      replayDirectory: resolve(credentialsDir(), "workflow-confirmations"),
+      cliCommand: current.command,
+    });
+  } catch (error) {
+    if (error instanceof PolicyError) throw error;
+    throw new PolicyError(
+      "policy.state_unavailable",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  if (decision.status !== "allowed" && decision.status !== "off") {
+    const { message, feedback } = policyDecisionFeedback(decision, state);
+    throw new PolicyError(decision.rule ?? `policy.${decision.status}`, message, {
+      decision,
+      feedback,
+    });
+  }
+}
+
+/** One dispatch through policy, graph confirmation and atomic budget reservation. */
+export type PolicyDispatch<T> = {
   /** Client used for cost quoting. */
   client: Reader;
   /** Fully-qualified Convex function name. */
@@ -847,25 +1661,34 @@ export type BudgetDispatch<T> = {
   /** Performs the actual call once the budget allows it. */
   invoke: () => Promise<T>;
   /** Where the local budget ledger lives and how to resolve the challenge. */
-  scope: BudgetDispatchScope;
+  scope: PolicyDispatchScope;
   /** Pre-loaded policy; loaded on demand when omitted. */
   policy?: Policy;
+  confirmationSecret?: string;
 };
 
-export async function dispatchWithBudget<T>({
+export async function dispatchWithPolicy<T>({
   client,
   name,
   args,
   invoke,
   scope,
   policy,
-}: BudgetDispatch<T>): Promise<T> {
-  if (!isPolicyEndpoint(name, args)) return invoke();
+  confirmationSecret,
+}: PolicyDispatch<T>): Promise<T> {
   const effective = policy ?? loadPolicy();
+  const authorize = () =>
+    authorizePolicy({ client, name, args, scope, policy: effective, confirmationSecret });
+  if (!isPolicyEndpoint(name, args)) {
+    await authorize();
+    return invoke();
+  }
   const limit = effective.tokens.challenge_budget;
+  assertPaidEndpoint(name, args, effective);
+  await assertCheckRerunAllowed(client, name, args, effective);
   if (limit === null || !paidEndpoints.has(name)) {
-    assertPaidEndpoint(name, args, effective);
     await assertOperationCost(client, name, args, effective);
+    await authorize();
     return invoke();
   }
   let context: BudgetContext | undefined;
@@ -893,7 +1716,6 @@ export async function dispatchWithBudget<T>({
       limit,
     };
     state = { ...state, ...(await readBudget(context)) };
-    assertPaidEndpoint(name, args, effective);
     let quote: Awaited<ReturnType<typeof quoteCost>>;
     try {
       quote = await quoteCost(client, name, args);
@@ -912,14 +1734,21 @@ export async function dispatchWithBudget<T>({
     const held = await reserveBudget(context, cost, assertChallengeBudget, parts);
     reservation = held.id;
     state = { ...state, ...held.feedback };
+    await authorize();
     invoked = true;
     const result = await invoke();
-    state = { ...state, ...(await settleBudget(context, reservation, "spent")) };
+    state = {
+      ...state,
+      ...(await settleBudget(context, reservation, "spent")),
+    };
     reportBudget(state);
     return result;
   } catch (error) {
     if (reservation && context && !invoked) {
-      state = { ...state, ...(await settleBudget(context, reservation, "released")) };
+      state = {
+        ...state,
+        ...(await settleBudget(context, reservation, "released")),
+      };
     } else if (
       (error instanceof BudgetError || error instanceof PolicyError)
       && error.details.budget

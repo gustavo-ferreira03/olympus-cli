@@ -90,11 +90,18 @@ function classify(error: object): ErrorDescription | undefined {
         hint: "Check the local policy file for validity and read access.",
       };
     }
+    if (error.rule === "policy.blocked" || error.rule === "policy.confirmation_required")
+      return {
+        kind: "policy",
+        code: error.rule,
+        retryable: false,
+        hint: "No action was dispatched. The response includes each unmet condition, observed or unknown evidence, policy recommendation, and any available advise confirmation. A recommendation is not a guaranteed repair.",
+      };
     return {
       kind: "policy",
       code: error.rule,
       retryable: false,
-      hint: "Review the reported policy rule and choose an operation permitted by the guardrails.",
+      hint: "Review the reported policy rule and choose an operation permitted by the policy.",
     };
   }
   const code = readProperty(error, "code");

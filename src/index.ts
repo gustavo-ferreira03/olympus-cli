@@ -15,7 +15,7 @@ import verifierAudit from "./commands/verifier-audit.ts";
 import tokens from "./commands/tokens.ts";
 import policy from "./commands/policy.ts";
 import dashboard from "./commands/dashboard.ts";
-import { PolicyError } from "./core/policy.ts";
+import { PolicyError, setPolicyInvocation } from "./core/policy.ts";
 import { BudgetError } from "./core/budget.ts";
 import { printJson } from "./terminal/format.ts";
 import { checkVersion, UPDATE_PACKAGE_NAME } from "./platform/config.ts";
@@ -29,7 +29,10 @@ const { version } = require("../package.json");
 const update = defineCommand({
   meta: { name: "update", description: "Update the CLI to the latest version" },
   args: {
-    version: { type: "string", description: "Target version (default: latest)" },
+    version: {
+      type: "string",
+      description: "Target version (default: latest)",
+    },
     json: { type: "boolean", description: "Output JSON" },
   },
   run: async ({ args }) => {
@@ -45,9 +48,15 @@ const update = defineCommand({
     const spec = `${UPDATE_PACKAGE_NAME}@${target}`;
     if (!args.json) console.log(`\n  Updating to ${spec}...`);
     try {
-      execFileSync("npm", ["install", "-g", spec], { stdio: args.json ? "pipe" : "inherit" });
+      execFileSync("npm", ["install", "-g", spec], {
+        stdio: args.json ? "pipe" : "inherit",
+      });
       if (args.json)
-        printJson({ status: "updated", package: UPDATE_PACKAGE_NAME, version: target });
+        printJson({
+          status: "updated",
+          package: UPDATE_PACKAGE_NAME,
+          version: target,
+        });
       else console.log(`\n  Updated successfully.`);
     } catch {
       throw new CliError("Update failed.", {
@@ -66,6 +75,12 @@ const main = defineCommand({
     description: "Olympus CLI — Gustavo's Fork",
   },
   default: "help",
+  args: {
+    "policy-confirmation": {
+      type: "string",
+      description: "Bound confirmation token for an unchanged advise-mode request",
+    },
+  },
   subCommands: {
     auth,
     problems,
@@ -82,7 +97,10 @@ const main = defineCommand({
     dashboard,
     update,
     view: defineCommand({
-      meta: { name: "view", description: "Shortcut for `olympus problems view <id>`" },
+      meta: {
+        name: "view",
+        description: "Shortcut for `olympus problems view <id>`",
+      },
       args: {
         id: { type: "positional", description: "Problem ID", required: true },
         json: { type: "boolean", description: "Output as JSON" },
@@ -103,7 +121,7 @@ const main = defineCommand({
     }),
   },
 });
-Object.assign(main.subCommands!, { schema: createSchemaCommand(main) });
+Object.assign(main.subCommands!, { schema: createSchemaCommand(main as any) });
 function errorMessage(error: unknown): string {
   if (error && typeof error === "object" && "data" in error) {
     const data = (error as { data?: unknown }).data;
@@ -113,11 +131,48 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-const rawArgs = process.argv.slice(2);
+const suppliedArgs = process.argv.slice(2);
+// Compatibility only: one canonical command tree, not a second subsystem.
+if (suppliedArgs[0] === "workflow" && suppliedArgs[1] === "status")
+  suppliedArgs.splice(0, 2, "policy", "show");
+let confirmation: string | undefined;
+const rawArgs: string[] = [];
+for (let index = 0; index < suppliedArgs.length; index += 1) {
+  const argument = suppliedArgs[index];
+  if (argument === "--policy-confirmation" || argument === "--workflow-confirmation") {
+    const value = suppliedArgs[index + 1];
+    if (!value || value.startsWith("-")) confirmation = "invalid-missing-confirmation";
+    else {
+      confirmation = confirmation === undefined ? value : "invalid-duplicate-confirmation";
+      index += 1;
+    }
+    continue;
+  }
+  if (
+    argument.startsWith("--policy-confirmation=")
+    || argument.startsWith("--workflow-confirmation=")
+  ) {
+    const value = argument.slice(argument.indexOf("=") + 1);
+    confirmation =
+      confirmation === undefined && value
+        ? value
+        : confirmation === undefined
+          ? "invalid-missing-confirmation"
+          : "invalid-duplicate-confirmation";
+    continue;
+  }
+  rawArgs.push(argument);
+}
+setPolicyInvocation({
+  confirmation,
+  command: ["olympus", ...rawArgs],
+});
+const confirmationInputError = confirmation?.startsWith("invalid-") ? confirmation : undefined;
 const jsonOutput = rawArgs.includes("--json") || rawArgs[0] === "schema";
 const usesBuiltinOutput =
-  rawArgs.some((arg) => arg === "--help" || arg === "-h")
-  || (rawArgs.length === 1 && (rawArgs[0] === "--version" || rawArgs[0] === "-v"));
+  !confirmationInputError
+  && (rawArgs.some((arg) => arg === "--help" || arg === "-h")
+    || (rawArgs.length === 1 && (rawArgs[0] === "--version" || rawArgs[0] === "-v")));
 
 if (usesBuiltinOutput) {
   await runMain(main, { rawArgs });
@@ -132,6 +187,13 @@ if (usesBuiltinOutput) {
   });
   versionCheckStart.unref();
   try {
+    if (confirmationInputError)
+      throw new CliError("--policy-confirmation requires exactly one non-option token value", {
+        kind: "usage",
+        code: "input.invalid_policy_confirmation",
+        retryable: false,
+        hint: "Use the exact continuation returned by the policy decision.",
+      });
     await runCommand(main, { rawArgs });
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "E_NO_COMMAND") {
@@ -139,13 +201,25 @@ if (usesBuiltinOutput) {
     } else {
       const message = errorMessage(error);
       if (jsonOutput) {
-        printJson({
-          ...(error instanceof PolicyError || error instanceof BudgetError
-            ? { status: "blocked", rule: sanitizeDiagnostic(error.rule), ...error.details }
-            : { status: "error" }),
-          error: sanitizeDiagnostic(message),
-          ...describeError(error),
-        });
+        if (error instanceof PolicyError && error.details.feedback) {
+          printJson({
+            status: "blocked",
+            rule: error.rule,
+            ...(error.details.feedback as Record<string, unknown>),
+          });
+          process.exitCode = 1;
+        } else
+          printJson({
+            ...(error instanceof PolicyError || error instanceof BudgetError
+              ? {
+                  status: "blocked",
+                  rule: sanitizeDiagnostic(error.rule),
+                  ...error.details,
+                }
+              : { status: "error" }),
+            error: sanitizeDiagnostic(message),
+            ...describeError(error),
+          });
       } else {
         console.error(`Error: ${message}`);
       }
