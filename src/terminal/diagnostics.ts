@@ -1,4 +1,4 @@
-import { sanitizeDiagnostic } from "./errors.ts";
+import { sanitizeDiagnostic } from "../shared/errors.ts";
 import { StringDecoder } from "node:string_decoder";
 
 export function installDiagnosticOutput(): () => void {
@@ -11,11 +11,9 @@ export function installDiagnosticOutput(): () => void {
     callback?: (error?: Error | null) => void,
   ): boolean => {
     const text =
-      typeof chunk === "string"
-        ? decoder.end() + chunk
-        : decoder.write(Buffer.from(chunk));
+      typeof chunk === "string" ? decoder.end() + chunk : decoder.write(Buffer.from(chunk));
     const done = typeof encoding === "function" ? encoding : callback;
-    return write(sanitizeDiagnostic(text.replace(/\r/g, "\n")), done);
+    return write(sanitizeDiagnostic(text.replaceAll("\r", "\n")), done);
   }) as typeof process.stderr.write;
   process.stderr.write = filtered;
   return () => {

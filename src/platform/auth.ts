@@ -1,32 +1,27 @@
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { CliError } from "./errors.ts";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { assertFileWithinLimit, MAX_LOCAL_STATE_BYTES } from "../shared/limits.ts";
+import { CliError } from "../shared/errors.ts";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
-export interface DecodedIdentity {
+export type DecodedIdentity = {
   sub: string;
   email: string;
   username: string;
   name: string;
   picture: string;
   exp: number;
-}
+};
 
-export interface Credentials {
+export type Credentials = {
   token: string;
   identity: DecodedIdentity;
-}
+};
 
-interface StoredCredentials {
+type StoredCredentials = {
   token: string;
   expiresAt: string;
-}
+};
 
 export function credentialsDir(): string {
   return resolve(homedir(), ".shipd", "olympus");
@@ -66,6 +61,7 @@ export function saveCredentials(token: string): DecodedIdentity {
 export function loadCredentials(): Credentials | null {
   if (!existsSync(CREDENTIALS_PATH)) return null;
   try {
+    assertFileWithinLimit(CREDENTIALS_PATH, MAX_LOCAL_STATE_BYTES, "Credentials file");
     const raw = readFileSync(CREDENTIALS_PATH, "utf-8");
     const stored = JSON.parse(raw) as Partial<StoredCredentials>;
     if (!stored.token) return null;
@@ -89,7 +85,10 @@ export function requireAuth(): Credentials {
   const credentials = loadCredentials();
   if (!credentials) {
     throw new CliError("Not logged in. Run: olympus auth login", {
-      kind: "auth", code: "auth.required", retryable: false, hint: "Run: olympus auth login",
+      kind: "auth",
+      code: "auth.required",
+      retryable: false,
+      hint: "Run: olympus auth login",
     });
   }
   return credentials;

@@ -1,11 +1,7 @@
 import { defineCommand } from "citty";
-import { assertPaidEndpoint, assertCheckCapacity, assertOperationCost } from "../policy.ts";
-import { api } from "../convex.ts";
-import {
-  commonArgs,
-  printResult,
-  resolveCommandContext,
-} from "../command-utils.ts";
+import { assertPaidEndpoint, assertCheckCapacity, assertOperationCost } from "../core/policy.ts";
+import { api } from "../platform/convex.ts";
+import { commonArgs, printResult, resolveCommandContext } from "./command-utils.ts";
 
 function noteArgs(description: string) {
   return {
@@ -144,5 +140,11 @@ const taskAsMars = defineCommand({
 
 export default defineCommand({
   meta: { name: "contest", description: "Contest quality-check verdicts" },
-  subCommands: { view, description, "test-quality": testQuality, solution, "task-as-mars": taskAsMars },
+  subCommands: {
+    view,
+    description,
+    "test-quality": testQuality,
+    solution,
+    "task-as-mars": taskAsMars,
+  },
 });

@@ -1,24 +1,33 @@
 import { createHash } from "node:crypto";
 import { anyApi } from "convex/server";
 import { readFileSync } from "node:fs";
+import { assertFileWithinLimit, MAX_LOCAL_STATE_BYTES } from "../shared/limits.ts";
+import { PolicyError } from "../shared/error-types.ts";
 import { resolve } from "node:path";
 import { parseDocument } from "yaml";
-import { credentialsDir } from "./auth.ts";
-import { BudgetError, budgetScope, readBudget, reserveBudget, settleBudget, sumBudgetAmounts, type BudgetContext, type BudgetFeedback, type BudgetPart } from "./budget.ts";
-import { reportBudget } from "./output.ts";
+import { credentialsDir } from "../platform/auth.ts";
+import {
+  BudgetError,
+  budgetScope,
+  readBudget,
+  reserveBudget,
+  settleBudget,
+  sumBudgetAmounts,
+  type BudgetContext,
+  type BudgetFeedback,
+  type BudgetPart,
+} from "./budget.ts";
+import { reportBudget } from "../terminal/output.ts";
 import { parseAgentTypeInput } from "./model.ts";
 import { resolveCostCatalog, resolveRunPrices, resolveVersionOffer } from "./pricing.ts";
-import {
-  TRIGGERABLE_CHECK_KEYS,
-  toPublicCheckKey,
-  toBackendCheckKey,
-} from "./expected.ts";
+import { TRIGGERABLE_CHECK_KEYS, toPublicCheckKey, toBackendCheckKey } from "./expected.ts";
 
-export interface Policy {
+// Re-exported so callers keep importing the error from the module that raises it.
+export { PolicyError };
+
+export type Policy = {
   runs: {
-    max_runs: Partial<
-      Record<"nova" | "vega" | "orion" | "castor", number | null>
-    >;
+    max_runs: Partial<Record<"nova" | "vega" | "orion" | "castor", number | null>>;
     allow_full_preset: boolean | null;
     allow_manual_batch_name: boolean | null;
     allow_cancellations: boolean | null;
@@ -38,7 +47,7 @@ export interface Policy {
     allow_contests: boolean | null;
   };
   auto_review: { allow_force_refresh: boolean | null };
-}
+};
 
 export const defaultPolicyYaml = `# yaml-language-server: $schema=./policy.schema.json
 runs:
@@ -67,31 +76,15 @@ auto_review:
   allow_force_refresh: false # Allow forced reruns of all review dimensions
 `;
 
-export class PolicyError extends Error {
-  constructor(
-    public rule: string,
-    message: string,
-    public details: Record<string, unknown> = {},
-  ) {
-    super(message);
-    this.name = "PolicyError";
-  }
-}
-
 export function policyPath(): string {
   return resolve(credentialsDir(), "policy.yml");
 }
 
-function object(
-  value: unknown,
-  keys: string[],
-  name: string,
-): Record<string, any> {
+function object(value: unknown, keys: string[], name: string): Record<string, any> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new PolicyError("policy.invalid", `${name} must be a mapping`);
   for (const key of Object.keys(value)) {
-    if (!keys.includes(key))
-      throw new PolicyError("policy.invalid", `Unknown key: ${name}.${key}`);
+    if (!keys.includes(key)) throw new PolicyError("policy.invalid", `Unknown key: ${name}.${key}`);
   }
   return value as Record<string, any>;
 }
@@ -99,17 +92,14 @@ function object(
 export function parsePolicy(text: string): Policy {
   try {
     const doc = parseDocument(text, { uniqueKeys: true, merge: false });
-    if (doc.errors.length || doc.warnings.length)
-      throw new Error(
-        [...doc.errors, ...doc.warnings].map((item) => item.message).join("; "),
-      );
+    if (doc.errors.length > 0 || doc.warnings.length > 0)
+      throw new Error([...doc.errors, ...doc.warnings].map((item) => item.message).join("; "));
     const root = object(
       doc.toJS({ maxAliasCount: 0 }) ?? {},
       ["runs", "tokens", "checks", "auto_review"],
       "policy",
     );
-    const group = (key: string, keys: string[]) =>
-      object(root[key] ?? {}, keys, key);
+    const group = (key: string, keys: string[]) => object(root[key] ?? {}, keys, key);
     const runs = group("runs", [
       "max_runs",
       "allow_full_preset",
@@ -136,8 +126,7 @@ export function parsePolicy(text: string): Policy {
       ["enabled", "max_attempts"],
       "runs.re_evaluation",
     );
-    const value = (group: Record<string, any>, key: string) =>
-      group[key] ?? null;
+    const value = (group: Record<string, any>, key: string) => group[key] ?? null;
     const result: Policy = {
       runs: {
         max_runs: runs.max_runs ?? {},
@@ -157,10 +146,7 @@ export function parsePolicy(text: string): Policy {
       },
       checks: {
         allowed: value(checks, "allowed"),
-        require_explicit_selection: value(
-          checks,
-          "require_explicit_selection",
-        ),
+        require_explicit_selection: value(checks, "require_explicit_selection"),
         max_checks_per_request: value(checks, "max_checks_per_request"),
         max_active: value(checks, "max_active"),
         allow_contests: value(checks, "allow_contests"),
@@ -169,23 +155,15 @@ export function parsePolicy(text: string): Policy {
         allow_force_refresh: value(review, "allow_force_refresh"),
       },
     };
-    const caps = object(
-      result.runs.max_runs,
-      ["nova", "vega", "orion", "castor"],
-      "runs.max_runs",
-    );
+    const caps = object(result.runs.max_runs, ["nova", "vega", "orion", "castor"], "runs.max_runs");
     for (const [model, cap] of Object.entries(caps)) {
       if (cap !== null && (!Number.isSafeInteger(cap) || cap < 0))
-        throw new Error(
-          `runs.max_runs.${model} must be null or a non-negative integer`,
-        );
+        throw new Error(`runs.max_runs.${model} must be null or a non-negative integer`);
     }
     if (
-      result.checks.allowed !== null &&
-      (!Array.isArray(result.checks.allowed) ||
-        result.checks.allowed.some(
-          (key) => !TRIGGERABLE_CHECK_KEYS.includes(key as any),
-        ))
+      result.checks.allowed !== null
+      && (!Array.isArray(result.checks.allowed)
+        || result.checks.allowed.some((key) => !TRIGGERABLE_CHECK_KEYS.includes(key as any)))
     ) {
       throw new Error(
         `checks.allowed must contain public dynamic check keys: ${TRIGGERABLE_CHECK_KEYS.join(", ")}`,
@@ -199,33 +177,26 @@ export function parsePolicy(text: string): Policy {
         throw new Error(`${key} must be null or a non-negative integer`);
     const attempts = result.runs.re_evaluation.max_attempts;
     if (attempts !== null && (!Number.isSafeInteger(attempts) || attempts < 0))
-      throw new Error(
-        "runs.re_evaluation.max_attempts must be null or a non-negative integer",
-      );
+      throw new Error("runs.re_evaluation.max_attempts must be null or a non-negative integer");
     const active = result.checks.max_active;
     if (active !== null && (!Number.isSafeInteger(active) || active < 0))
-      throw new Error(
-        "checks.max_active must be null or a non-negative integer",
-      );
+      throw new Error("checks.max_active must be null or a non-negative integer");
 
     const budget = result.tokens.challenge_budget;
     if (budget !== null && (typeof budget !== "number" || !Number.isFinite(budget) || budget < 0))
       throw new Error("tokens.challenge_budget must be null or a non-negative number");
     const reserve = result.tokens.min_remaining_balance;
     if (
-      reserve !== null &&
-      (typeof reserve !== "number" || !Number.isFinite(reserve) || reserve < 0)
+      reserve !== null
+      && (typeof reserve !== "number" || !Number.isFinite(reserve) || reserve < 0)
     )
-      throw new Error(
-        "tokens.min_remaining_balance must be null or a non-negative number",
-      );
+      throw new Error("tokens.min_remaining_balance must be null or a non-negative number");
     for (const [key, v] of Object.entries({
       "runs.allow_manual_batch_name": result.runs.allow_manual_batch_name,
       "runs.allow_cancellations": result.runs.allow_cancellations,
       "runs.allow_full_preset": result.runs.allow_full_preset,
       "tokens.allow_general_tokens": result.tokens.allow_general_tokens,
-      "checks.require_explicit_selection":
-        result.checks.require_explicit_selection,
+      "checks.require_explicit_selection": result.checks.require_explicit_selection,
       "auto_review.allow_force_refresh": result.auto_review.allow_force_refresh,
       "runs.re_evaluation.enabled": result.runs.re_evaluation.enabled,
       "checks.allow_contests": result.checks.allow_contests,
@@ -235,10 +206,7 @@ export function parsePolicy(text: string): Policy {
     return result;
   } catch (error) {
     if (error instanceof PolicyError) throw error;
-    throw new PolicyError(
-      "policy.invalid",
-      error instanceof Error ? error.message : String(error),
-    );
+    throw new PolicyError("policy.invalid", error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -281,10 +249,7 @@ export function policySchema(): Record<string, unknown> {
 
     if (path === "tokens.min_remaining_balance" || path === "tokens.challenge_budget")
       return { type: ["number", "null"], minimum: 0, default: null };
-    if (
-      path === "checks.max_active" ||
-      path === "runs.re_evaluation.max_attempts"
-    )
+    if (path === "checks.max_active" || path === "runs.re_evaluation.max_attempts")
       return { ...integer, default: value };
     if (typeof value === "boolean") return { type: ["boolean", "null"], default: value };
     if (typeof value === "number")
@@ -313,6 +278,7 @@ export function policySchema(): Record<string, unknown> {
 export function loadPolicy(): Policy {
   let text: string;
   try {
+    assertFileWithinLimit(policyPath(), MAX_LOCAL_STATE_BYTES, "Policy file");
     text = readFileSync(policyPath(), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -334,9 +300,7 @@ export function assertTokenPolicy(
     );
 }
 
-export function solverName(
-  value: unknown,
-): "nova" | "vega" | "orion" | "castor" | undefined {
+function solverName(value: unknown): "nova" | "vega" | "orion" | "castor" | undefined {
   if (typeof value !== "string") return undefined;
   const type = parseAgentTypeInput(value) ?? value;
   const names = {
@@ -345,7 +309,7 @@ export function solverName(
     codex_cli: "orion",
     taiga: "castor",
   } as const;
-  return Object.hasOwn(names, type) ? names[type] : undefined;
+  return Object.hasOwn(names, type) ? names[type as keyof typeof names] : undefined;
 }
 
 export function runLimit(model: string, policy = loadPolicy()): number | null {
@@ -354,18 +318,13 @@ export function runLimit(model: string, policy = loadPolicy()): number | null {
   return policy.runs.max_runs[name] ?? null;
 }
 
-export function assertRunCount(
-  model: string,
-  count: number,
-  policy = loadPolicy(),
-): void {
+export function assertRunCount(model: string, count: number, policy = loadPolicy()): void {
   const limit = runLimit(model, policy);
   if (limit !== null && count > limit)
-    throw new PolicyError(
-      "runs.max_runs",
-      "Requested runs exceed the limit for current inputs",
-      { limit, requested: count },
-    );
+    throw new PolicyError("runs.max_runs", "Requested runs exceed the limit for current inputs", {
+      limit,
+      requested: count,
+    });
 }
 
 type RunConfig = { taskAgentType: string; evalAgentType: string };
@@ -379,8 +338,7 @@ export function assertRunRequest(
       "runs.allow_manual_batch_name",
       "Manual batch names are disabled by policy",
     );
-  if (!configs.length)
-    throw new PolicyError("runs.max_runs", "At least one run is required");
+  if (configs.length === 0) throw new PolicyError("runs.max_runs", "At least one run is required");
   assertRunCapacity([], configs, policy);
 }
 
@@ -393,34 +351,26 @@ export function assertRunCapacity(
   const requests = new Map<string, number>();
   for (const config of requested) {
     const model = solverName(config.taskAgentType);
-    if (!model)
-      throw new PolicyError("runs.max_runs", "Unknown requested model");
-    if (runLimit(model, policy) !== null)
-      requests.set(model, (requests.get(model) ?? 0) + 1);
+    if (!model) throw new PolicyError("runs.max_runs", "Unknown requested model");
+    if (runLimit(model, policy) !== null) requests.set(model, (requests.get(model) ?? 0) + 1);
   }
-  if (!requests.size) return;
-  const unavailable = (message: string): never => {
+  if (requests.size === 0) return;
+  const unavailable: (message: string) => never = (message: string) => {
     throw new PolicyError("runs.state_unavailable", message);
   };
   if (!Array.isArray(records)) unavailable("Cannot read current runs");
   const seen = new Map<string, string>();
   const counts = new Map<string, number>();
   for (const run of records as any[]) {
-    if (!run || typeof run.stale !== "boolean")
-      unavailable("Run freshness is missing or invalid");
+    if (!run || typeof run.stale !== "boolean") unavailable("Run freshness is missing or invalid");
     if (run.stale !== false) continue;
-    if (typeof run.id !== "string" || !run.id)
-      unavailable("Current run ID is missing");
-    const tagged =
-      typeof run.batchTag === "string" && run.batchTag.startsWith("reeval-");
-    const labeled =
-      typeof run.label === "string" && / · re-eval [1-9]\d*$/.test(run.label);
+    if (typeof run.id !== "string" || !run.id) unavailable("Current run ID is missing");
+    const tagged = typeof run.batchTag === "string" && run.batchTag.startsWith("reeval-");
+    const labeled = typeof run.label === "string" && / · re-eval [1-9]\d*$/.test(run.label);
     if (tagged !== labeled) unavailable("Conflicting re-evaluation markers");
     const label =
       typeof run.label === "string"
-        ? /^(Nova|Vega|Orion|Castor) #[1-9]\d*(?: · re-eval [1-9]\d*)?$/.exec(
-            run.label,
-          )?.[1]
+        ? /^(Nova|Vega|Orion|Castor) #[1-9]\d*(?: · re-eval [1-9]\d*)?$/.exec(run.label)?.[1]
         : undefined;
     const codename = solverName(run.taskAgentCodename),
       labelModel = solverName(label);
@@ -432,8 +382,7 @@ export function assertRunCapacity(
     if (!model) unavailable("Cannot identify current run model");
     const identity = `${model}:${tagged}`;
     if (seen.has(run.id)) {
-      if (seen.get(run.id) !== identity)
-        unavailable("Conflicting duplicate current run");
+      if (seen.get(run.id) !== identity) unavailable("Conflicting duplicate current run");
       continue;
     }
     seen.set(run.id, identity);
@@ -451,7 +400,7 @@ export function assertRunCapacity(
   }
 }
 
-export const contestEndpoints = new Set([
+const contestEndpoints = new Set([
   "fairnessContest:contestVerifyFairness",
   "solutionQualityContest:contestSolutionQuality",
   "systemComments:contestDescriptionQuality",
@@ -470,15 +419,12 @@ const paidEndpoints = new Set([
   "scopeGate:triggerScopeGate",
   ...contestEndpoints,
 ]);
-export function isPolicyEndpoint(
-  name: string,
-  args: Record<string, unknown>,
-): boolean {
+export function isPolicyEndpoint(name: string, args: Record<string, unknown>): boolean {
   return (
-    name === "runAgentRuns:cancelRun" ||
-    name === "runAgentRuns:scratchRun" ||
-    paidEndpoints.has(name) ||
-    Object.hasOwn(args, "useGeneralTokens")
+    name === "runAgentRuns:cancelRun"
+    || name === "runAgentRuns:scratchRun"
+    || paidEndpoints.has(name)
+    || Object.hasOwn(args, "useGeneralTokens")
   );
 }
 
@@ -490,31 +436,18 @@ export function assertRunPreset(preset: unknown, policy = loadPolicy()): void {
     );
 }
 
-export function checkKeysForEndpoint(
-  name: string,
-  args: Record<string, unknown>,
-): string[] {
+function checkKeysForEndpoint(name: string, args: Record<string, unknown>): string[] {
   if (name === "runDynamicChecks:triggerDynamicCheck") {
     if (typeof args.checkKey !== "string")
-      throw new PolicyError(
-        "checks.selection_invalid",
-        "A check key is required",
-      );
+      throw new PolicyError("checks.selection_invalid", "A check key is required");
     return [toPublicCheckKey(args.checkKey)];
   }
   if (name === "runDynamicChecks:triggerAllDynamicChecks") {
-    if (
-      !Array.isArray(args.checkKeys) ||
-      args.checkKeys.some((key) => typeof key !== "string")
-    )
-      throw new PolicyError(
-        "checks.selection_invalid",
-        "An explicit check list is required",
-      );
+    if (!Array.isArray(args.checkKeys) || args.checkKeys.some((key) => typeof key !== "string"))
+      throw new PolicyError("checks.selection_invalid", "An explicit check list is required");
     return [...new Set(args.checkKeys.map(toPublicCheckKey))];
   }
-  if (name === "orchestratorReview:triggerOrchestratorReview")
-    return ["autoReview"];
+  if (name === "orchestratorReview:triggerOrchestratorReview") return ["autoReview"];
   return [];
 }
 
@@ -528,25 +461,23 @@ export function assertCheckSelection(
       "checks.require_explicit_selection",
       "Select checks explicitly with --checks",
     );
-  if (!keys.length)
-    throw new PolicyError(
-      "checks.selection_invalid",
-      "Select at least one check",
-    );
+  if (keys.length === 0)
+    throw new PolicyError("checks.selection_invalid", "Select at least one check");
   const unique = [...new Set(keys.map(toPublicCheckKey))];
   const allowed = policy.checks.allowed;
   if (allowed !== null && unique.some((key) => !allowed.includes(key)))
-    throw new PolicyError(
-      "checks.allowed",
-      "The request contains a disallowed check",
-      { allowed: policy.checks.allowed, requested: unique },
-    );
-  if (policy.checks.max_checks_per_request !== null && unique.length > policy.checks.max_checks_per_request)
-    throw new PolicyError(
-      "checks.max_checks_per_request",
-      "Too many checks in one request",
-      { requested: unique.length, limit: policy.checks.max_checks_per_request },
-    );
+    throw new PolicyError("checks.allowed", "The request contains a disallowed check", {
+      allowed: policy.checks.allowed,
+      requested: unique,
+    });
+  if (
+    policy.checks.max_checks_per_request !== null
+    && unique.length > policy.checks.max_checks_per_request
+  )
+    throw new PolicyError("checks.max_checks_per_request", "Too many checks in one request", {
+      requested: unique.length,
+      limit: policy.checks.max_checks_per_request,
+    });
 }
 
 export function assertPaidEndpoint(
@@ -563,33 +494,21 @@ export function assertPaidEndpoint(
       "Run cancellations are disabled by guardrails",
     );
   if (
-    name === "runAgentRuns:scratchRun" &&
-    args.scratched !== false &&
-    effective.runs.allow_contests === false
+    name === "runAgentRuns:scratchRun"
+    && args.scratched !== false
+    && effective.runs.allow_contests === false
   )
-    throw new PolicyError(
-      "runs.allow_contests",
-      "Run contests are disabled by policy",
-    );
+    throw new PolicyError("runs.allow_contests", "Run contests are disabled by policy");
   if (contestEndpoints.has(name) && effective.checks.allow_contests === false)
-    throw new PolicyError(
-      "checks.allow_contests",
-      "Check contests are disabled by policy",
-    );
-  if (
-    name === "reEvalRuns:triggerReEvalRuns" &&
-    effective.runs.re_evaluation.enabled === false
-  )
-    throw new PolicyError(
-      "runs.re_evaluation.enabled",
-      "Re-evaluation is disabled by policy",
-    );
+    throw new PolicyError("checks.allow_contests", "Check contests are disabled by policy");
+  if (name === "reEvalRuns:triggerReEvalRuns" && effective.runs.re_evaluation.enabled === false)
+    throw new PolicyError("runs.re_evaluation.enabled", "Re-evaluation is disabled by policy");
   const keys = checkKeysForEndpoint(name, args);
-  if (keys.length) assertCheckSelection(keys, true, effective);
+  if (keys.length > 0) assertCheckSelection(keys, true, effective);
   if (
-    name === "orchestratorReview:triggerOrchestratorReview" &&
-    args.forceFresh &&
-    effective.auto_review.allow_force_refresh === false
+    name === "orchestratorReview:triggerOrchestratorReview"
+    && args.forceFresh
+    && effective.auto_review.allow_force_refresh === false
   )
     throw new PolicyError(
       "auto_review.allow_force_refresh",
@@ -605,8 +524,7 @@ const record = (value: any): value is Record<string, any> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const amount = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0;
-const id = (value: unknown): value is string =>
-  typeof value === "string" && value.length > 0;
+const id = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 
 // These are the exact quick-run keys supported in runs.ts, not a tariff fallback.
 const quickSolvers: Record<string, string> = {
@@ -626,24 +544,49 @@ async function quoteCost(
   args: Record<string, any>,
 ): Promise<{ cost: number; parts: BudgetPart[] } | undefined> {
   // Admin resume/force and contests have no proven author tariff.
-  if (name === "orchestratorReview:triggerOrchestratorReview" || contestEndpoints.has(name)) return undefined;
+  if (name === "orchestratorReview:triggerOrchestratorReview" || contestEndpoints.has(name))
+    return undefined;
   if (name === "reEvalRuns:triggerReEvalRuns" || name === "fpReview:requestFpCheck") {
     const kind = name === "fpReview:requestFpCheck" ? "fp" : "reevaluation";
-    const cost = (await resolveVersionOffer(client, kind, typeof args.versionId === "string" ? args.versionId : undefined)).tokens;
-    return cost === null ? undefined : { cost, parts: [{ operation: kind === "fp" ? "reviews:fpCheck" : "runs:reEvaluation", amount: cost }] };
+    const cost = (
+      await resolveVersionOffer(
+        client,
+        kind,
+        typeof args.versionId === "string" ? args.versionId : undefined,
+      )
+    ).tokens;
+    return cost === null
+      ? undefined
+      : {
+          cost,
+          parts: [
+            { operation: kind === "fp" ? "reviews:fpCheck" : "runs:reEvaluation", amount: cost },
+          ],
+        };
   }
   const isRun = name === "runAgentRuns:triggerRuns" || name === "runAgentRuns:triggerAgentRun";
   let prices: unknown[];
-  let identities: { operation: string; checkKey?: string }[];
+  let identities: Array<{ operation: string; checkKey?: string }>;
   if (isRun) {
     const runs = await resolveRunPrices(client);
-    const solvers = name === "runAgentRuns:triggerAgentRun"
-      ? [Object.hasOwn(quickSolvers, args.agentRunKey) ? quickSolvers[args.agentRunKey] : undefined]
-      : Array.isArray(args.configs) && args.configs.length
-        ? args.configs.map((item: any) => typeof item?.taskAgentType === "string" ? (parseAgentTypeInput(item.taskAgentType) ?? item.taskAgentType) : undefined)
-        : [undefined];
-    prices = solvers.map(solver => solver && Object.hasOwn(runs, solver) ? runs[solver].tokens : undefined);
-    identities = solvers.map(solver => ({ operation: `runs:${solver}` }));
+    const solvers =
+      name === "runAgentRuns:triggerAgentRun"
+        ? [
+            Object.hasOwn(quickSolvers, args.agentRunKey)
+              ? quickSolvers[args.agentRunKey]
+              : undefined,
+          ]
+        : Array.isArray(args.configs) && args.configs.length > 0
+          ? args.configs.map((item: any) =>
+              typeof item?.taskAgentType === "string"
+                ? (parseAgentTypeInput(item.taskAgentType) ?? item.taskAgentType)
+                : undefined,
+            )
+          : [undefined];
+    prices = solvers.map((solver) =>
+      solver && Object.hasOwn(runs, solver) ? runs[solver].tokens : undefined,
+    );
+    identities = solvers.map((solver) => ({ operation: `runs:${solver}` }));
   } else {
     const catalog = await resolveCostCatalog(client);
     const special = {
@@ -653,21 +596,37 @@ async function quoteCost(
     };
     if (Object.hasOwn(special, name)) {
       const cost = special[name as keyof typeof special].tokens;
-      const operation = name === "scopeGate:triggerScopeGate" ? "scope:scopeGate"
-        : name === "dockerImage:buildVersionImage" ? "builds:build" : "checks:bundledPrechecks";
+      const operation =
+        name === "scopeGate:triggerScopeGate"
+          ? "scope:scopeGate"
+          : name === "dockerImage:buildVersionImage"
+            ? "builds:build"
+            : "checks:bundledPrechecks";
       return cost === null ? undefined : { cost, parts: [{ operation, amount: cost }] };
     }
     const keys = checkKeysForEndpoint(name, args);
-    if (!keys.length) return undefined;
-    prices = keys.map(key => {
+    if (keys.length === 0) return undefined;
+    prices = keys.map((key) => {
       const backendKey = toBackendCheckKey(key);
-      return Object.hasOwn(catalog.checks, backendKey) ? catalog.checks[backendKey].tokens : undefined;
+      return Object.hasOwn(catalog.checks, backendKey)
+        ? catalog.checks[backendKey].tokens
+        : undefined;
     });
-    identities = keys.map(key => ({ operation: `checks:${toPublicCheckKey(key)}`, checkKey: toPublicCheckKey(key) }));
+    identities = keys.map((key) => ({
+      operation: `checks:${toPublicCheckKey(key)}`,
+      checkKey: toPublicCheckKey(key),
+    }));
   }
   if (!prices.every(amount)) return undefined;
   const total = sumBudgetAmounts(prices as number[]);
-  return amount(total) ? { cost: total, parts: identities.map((identity, index) => ({ ...identity, amount: prices[index] as number })) } : undefined;
+  return amount(total)
+    ? {
+        cost: total,
+        parts: identities.map((identity, index) =>
+          Object.assign(identity, { amount: prices[index] as number }),
+        ),
+      }
+    : undefined;
 }
 
 // Align decimal API token values before sums/division (avoid binary 0.1 + 0.2).
@@ -678,7 +637,10 @@ function tokenUnits(values: number[]): { units: bigint[]; exponent: number } {
     return { digits: BigInt(whole + fraction), exponent: Number(power) - fraction.length };
   });
   const exponent = Math.min(...parts.map((part) => part.exponent));
-  return { exponent, units: parts.map((part) => part.digits * 10n ** BigInt(part.exponent - exponent)) };
+  return {
+    exponent,
+    units: parts.map((part) => part.digits * 10n ** BigInt(part.exponent - exponent)),
+  };
 }
 function decimalTokenSum(values: number[]): number {
   if (!values.every(Number.isFinite)) return NaN;
@@ -686,7 +648,7 @@ function decimalTokenSum(values: number[]): number {
   return Number(`${units.reduce((sum, value) => sum + value, 0n)}e${exponent}`);
 }
 
-interface DripEstimate {
+type DripEstimate = {
   waitSeconds: number | null;
   retryAt: string | null;
   drip: {
@@ -700,46 +662,78 @@ interface DripEstimate {
     estimated: boolean;
     dripsNeeded?: number;
   };
-}
+};
 
-export function estimateTokenDrip(
+function estimateTokenDrip(
   snapshot: Record<string, any>,
   requiredBalance: number,
   now = Date.now(),
   tier?: Record<string, any>,
 ): DripEstimate {
-  const rate = amount(snapshot.tierDripAmount) ? snapshot.tierDripAmount
-    : tier?.name === snapshot.tierName && amount(tier?.dripAmount) ? tier.dripAmount : null;
+  const rate = amount(snapshot.tierDripAmount)
+    ? snapshot.tierDripAmount
+    : tier?.name === snapshot.tierName && amount(tier?.dripAmount)
+      ? tier.dripAmount
+      : null;
   const cap = amount(snapshot.cap) ? snapshot.cap : null;
-  const next = typeof snapshot.nextDripAt === "number" && Number.isSafeInteger(snapshot.nextDripAt)
-    && snapshot.nextDripAt > 0 && snapshot.nextDripAt <= 8.64e15 ? snapshot.nextDripAt : null;
+  const next =
+    typeof snapshot.nextDripAt === "number"
+    && Number.isSafeInteger(snapshot.nextDripAt)
+    && snapshot.nextDripAt > 0
+    && snapshot.nextDripAt <= 8.64e15
+      ? snapshot.nextDripAt
+      : null;
   const result: DripEstimate = {
-    waitSeconds: null, retryAt: null,
-    drip: { status: "unknown", reason: "The token drip schedule is unavailable", amount: rate,
-      intervalSeconds: 3600, nextDripAt: next, cap,
-      source: amount(snapshot.tierDripAmount) ? "contributorTokens:getBalance; official UI hourly drip contract"
+    waitSeconds: null,
+    retryAt: null,
+    drip: {
+      status: "unknown",
+      reason: "The token drip schedule is unavailable",
+      amount: rate,
+      intervalSeconds: 3600,
+      nextDripAt: next,
+      cap,
+      source: amount(snapshot.tierDripAmount)
+        ? "contributorTokens:getBalance; official UI hourly drip contract"
         : "contributorTokens:getBalance + contributorTokens:getTierConfig; official UI hourly drip contract",
-      estimated: false },
+      estimated: false,
+    },
   };
   const stop = (status: DripEstimate["drip"]["status"], reason: string) => {
-    result.drip.status = status; result.drip.reason = reason; return result;
+    result.drip.status = status;
+    result.drip.reason = reason;
+    return result;
   };
   if (snapshot.dripUnlimited !== false)
     return stop("unknown", "The account's special or unknown drip mode cannot be estimated safely");
   if (cap !== null && requiredBalance > cap)
-    return stop("unreachable", "Required balance exceeds the current token cap; waiting for drip alone cannot satisfy it");
+    return stop(
+      "unreachable",
+      "Required balance exceeds the current token cap; waiting for drip alone cannot satisfy it",
+    );
   if (snapshot.dripPaused === true)
     return stop("paused", "Token drip is paused; replenishment time is unknown");
   if (rate === 0)
-    return stop("unreachable", "The current tier has no token drip; waiting alone cannot satisfy the threshold");
+    return stop(
+      "unreachable",
+      "The current tier has no token drip; waiting alone cannot satisfy the threshold",
+    );
   if (snapshot.needsRefresh === true)
-    return stop("unknown", "The server reports that the balance needs refresh; replenishment time is unknown until a fresh balance is available");
+    return stop(
+      "unknown",
+      "The server reports that the balance needs refresh; replenishment time is unknown until a fresh balance is available",
+    );
   if (rate === null || cap === null || snapshot.dripPaused !== false || next === null)
     return result;
   if (next < now)
-    return stop("unknown", "The reported next drip is in the past; refresh the balance before estimating");
+    return stop(
+      "unknown",
+      "The reported next drip is in the past; refresh the balance before estimating",
+    );
   if (!amount(snapshot.balance) || !amount(requiredBalance) || !Number.isFinite(now)) return result;
-  const { units: [required, balance, perDrip] } = tokenUnits([requiredBalance, snapshot.balance, rate]);
+  const {
+    units: [required, balance, perDrip],
+  } = tokenUnits([requiredBalance, snapshot.balance, rate]);
   const missing = required > balance ? required - balance : 0n;
   const count = Number((missing + perDrip - 1n) / perDrip);
   const retry = count === 0 ? now : next + (count - 1) * 3600_000;
@@ -747,8 +741,14 @@ export function estimateTokenDrip(
     return stop("unknown", "The estimated replenishment time is outside the supported range");
   result.waitSeconds = Math.ceil(Math.max(0, retry - now) / 1000);
   result.retryAt = new Date(retry).toISOString();
-  result.drip = { ...result.drip, status: "estimated", estimated: true, dripsNeeded: count,
-    reason: "Estimate only: assumes unchanged hourly drip, tier and cap, no other spending, and timely server replenishment; recheck before retrying" };
+  result.drip = {
+    ...result.drip,
+    status: "estimated",
+    estimated: true,
+    dripsNeeded: count,
+    reason:
+      "Estimate only: assumes unchanged hourly drip, tier and cap, no other spending, and timely server replenishment; recheck before retrying",
+  };
   return result;
 }
 
@@ -761,9 +761,9 @@ export async function assertOperationCost(
 ): Promise<void> {
   // Scratching/restoring a run changes metadata, not token spending.
   if (
-    name === "runAgentRuns:cancelRun" ||
-    name === "runAgentRuns:scratchRun" ||
-    !isPolicyEndpoint(name, args)
+    name === "runAgentRuns:cancelRun"
+    || name === "runAgentRuns:scratchRun"
+    || !isPolicyEndpoint(name, args)
   )
     return;
   const effective = policy ?? loadPolicy();
@@ -805,8 +805,10 @@ export async function assertOperationCost(
     } catch {}
   }
   const estimate = estimateTokenDrip(snapshot!, requiredBalance, Date.now(), tier);
-  const wait = estimate.waitSeconds === null ? estimate.drip.reason
-    : `Estimated wait: ${estimate.waitSeconds} seconds (retry at ${estimate.retryAt}); not guaranteed, recheck the balance before retrying`;
+  const wait =
+    estimate.waitSeconds === null
+      ? estimate.drip.reason
+      : `Estimated wait: ${estimate.waitSeconds} seconds (retry at ${estimate.retryAt}); not guaranteed, recheck the balance before retrying`;
   throw new PolicyError(
     "tokens.min_remaining_balance",
     `Operation would breach the minimum remaining balance. ${wait}`,
@@ -814,28 +816,50 @@ export async function assertOperationCost(
   );
 }
 
-export interface BudgetDispatchScope {
+export type BudgetDispatchScope = {
   directory: string;
   backend: string;
   account: string;
   resolveChallenge: (args: Record<string, any>) => Promise<string>;
-}
+};
 
 export function assertChallengeBudget(state: BudgetFeedback): void {
-  const total = state.spent !== null && state.reserved !== null && state.cost !== null
-    ? sumBudgetAmounts([state.spent, state.reserved, state.cost]) : NaN;
+  const total =
+    state.spent !== null && state.reserved !== null && state.cost !== null
+      ? sumBudgetAmounts([state.spent, state.reserved, state.cost])
+      : NaN;
   if (!Number.isFinite(total) || total > state.limit)
-    throw new PolicyError("tokens.challenge_budget", "Operation exceeds the remaining local challenge budget", { budget: { ...state, status: "blocked" } });
+    throw new PolicyError(
+      "tokens.challenge_budget",
+      "Operation exceeds the remaining local challenge budget",
+      { budget: { ...state, status: "blocked" } },
+    );
 }
 
-export async function dispatchWithBudget<T>(
-  client: Reader,
-  name: string,
-  args: Record<string, any>,
-  invoke: () => Promise<T>,
-  scope: BudgetDispatchScope,
-  policy?: Policy,
-): Promise<T> {
+/** One budgeted dispatch: which endpoint, with what arguments, and how to run it. */
+export type BudgetDispatch<T> = {
+  /** Client used for cost quoting. */
+  client: Reader;
+  /** Fully-qualified Convex function name. */
+  name: string;
+  /** Arguments the endpoint was called with. */
+  args: Record<string, any>;
+  /** Performs the actual call once the budget allows it. */
+  invoke: () => Promise<T>;
+  /** Where the local budget ledger lives and how to resolve the challenge. */
+  scope: BudgetDispatchScope;
+  /** Pre-loaded policy; loaded on demand when omitted. */
+  policy?: Policy;
+};
+
+export async function dispatchWithBudget<T>({
+  client,
+  name,
+  args,
+  invoke,
+  scope,
+  policy,
+}: BudgetDispatch<T>): Promise<T> {
   if (!isPolicyEndpoint(name, args)) return invoke();
   const effective = policy ?? loadPolicy();
   const limit = effective.tokens.challenge_budget;
@@ -847,16 +871,41 @@ export async function dispatchWithBudget<T>(
   let context: BudgetContext | undefined;
   let reservation: string | undefined;
   let invoked = false;
-  let state: BudgetFeedback = { scope: "local", scopeId: null, accounting: "prospective-quotes", cost: null, spent: null, reserved: null, limit, remaining: null, activatedAt: null, endpoint: name, status: "blocked" };
+  let state: BudgetFeedback = {
+    scope: "local",
+    scopeId: null,
+    accounting: "prospective-quotes",
+    cost: null,
+    spent: null,
+    reserved: null,
+    limit,
+    remaining: null,
+    activatedAt: null,
+    endpoint: name,
+    status: "blocked",
+  };
   try {
     const challenge = await scope.resolveChallenge(args);
     state.challengeId = challenge;
-    context = { directory: scope.directory, scope: budgetScope(scope.backend, scope.account, challenge), limit };
-    state = { ...state, ...await readBudget(context) };
+    context = {
+      directory: scope.directory,
+      scope: budgetScope(scope.backend, scope.account, challenge),
+      limit,
+    };
+    state = { ...state, ...(await readBudget(context)) };
     assertPaidEndpoint(name, args, effective);
     let quote: Awaited<ReturnType<typeof quoteCost>>;
-    try { quote = await quoteCost(client, name, args); } catch { quote = undefined; }
-    if (quote === undefined) throw new PolicyError("tokens.cost_unavailable", "Cannot establish a prospective cost for this operation", { endpoint: name });
+    try {
+      quote = await quoteCost(client, name, args);
+    } catch {
+      quote = undefined;
+    }
+    if (quote === undefined)
+      throw new PolicyError(
+        "tokens.cost_unavailable",
+        "Cannot establish a prospective cost for this operation",
+        { endpoint: name },
+      );
     const { cost, parts } = quote;
     state.cost = cost;
     await assertOperationCost(client, name, args, effective, cost);
@@ -865,14 +914,17 @@ export async function dispatchWithBudget<T>(
     state = { ...state, ...held.feedback };
     invoked = true;
     const result = await invoke();
-    state = { ...state, ...await settleBudget(context, reservation, "spent") };
+    state = { ...state, ...(await settleBudget(context, reservation, "spent")) };
     reportBudget(state);
     return result;
   } catch (error) {
     if (reservation && context && !invoked) {
-      state = { ...state, ...await settleBudget(context, reservation, "released") };
-    } else if ((error instanceof BudgetError || error instanceof PolicyError) && error.details.budget) {
-      state = { ...state, ...error.details.budget as BudgetFeedback };
+      state = { ...state, ...(await settleBudget(context, reservation, "released")) };
+    } else if (
+      (error instanceof BudgetError || error instanceof PolicyError)
+      && error.details.budget
+    ) {
+      state = { ...state, ...(error.details.budget as BudgetFeedback) };
     }
     reportBudget(state);
     throw error;
@@ -898,8 +950,7 @@ function stateError(): never {
 function activeJob(value: any): string | undefined {
   if (!record(value) || typeof value.status !== "string") return stateError();
   const status = value.status.toLowerCase();
-  if (!activeStatuses.has(status) && !inactiveStatuses.has(status))
-    return stateError();
+  if (!activeStatuses.has(status) && !inactiveStatuses.has(status)) return stateError();
   if (!activeStatuses.has(status)) return undefined;
   if (!id(value.jobId)) return stateError();
   // Stale still-running jobs consume capacity; they are not evidence of a fresh result.
@@ -916,12 +967,11 @@ export async function assertCheckCapacity(
   const limit = policy.checks.max_active;
   if (limit === null) return;
   if (
-    !Array.isArray(requestedKeys) ||
-    !requestedKeys.length ||
-    requestedKeys.some(
+    !Array.isArray(requestedKeys)
+    || requestedKeys.length === 0
+    || requestedKeys.some(
       (key) =>
-        typeof key !== "string" ||
-        !TRIGGERABLE_CHECK_KEYS.includes(toPublicCheckKey(key) as any),
+        typeof key !== "string" || !TRIGGERABLE_CHECK_KEYS.includes(toPublicCheckKey(key) as any),
     )
   )
     throw new PolicyError(
@@ -934,16 +984,14 @@ export async function assertCheckCapacity(
       problemId,
     });
     if (
-      !Array.isArray(versions) ||
-      versions.some((version) => !record(version) || !id(version._id)) ||
-      !versions.some((version) => version._id === versionId)
+      !Array.isArray(versions)
+      || versions.some((version) => !record(version) || !id(version._id))
+      || !versions.some((version) => version._id === versionId)
     )
       return stateError();
     const jobs = new Set<string>();
-    let reviews: Set<string>[] = [];
-    for (const currentVersion of new Set<string>(
-      versions.map((version) => version._id),
-    )) {
+    let reviews: Array<Set<string>> = [];
+    for (const currentVersion of new Set<string>(versions.map((version) => version._id))) {
       const [dynamic, review] = await Promise.all([
         client.query(api.runDynamicChecks.getDynamicChecks, {
           versionId: currentVersion,
@@ -952,8 +1000,7 @@ export async function assertCheckCapacity(
           versionId: currentVersion,
         }),
       ]);
-      if (!record(dynamic) || !record(review) || !record(review.slots))
-        return stateError();
+      if (!record(dynamic) || !record(review) || !record(review.slots)) return stateError();
       const orchestration = new Set<string>();
       for (const [key, value] of Object.entries(dynamic)) {
         if (key.startsWith("_")) continue;
@@ -964,25 +1011,16 @@ export async function assertCheckCapacity(
         if (job) jobs.add(job);
       }
       for (const [key, slot] of Object.entries(review.slots)) {
-        if (
-          ![
-            "description",
-            "tests",
-            "solution",
-            "agents",
-            "gate",
-            "synthesis",
-          ].includes(key)
-        )
+        if (!["description", "tests", "solution", "agents", "gate", "synthesis"].includes(key))
           return stateError();
         if (slot === null) continue;
         const job = activeJob(slot);
         if (job) orchestration.add(job);
       }
-      if (orchestration.size) {
+      if (orchestration.size > 0) {
         // Merge overlapping current job snapshots, counting one logical review,
         // not each of its five slots (or a duplicate dynamic autoReview entry).
-        let merged = orchestration;
+        const merged = orchestration;
         let changed = true;
         while (changed) {
           changed = false;
@@ -1011,15 +1049,15 @@ export async function assertCheckCapacity(
 }
 
 // Remote re-evaluation history and limits
-interface HistoryRun {
+type HistoryRun = {
   id: string;
   jobId: string;
   label: string;
   taskAgentType: string;
   batchTag?: string;
   createdAt: number;
-}
-export interface CandidateSet {
+};
+export type CandidateSet = {
   fingerprint: string;
   candidateCount: number;
   originalBatches: string[];
@@ -1027,19 +1065,18 @@ export interface CandidateSet {
   attempts: number;
   newestOriginalCreatedAt: number | null;
   newestReevaluationCreatedAt: number | null;
-}
-export interface ReevaluationHistory {
+};
+export type ReevaluationHistory = {
   candidateSets: CandidateSet[];
-  unresolvedBatches: {
+  unresolvedBatches: Array<{
     batchTag: string;
     reason: string;
     newestCreatedAt: number;
-  }[];
-}
+  }>;
+};
 const unavailable = (message: string) =>
   new PolicyError("runs.re_evaluation.state_unavailable", message);
-const digest = (value: string) =>
-  createHash("sha256").update(value).digest("hex");
+const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 
 /** Patch-content identity, not a solver-input or evaluator-input fingerprint. */
 export async function groupReevaluationHistory(
@@ -1060,33 +1097,27 @@ export async function groupReevaluationHistory(
   const seen = new Map<string, string>();
   for (const r of records) {
     if (
-      !r ||
-      typeof r.id !== "string" ||
-      !r.id ||
-      typeof r.jobId !== "string" ||
-      !r.jobId ||
-      typeof r.label !== "string"
+      !r
+      || typeof r.id !== "string"
+      || !r.id
+      || typeof r.jobId !== "string"
+      || !r.jobId
+      || typeof r.label !== "string"
     )
       throw unavailable("Run history lacks IDs, jobs or labels");
     if (!Number.isFinite(r.createdAt) || r.createdAt < 0)
       throw unavailable(`Run history lacks a valid creation time for ${r.id}`);
-    const label =
-      /^(Nova|Vega|Orion|Castor) #[1-9]\d*(?: · re-eval ([1-9]\d*))?$/.exec(
-        r.label,
-      );
+    const label = /^(Nova|Vega|Orion|Castor) #[1-9]\d*(?: · re-eval ([1-9]\d*))?$/.exec(r.label);
     // Historical runner types can differ from the public solver codename.
     // The backend's public codename/label identifies the candidate's solver.
     const solver = label ? parseAgentTypeInput(label[1]) : undefined;
     if (
-      !label ||
-      !solver ||
-      (r.taskAgentCodename !== undefined && r.taskAgentCodename !== label[1])
+      !label
+      || !solver
+      || (r.taskAgentCodename !== undefined && r.taskAgentCodename !== label[1])
     )
       throw unavailable(`Unrecognized solver or label for run ${r.id}`);
-    if (
-      r.batchTag !== undefined &&
-      (typeof r.batchTag !== "string" || !r.batchTag)
-    )
+    if (r.batchTag !== undefined && (typeof r.batchTag !== "string" || !r.batchTag))
       throw unavailable(`Invalid batch tag for run ${r.id}`);
     const reevaluation = Boolean(label[2]);
     if (reevaluation !== Boolean(r.batchTag?.startsWith("reeval-")))
@@ -1097,23 +1128,18 @@ export async function groupReevaluationHistory(
     const tag = r.batchTag ?? `original:${r.id}`;
     const identity = JSON.stringify([r.jobId, r.label, solver, tag, r.createdAt]);
     if (seen.has(r.id)) {
-      if (seen.get(r.id) !== identity)
-        throw unavailable(`Conflicting snapshots for run ${r.id}`);
+      if (seen.get(r.id) !== identity) throw unavailable(`Conflicting snapshots for run ${r.id}`);
       continue;
     }
     seen.set(r.id, identity);
     const group = batches.get(tag) ?? {
       reevaluation,
       round,
-      runs: [],
+      runs: [] as HistoryRun[],
       labels: new Set<string>(),
       newestCreatedAt: r.createdAt,
     };
-    if (
-      group.reevaluation !== reevaluation ||
-      group.round !== round ||
-      group.labels.has(r.label)
-    )
+    if (group.reevaluation !== reevaluation || group.round !== round || group.labels.has(r.label))
       throw unavailable(`Inconsistent batch ${tag}`);
     group.labels.add(r.label);
     group.runs.push({
@@ -1147,7 +1173,7 @@ export async function groupReevaluationHistory(
       });
       continue;
     }
-    const fingerprint = digest(JSON.stringify(members.sort()));
+    const fingerprint = digest(JSON.stringify(members.toSorted()));
     const set = sets.get(fingerprint) ?? {
       fingerprint,
       candidateCount: members.length,
@@ -1157,9 +1183,7 @@ export async function groupReevaluationHistory(
       newestOriginalCreatedAt: null,
       newestReevaluationCreatedAt: null,
     };
-    (batch.reevaluation ? set.reevaluationBatches : set.originalBatches).push(
-      tag,
-    );
+    (batch.reevaluation ? set.reevaluationBatches : set.originalBatches).push(tag);
     if (batch.reevaluation) {
       set.attempts += 1;
       set.newestReevaluationCreatedAt = Math.max(
@@ -1175,7 +1199,7 @@ export async function groupReevaluationHistory(
     sets.set(fingerprint, set);
   }
   for (const set of sets.values()) {
-    if (!set.originalBatches.length)
+    if (set.originalBatches.length === 0)
       for (const batchTag of set.reevaluationBatches)
         unresolvedBatches.push({
           batchTag,
@@ -1186,26 +1210,22 @@ export async function groupReevaluationHistory(
     set.reevaluationBatches.sort();
   }
   return {
-    candidateSets: [...sets.values()].sort((a, b) =>
+    candidateSets: [...sets.values()].toSorted((a, b) =>
       a.fingerprint.localeCompare(b.fingerprint),
     ),
     unresolvedBatches,
   };
 }
 
-async function readHistory(
-  client: any,
-  problemId: string,
-  versionId: string,
-): Promise<any[]> {
+async function readHistory(client: any, problemId: string, versionId: string): Promise<any[]> {
   try {
     const versions = await client.query(api.problems.listVersions, {
       problemId,
     });
     if (
-      !Array.isArray(versions) ||
-      versions.some((v) => !v || typeof v._id !== "string") ||
-      !versions.some((v) => v._id === versionId)
+      !Array.isArray(versions)
+      || versions.some((v) => !v || typeof v._id !== "string")
+      || !versions.some((v) => v._id === versionId)
     )
       throw unavailable("Cannot enumerate challenge versions");
     const records: any[] = [];
@@ -1213,8 +1233,7 @@ async function readHistory(
       const rows = await client.query(api.runAgentRuns.getAgentRuns, {
         versionId: id,
       });
-      if (!Array.isArray(rows))
-        throw unavailable("Cannot enumerate version run history");
+      if (!Array.isArray(rows)) throw unavailable("Cannot enumerate version run history");
       records.push(...rows);
     }
     return records;
@@ -1248,8 +1267,7 @@ async function remotePatchHash(client: any, run: HistoryRun): Promise<string> {
     } finally {
       await reader.cancel();
     }
-    if (!bytes)
-      throw new Error("Empty artifact cannot establish source identity");
+    if (!bytes) throw new Error("Empty artifact cannot establish source identity");
     return hash.digest("hex");
   } catch {
     // Do not leak signed artifact URLs through network errors.
@@ -1262,9 +1280,8 @@ export async function inspectReevaluationHistory(
   problemId: string,
   versionId: string,
 ): Promise<ReevaluationHistory> {
-  return groupReevaluationHistory(
-    await readHistory(client, problemId, versionId),
-    (run) => remotePatchHash(client, run),
+  return groupReevaluationHistory(await readHistory(client, problemId, versionId), (run) =>
+    remotePatchHash(client, run),
   );
 }
 
@@ -1276,12 +1293,10 @@ export function assertReevaluationAttempts(
   if (!Number.isSafeInteger(runCount) || (runCount as number) < 1)
     throw unavailable("Re-evaluation offer lacks a valid candidate count");
   const possible = sets.filter((set) => set.candidateCount === runCount);
-  if (!possible.length)
-    throw unavailable(
-      "No complete original set matches the offered candidate count",
-    );
+  if (possible.length === 0)
+    throw unavailable("No complete original set matches the offered candidate count");
   const exhausted = possible.filter((set) => set.attempts >= limit);
-  if (!exhausted.length) return; // Every possible source fits; choosing one is unnecessary.
+  if (exhausted.length === 0) return; // Every possible source fits; choosing one is unnecessary.
   if (possible.length > 1)
     throw new PolicyError(
       "runs.re_evaluation.source_ambiguous",
@@ -1309,21 +1324,15 @@ export function assertLatestReevaluationAttempts(
   }
   const possible = history.candidateSets.filter(
     (set) =>
-      set.candidateCount === runCount &&
-      set.originalBatches.length > 0 &&
-      set.newestOriginalCreatedAt !== null,
+      set.candidateCount === runCount
+      && set.originalBatches.length > 0
+      && set.newestOriginalCreatedAt !== null,
   );
-  if (!possible.length) {
-    throw unavailable(
-      "No complete original set matches the offered candidate count",
-    );
+  if (possible.length === 0) {
+    throw unavailable("No complete original set matches the offered candidate count");
   }
-  const latestCreatedAt = Math.max(
-    ...possible.map((set) => set.newestOriginalCreatedAt as number),
-  );
-  const latest = possible.filter(
-    (set) => set.newestOriginalCreatedAt === latestCreatedAt,
-  );
+  const latestCreatedAt = Math.max(...possible.map((set) => set.newestOriginalCreatedAt as number));
+  const latest = possible.filter((set) => set.newestOriginalCreatedAt === latestCreatedAt);
   if (latest.length !== 1) {
     throw new PolicyError(
       "runs.re_evaluation.source_ambiguous",
@@ -1368,7 +1377,7 @@ const historySignature = (records: any[]) =>
           r?.createdAt,
         ])
         .map((r) => JSON.stringify(r))
-        .sort(),
+        .toSorted(),
     ),
   );
 
@@ -1387,9 +1396,7 @@ export async function assertRemoteReevaluationAttempts(
       { limit },
     );
   const before = await readHistory(client, problemId, versionId);
-  const history = await groupReevaluationHistory(before, (run) =>
-    remotePatchHash(client, run),
-  );
+  const history = await groupReevaluationHistory(before, (run) => remotePatchHash(client, run));
   const [offer, after] = await Promise.all([
     client.query(api.reEvalRuns.getReEvalOffer, { versionId }),
     readHistory(client, problemId, versionId),

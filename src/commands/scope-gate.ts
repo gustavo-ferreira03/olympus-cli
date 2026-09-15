@@ -1,8 +1,12 @@
 import { defineCommand } from "citty";
-import { api } from "../convex.ts";
-import { parseWaitNumber } from "./checks.ts";
-import { statusBadge, truncate, printJson } from "../format.ts";
-import { commonArgs, resolveCommandContext } from "../command-utils.ts";
+import { api } from "../platform/convex.ts";
+import { resolveWaitWindow, waitWindow } from "../shared/wait.ts";
+
+import { statusBadge, truncate, printJson } from "../terminal/format.ts";
+import { commonArgs, resolveCommandContext } from "./command-utils.ts";
+
+/** Scope Gate shares the quality-check cadence. */
+const SCOPE_GATE_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 30 } as const;
 
 function isActive(status: unknown): boolean {
   return status === "pending" || status === "running";
@@ -13,7 +17,14 @@ function scopeStatus(state: any): string {
   return String(state?.latestVerdict ?? state?.status ?? "not_run").toLowerCase();
 }
 
-async function waitForScopeGate({ client, versionId, versionNumber, intervalMs, timeoutMs, json }: any) {
+async function waitForScopeGate({
+  client,
+  versionId,
+  versionNumber,
+  intervalMs,
+  timeoutMs,
+  json,
+}: any) {
   const startedAt = Date.now();
   while (true) {
     const state: any = await client.query(api.scopeGate.getScopeGate, { versionId });
@@ -26,9 +37,17 @@ async function waitForScopeGate({ client, versionId, versionNumber, intervalMs, 
     }
     const status = scopeStatus(state);
     if (!isActive(status) && !state?.inFlight) {
-      const result = { status: status === "fail" || status === "failed" ? "failed" : "completed", version: versionNumber, elapsedSeconds, state };
+      const result = {
+        status: status === "fail" || status === "failed" ? "failed" : "completed",
+        version: versionNumber,
+        elapsedSeconds,
+        state,
+      };
       if (json) printJson(result);
-      else console.log(`\n  Scope Gate ${result.status} on v${versionNumber}: ${statusBadge(status)}\n`);
+      else
+        console.log(
+          `\n  Scope Gate ${result.status} on v${versionNumber}: ${statusBadge(status)}\n`,
+        );
       if (result.status === "failed") process.exitCode = 1;
       return result;
     }
@@ -71,13 +90,15 @@ const wait = defineCommand({
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
   },
   run: async ({ args }) => {
+    // Validate the wait flags before dispatching, so a bad --interval
+    // fails locally instead of after a round trip.
+    const window = waitWindow(args, SCOPE_GATE_WAIT_DEFAULTS);
     const { client, versionId, versionNumber } = await resolveCommandContext(args);
     await waitForScopeGate({
       client,
       versionId,
       versionNumber,
-      intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-      timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+      ...window,
       json: Boolean(args.json),
     });
   },
@@ -96,8 +117,7 @@ const run = defineCommand({
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
   },
   run: async ({ args }) => {
-    const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
-    const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
+    const wait = resolveWaitWindow(args, SCOPE_GATE_WAIT_DEFAULTS);
     const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
     const [scopeState, readiness] = await Promise.all([
       client.query(api.scopeGate.getScopeGate, { versionId }),
@@ -114,18 +134,18 @@ const run = defineCommand({
       versionId,
       useGeneralTokens: Boolean(args["use-general-tokens"]),
     });
-    if (args.wait) {
+    if (wait) {
       await waitForScopeGate({
         client,
         versionId,
         versionNumber,
-        intervalMs,
-        timeoutMs,
+        ...wait,
         json: Boolean(args.json),
       });
       return;
     }
-    if (args.json) return printJson({ ...result, waitCommand: `olympus scope-gate wait ${args.id} --json` });
+    if (args.json)
+      return printJson({ ...result, waitCommand: `olympus scope-gate wait ${args.id} --json` });
     console.log(`\n  Scope Gate triggered on v${versionNumber}.`);
     console.log(`  Wait: olympus scope-gate wait ${args.id} --json\n`);
   },

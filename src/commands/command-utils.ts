@@ -1,11 +1,7 @@
 import { readFileSync } from "node:fs";
-import type { ArgsDef } from "citty";
-import {
-  getClient,
-  parseVersionNumber,
-  resolveProblemVersion,
-} from "./convex.ts";
-import { printJson } from "./format.ts";
+import { type ArgsDef } from "citty";
+import { getClient, parseVersionNumber, resolveProblemVersion } from "../platform/convex.ts";
+import { printJson } from "../terminal/format.ts";
 
 export type CommonArgs = {
   id: string;

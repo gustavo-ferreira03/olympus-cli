@@ -1,16 +1,15 @@
 import { defineCommand } from "citty";
-import { assertCheckCapacity, assertPaidEndpoint } from "../policy.ts";
-import { api } from "../convex.ts";
-import { parseWaitNumber } from "./checks.ts";
-import { printJson } from "../format.ts";
-import {
-  commonArgs,
-  printResult,
-  resolveCommandContext,
-} from "../command-utils.ts";
+import { assertCheckCapacity, assertPaidEndpoint } from "../core/policy.ts";
+import { api } from "../platform/convex.ts";
+import { resolveWaitWindow, waitWindow } from "../shared/wait.ts";
 
-type OrchestratorWaitStatus =
-  "not_started" | "running" | "failed" | "completed";
+import { printJson } from "../terminal/format.ts";
+import { commonArgs, printResult, resolveCommandContext } from "./command-utils.ts";
+
+/** Auto Review shares the quality-check cadence. */
+const AUTO_REVIEW_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 30 } as const;
+
+type OrchestratorWaitStatus = "not_started" | "running" | "failed" | "completed";
 
 const ACTIVE_STATUSES = new Set(["pending", "running", "queued", "processing"]);
 const FAILED_STATUSES = new Set(["failed", "error", "cancelled", "canceled"]);
@@ -19,7 +18,7 @@ function slotStatus(slot: any): string {
   return String(slot?.status ?? "").toLowerCase();
 }
 
-export function orchestratorReviewStatus(review: any): OrchestratorWaitStatus {
+function orchestratorReviewStatus(review: any): OrchestratorWaitStatus {
   const slots = review?.slots;
   if (!slots || typeof slots !== "object") return "not_started";
 
@@ -28,32 +27,18 @@ export function orchestratorReviewStatus(review: any): OrchestratorWaitStatus {
   if (FAILED_STATUSES.has(synthesisStatus)) return "failed";
   if (ACTIVE_STATUSES.has(synthesisStatus)) return "running";
 
-  const dimensions = [
-    slots.description,
-    slots.tests,
-    slots.solution,
-    slots.agents,
-  ].filter(Boolean);
+  const dimensions = [slots.description, slots.tests, slots.solution, slots.agents].filter(Boolean);
   if (dimensions.length === 0) return "not_started";
-  if (dimensions.some((slot) => FAILED_STATUSES.has(slotStatus(slot))))
-    return "failed";
+  if (dimensions.some((slot) => FAILED_STATUSES.has(slotStatus(slot)))) return "failed";
   return "running";
 }
 
 function reviewJobIds(review: any): string[] {
   const slots = review?.slots;
   if (!slots || typeof slots !== "object") return [];
-  return [
-    slots.description,
-    slots.tests,
-    slots.solution,
-    slots.agents,
-    slots.synthesis,
-  ]
+  return [slots.description, slots.tests, slots.solution, slots.agents, slots.synthesis]
     .map((slot) => slot?.jobId)
-    .filter(
-      (jobId): jobId is string => typeof jobId === "string" && jobId.length > 0,
-    );
+    .filter((jobId): jobId is string => typeof jobId === "string" && jobId.length > 0);
 }
 
 function summarizeOrchestratorReview(review: any) {
@@ -75,7 +60,7 @@ function summarizeOrchestratorReview(review: any) {
   );
 }
 
-export async function queryAutoReviewStateWithRetry(
+async function queryAutoReviewStateWithRetry(
   client: any,
   versionId: string,
   sleep: (milliseconds: number) => Promise<void> = (milliseconds) =>
@@ -84,14 +69,12 @@ export async function queryAutoReviewStateWithRetry(
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const review = await client.query(
-        api.orchestratorReview.getOrchestratorReview,
-        { versionId },
-      );
-      const triggerState = await client.query(
-        api.runDynamicChecks.getAutoReviewTriggerState,
-        { versionId },
-      );
+      const review = await client.query(api.orchestratorReview.getOrchestratorReview, {
+        versionId,
+      });
+      const triggerState = await client.query(api.runDynamicChecks.getAutoReviewTriggerState, {
+        versionId,
+      });
       return { review, triggerState };
     } catch (error) {
       lastError = error;
@@ -116,10 +99,7 @@ async function waitForAutoReview({
 }: any) {
   const startedAt = Date.now();
   while (true) {
-    const { review, triggerState } = await queryAutoReviewStateWithRetry(
-      client,
-      versionId,
-    );
+    const { review, triggerState } = await queryAutoReviewStateWithRetry(client, versionId);
     let status = orchestratorReviewStatus(review);
     const backendReportsRunning = (triggerState?.blockers ?? []).some(
       (blocker: any) => blocker?.id === "review_running",
@@ -128,9 +108,7 @@ async function waitForAutoReview({
 
     const currentJobIds = reviewJobIds(review);
     if (jobId && currentJobIds.length > 0 && !currentJobIds.includes(jobId)) {
-      throw new Error(
-        `Auto Review job ${jobId} is not current on v${versionNumber}`,
-      );
+      throw new Error(`Auto Review job ${jobId} is not current on v${versionNumber}`);
     }
 
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
@@ -139,9 +117,7 @@ async function waitForAutoReview({
         status,
         version: versionNumber,
         elapsedSeconds,
-        ...(full
-          ? { review, triggerState }
-          : { slots: summarizeOrchestratorReview(review) }),
+        ...(full ? { review, triggerState } : { slots: summarizeOrchestratorReview(review) }),
       };
       if (json) printJson(result);
       else printResult(result, false);
@@ -163,10 +139,7 @@ async function waitForAutoReview({
       process.exitCode = 2;
       return result;
     }
-    if (!json)
-      process.stderr.write(
-        `\r  waiting Auto Review elapsed=${elapsedSeconds}s`,
-      );
+    if (!json) process.stderr.write(`\r  waiting Auto Review elapsed=${elapsedSeconds}s`);
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
@@ -208,15 +181,16 @@ const wait = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const { client, versionId, versionNumber } =
-      await resolveCommandContext(args);
+    // Validate the wait flags before dispatching, so a bad --interval
+    // fails locally instead of after a round trip.
+    const window = waitWindow(args, AUTO_REVIEW_WAIT_DEFAULTS);
+    const { client, versionId, versionNumber } = await resolveCommandContext(args);
     await waitForAutoReview({
       client,
       versionId,
       versionNumber,
       jobId: args.job,
-      intervalMs: parseWaitNumber(args.interval, 5, "--interval") * 1000,
-      timeoutMs: parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000,
+      ...window,
       json: Boolean(args.json),
       full: Boolean(args.full),
     });
@@ -243,39 +217,28 @@ const run = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
-    const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
-    const { client, problemId, version, versionId, versionNumber } =
-      await resolveCommandContext(args);
-    const state: any = await client.query(
-      api.runDynamicChecks.getAutoReviewTriggerState,
-      { versionId },
-    );
+    const wait = resolveWaitWindow(args, AUTO_REVIEW_WAIT_DEFAULTS);
+    const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
+    const state: any = await client.query(api.runDynamicChecks.getAutoReviewTriggerState, {
+      versionId,
+    });
     if (state?.canRun === false) {
-      const reasons = (state.blockers ?? [])
-        .map((item: any) => item.reason)
-        .filter(Boolean);
-      throw new Error(
-        `Auto Review is blocked: ${reasons.join("; ") || "unknown reason"}`,
-      );
+      const reasons = (state.blockers ?? []).map((item: any) => item.reason).filter(Boolean);
+      throw new Error(`Auto Review is blocked: ${reasons.join("; ") || "unknown reason"}`);
     }
     await assertCheckCapacity(client, problemId, versionId, ["autoReview"]);
-    const result: any = await client.action(
-      api.runDynamicChecks.triggerDynamicCheck,
-      {
-        versionId,
-        checkKey: "autoReview",
-        useGeneralTokens: args["use-general-tokens"] || undefined,
-      },
-    );
-    if (args.wait) {
+    const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
+      versionId,
+      checkKey: "autoReview",
+      useGeneralTokens: args["use-general-tokens"] || undefined,
+    });
+    if (wait) {
       await waitForAutoReview({
         client,
         versionId,
         versionNumber,
         jobId: result?.jobId,
-        intervalMs,
-        timeoutMs,
+        ...wait,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });
@@ -299,24 +262,23 @@ const orchestrate = defineCommand({
     ...commonArgs,
     "force-fresh": {
       type: "boolean",
-      description:
-        "Rerun every review dimension instead of resuming existing results",
+      description: "Rerun every review dimension instead of resuming existing results",
     },
   },
   run: async ({ args }) => {
-    assertPaidEndpoint("orchestratorReview:triggerOrchestratorReview", { forceFresh: Boolean(args["force-fresh"]) });
+    assertPaidEndpoint("orchestratorReview:triggerOrchestratorReview", {
+      forceFresh: Boolean(args["force-fresh"]),
+    });
     const { client, problemId, versionId } = await resolveCommandContext(args);
     const isAdmin = await client.query(api.admins.isCurrentUser, {});
     if (!isAdmin) {
-      throw new Error(
-        "Auto Review orchestration is restricted to admins in the UI",
-      );
+      throw new Error("Auto Review orchestration is restricted to admins in the UI");
     }
     await assertCheckCapacity(client, problemId, versionId, ["autoReview"]);
-    const result = await client.action(
-      api.orchestratorReview.triggerOrchestratorReview,
-      { versionId, forceFresh: Boolean(args["force-fresh"]) },
-    );
+    const result = await client.action(api.orchestratorReview.triggerOrchestratorReview, {
+      versionId,
+      forceFresh: Boolean(args["force-fresh"]),
+    });
     printResult(result, args.json);
   },
 });

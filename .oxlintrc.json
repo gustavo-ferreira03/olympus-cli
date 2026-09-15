@@ -1,0 +1,178 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["oxc", "typescript", "unicorn", "import", "promise", "node"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "env": { "es2024": true, "node": true },
+  "ignorePatterns": ["dist/**", "node_modules/**"],
+  "settings": {
+    "jsdoc": { "ignorePrivate": true }
+  },
+  "rules": {
+    // Complexity and size budgets.
+    //
+    // These are WARNINGS on purpose. They describe the standard we are moving
+    // towards, not a wall that blocks unrelated work. CI pins the warning count
+    // (`pnpm lint:ci`) so the debt can shrink but never grow: new code must come
+    // in under budget, and touching an over-budget function means paying some of
+    // it down. Everything outside this block is an error and fails the build.
+    "complexity": ["warn", { "max": 15 }],
+    "max-depth": ["warn", { "max": 4 }],
+    "max-lines": ["warn", { "max": 600, "skipBlankLines": true, "skipComments": true }],
+    "max-lines-per-function": [
+      "warn",
+      { "max": 120, "skipBlankLines": true, "skipComments": true }
+    ],
+    "max-nested-callbacks": ["warn", { "max": 3 }],
+    "no-shadow": "warn",
+    "no-nested-ternary": "warn",
+    "unicorn/no-nested-ternary": "warn",
+
+    // The Convex backend exposes system fields (_id, _creationTime) and contest
+    // markers (_<check>Contested, _<check>ContestNote) with a leading underscore.
+    // That naming is the backend's, not ours, so the rule buys nothing here.
+    "no-underscore-dangle": "off",
+    "no-await-in-loop": "off",
+    "max-params": ["error", { "max": 5 }],
+
+    "eqeqeq": ["error", "always", { "null": "ignore" }],
+    "no-else-return": "error",
+    "no-lonely-if": "error",
+    "no-return-assign": "error",
+    "no-unneeded-ternary": "error",
+    "no-useless-concat": "error",
+    "no-var": "error",
+    "object-shorthand": "error",
+    "prefer-const": "error",
+    "prefer-object-spread": "error",
+    "prefer-template": "error",
+    "preserve-caught-error": "error",
+    // Off: citty command handlers and the budget API are declared async as an
+    // interface contract, so a handler that happens not to await is correct.
+    "require-await": "off",
+    "symbol-description": "error",
+
+    "typescript/array-type": ["error", { "default": "array-simple" }],
+    "typescript/consistent-type-definitions": ["error", "type"],
+    "typescript/consistent-type-imports": ["error", { "fixStyle": "inline-type-imports" }],
+    "typescript/no-inferrable-types": "error",
+    "typescript/no-non-null-asserted-optional-chain": "error",
+    "typescript/no-unnecessary-type-constraint": "error",
+    "typescript/prefer-for-of": "error",
+
+    "import/consistent-type-specifier-style": ["error", "prefer-inline"],
+    "import/first": "error",
+    "import/newline-after-import": "error",
+    "import/no-cycle": "error",
+    "import/no-duplicates": "error",
+    "import/no-self-import": "error",
+
+    "promise/no-return-wrap": "error",
+    "promise/param-names": "error",
+    "promise/prefer-await-to-then": "error",
+
+    "unicorn/error-message": "error",
+    "unicorn/explicit-length-check": "error",
+    "unicorn/no-array-sort": "error",
+    "unicorn/no-negated-condition": "error",
+    "unicorn/prefer-node-protocol": "error",
+    "unicorn/prefer-string-replace-all": "error",
+    "unicorn/prefer-string-slice": "error",
+    "unicorn/require-array-join-separator": "error",
+    "unicorn/throw-new-error": "error",
+
+    "unicorn/no-null": "off",
+    "unicorn/prefer-top-level-await": "off",
+    "unicorn/no-process-exit": "off",
+    "unicorn/consistent-function-scoping": "off"
+  },
+  "overrides": [
+    {
+      "files": ["src/commands/**/*.ts", "src/index.ts", "src/platform/**/*.ts"],
+      "rules": {
+        "import/no-nodejs-modules": "off"
+      }
+    },
+    {
+      // Layering, from the inside out:
+      //
+      //   shared/    leaf utilities and cross-cutting types; imports nothing internal
+      //   terminal/  rendering and process IO
+      //   platform/  the outside world: auth, config, Convex, HTTP
+      //   core/      domain rules: policy, budget, pricing, model
+      //   dashboard/ the dashboard feature: data, UI, TUI
+      //   commands/  the CLI surface; leaves of the graph
+      //   index.ts   composition root, may reach anywhere
+      //
+      // The rules below pin the two ends that matter -- shared/ stays a leaf and
+      // commands/ stay leaves -- and leave the middle to judgement. `import/no-cycle`
+      // is the real backstop and is an error everywhere.
+      "files": ["src/shared/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["../*"],
+                "message": "src/shared/ is the leaf layer: it must not import from any other layer. If a helper needs domain knowledge, it belongs in core/ instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/commands/**/*.ts"],
+      "excludeFiles": ["src/commands/command-utils.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "warn",
+          {
+            "patterns": [
+              {
+                "group": ["./*", "!./command-utils.ts"],
+                "message": "Command modules are leaves and should not import each other. Move the shared helper into a core module (e.g. src/shared/wait.ts) and import it from there."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/terminal/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "warn",
+          {
+            "patterns": [
+              {
+                "group": ["../core/*", "../platform/*", "../commands/*", "../dashboard/*"],
+                "message": "The terminal layer renders; it should depend only on src/shared/. Put the shared data contract in src/shared/types.ts instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/core/**/*.ts", "src/platform/**/*.ts", "src/dashboard/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["../commands/*", "**/commands/*"],
+                "message": "Dependencies point inward: commands depend on core, platform and dashboard, never the reverse."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

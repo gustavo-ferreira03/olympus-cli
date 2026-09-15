@@ -1,8 +1,8 @@
 import { defineCommand } from "citty";
-import { api } from "../convex.ts";
-import { printJson } from "../format.ts";
-import { omitEmpty } from "../output.ts";
-import { commonArgs, resolveCommandContext } from "../command-utils.ts";
+import { api } from "../platform/convex.ts";
+import { printJson } from "../terminal/format.ts";
+import { omitEmpty } from "../terminal/output.ts";
+import { commonArgs, resolveCommandContext } from "./command-utils.ts";
 
 function isActive(status: unknown): boolean {
   return status === "pending" || status === "running";
@@ -92,7 +92,10 @@ async function waitForImage({
         ? { status: "ready", version: versionNumber, elapsedSeconds, image, build }
         : { ...summarizeImage(versionNumber, image, build), elapsedSeconds };
       if (json) printJson(result);
-      else console.log(`\n  Image ready for v${versionNumber}${build?.jobId ? ` (${build.jobId})` : ""}.\n`);
+      else
+        console.log(
+          `\n  Image ready for v${versionNumber}${build?.jobId ? ` (${build.jobId})` : ""}.\n`,
+        );
       return result;
     }
     if (state === "failed") {
@@ -178,8 +181,12 @@ const build = defineCommand({
     full: { type: "boolean", description: "Include complete backend payloads when waiting" },
   },
   run: async ({ args }) => {
-    const intervalMs = args.wait ? parsePositiveNumber(args.interval, 5, "--interval") * 1000 : undefined;
-    const timeoutMs = args.wait ? parsePositiveNumber(args.timeout, 30, "--timeout") * 60 * 1000 : undefined;
+    const intervalMs = args.wait
+      ? parsePositiveNumber(args.interval, 5, "--interval") * 1000
+      : undefined;
+    const timeoutMs = args.wait
+      ? parsePositiveNumber(args.timeout, 30, "--timeout") * 60 * 1000
+      : undefined;
     const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
     let { image, build: latestBuild } = await readImageState(client, versionId);
 
@@ -190,7 +197,9 @@ const build = defineCommand({
       return;
     }
     if (image?.lastBuildFailedForCurrentInputs && !image?.rebuildSafeNeeded) {
-      throw new Error("The last image build failed for the current Dockerfile; edit it before rebuilding");
+      throw new Error(
+        "The last image build failed for the current Dockerfile; edit it before rebuilding",
+      );
     }
     if (image?.canBuild === false) throw new Error("The image cannot currently be built");
 
@@ -227,7 +236,9 @@ const build = defineCommand({
       waitCommand,
     });
     if (args.json) return printJson(result);
-    console.log(`\n  Image build ${triggered ? "queued" : "already running"} for v${versionNumber}.`);
+    console.log(
+      `\n  Image build ${triggered ? "queued" : "already running"} for v${versionNumber}.`,
+    );
     console.log(`  Wait: ${waitCommand}\n`);
   },
 });
@@ -247,7 +258,9 @@ const cancel = defineCommand({
       cancelled: Boolean(result?.cancelled),
     };
     if (args.json) return printJson(output);
-    console.log(result?.cancelled ? "\n  Image build cancelled.\n" : "\n  Image build already finished.\n");
+    console.log(
+      result?.cancelled ? "\n  Image build cancelled.\n" : "\n  Image build already finished.\n",
+    );
   },
 });
 

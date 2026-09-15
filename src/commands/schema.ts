@@ -6,8 +6,8 @@ import {
   type Resolvable,
   type SubCommandsDef,
 } from "citty";
-import { printJson } from "./format.ts";
-import { CliError } from "./errors.ts";
+import { printJson } from "../terminal/format.ts";
+import { CliError } from "../shared/errors.ts";
 
 type CommandSchema = {
   path: string[];
@@ -19,9 +19,7 @@ type CommandSchema = {
 };
 
 async function resolve<T>(value: Resolvable<T>): Promise<T> {
-  return typeof value === "function"
-    ? await (value as () => T | Promise<T>)()
-    : await value;
+  return typeof value === "function" ? await (value as () => T | Promise<T>)() : await value;
 }
 
 async function describe(
@@ -32,12 +30,8 @@ async function describe(
   const args = await resolve(command.args ?? {});
   return {
     path,
-    ...(command.meta === undefined
-      ? {}
-      : { meta: await resolve(command.meta) }),
-    ...(command.default === undefined
-      ? {}
-      : { default: await resolve(command.default) }),
+    ...(command.meta === undefined ? {} : { meta: await resolve(command.meta) }),
+    ...(command.default === undefined ? {} : { default: await resolve(command.default) }),
     args,
     flags: Object.entries(args)
       .filter(([, arg]) => arg.type !== "positional")
@@ -58,9 +52,7 @@ async function collect(
   const commands = [await describe(command, path, children)];
   const nextAncestors = new Set(ancestors).add(command);
   for (const [name, child] of Object.entries(children)) {
-    commands.push(
-      ...(await collect(await resolve(child), [...path, name], nextAncestors)),
-    );
+    commands.push(...(await collect(await resolve(child), [...path, name], nextAncestors)));
   }
   return commands;
 }
@@ -75,8 +67,7 @@ async function findChild(
   for (const [key, child] of Object.entries(children)) {
     const command = await resolve(child);
     const meta = await resolve(command.meta ?? {});
-    const aliases =
-      typeof meta.alias === "string" ? [meta.alias] : (meta.alias ?? []);
+    const aliases = typeof meta.alias === "string" ? [meta.alias] : (meta.alias ?? []);
     if (aliases.includes(name)) return [key, command];
   }
   return undefined;
@@ -93,8 +84,7 @@ export function createSchemaCommand(root: CommandDef): CommandDef {
       command: {
         type: "positional",
         required: false,
-        description:
-          "Command path segments, such as runs run; omit to list the full command tree",
+        description: "Command path segments, such as runs run; omit to list the full command tree",
       },
       json: {
         type: "boolean",
@@ -114,22 +104,17 @@ export function createSchemaCommand(root: CommandDef): CommandDef {
         const children = await resolve(command.subCommands ?? {});
         const found = await findChild(children, segment);
         if (!found) {
-          throw new CliError(
-            `Unknown command path: ${[...path, segment].join(" ")}`,
-            {
-              kind: "usage",
-              code: "schema.unknown_command",
-              retryable: false,
-              hint: "Run olympus schema to discover available command paths.",
-            },
-          );
+          throw new CliError(`Unknown command path: ${[...path, segment].join(" ")}`, {
+            kind: "usage",
+            code: "schema.unknown_command",
+            retryable: false,
+            hint: "Run olympus schema to discover available command paths.",
+          });
         }
         path.push(found[0]);
         command = found[1];
       }
-      printJson(
-        await describe(command, path, await resolve(command.subCommands ?? {})),
-      );
+      printJson(await describe(command, path, await resolve(command.subCommands ?? {})));
     },
   });
 }

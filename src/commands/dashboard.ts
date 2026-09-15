@@ -1,11 +1,11 @@
 import { defineCommand } from "citty";
-import { getClient, installPolicyGuards } from "../convex.ts";
+import { getClient, installPolicyGuards } from "../platform/convex.ts";
 import { ConvexHttpClient } from "convex/browser";
-import { requireAuth } from "../auth.ts";
-import { printJson } from "../format.ts";
-import { CliError } from "../errors.ts";
-import { readDashboard, type Snapshot } from "../dashboard.ts";
-import { runDashboard } from "../dashboard-tui.ts";
+import { requireAuth } from "../platform/auth.ts";
+import { printJson } from "../terminal/format.ts";
+import { CliError } from "../shared/errors.ts";
+import { readDashboard, type Snapshot } from "../dashboard/data.ts";
+import { runDashboard } from "../dashboard/tui.ts";
 
 export default defineCommand({
   meta: {
@@ -25,8 +25,7 @@ export default defineCommand({
     },
     json: {
       type: "boolean",
-      description:
-        "Return one read-only snapshot instead of opening the live terminal dashboard",
+      description: "Return one read-only snapshot instead of opening the live terminal dashboard",
     },
   },
   run: async ({ args }) => {
@@ -54,10 +53,7 @@ export default defineCommand({
       fetch: (input, init) => fetch(input, { ...init, signal: requestSignal }),
     });
     installPolicyGuards(client, base.url, identity.sub);
-    const load = async (
-      previous: Snapshot | undefined,
-      signal: AbortSignal,
-    ) => {
+    const load = async (previous: Snapshot | undefined, signal: AbortSignal) => {
       requestSignal = signal;
       return readDashboard(client, args.id, previous);
     };
@@ -67,8 +63,7 @@ export default defineCommand({
       try {
         const snapshot = await load(undefined, controller.signal);
         printJson(snapshot);
-        if (Object.values(snapshot.sources).some((source) => source.error))
-          process.exitCode = 1;
+        if (Object.values(snapshot.sources).some((source) => source.error)) process.exitCode = 1;
       } finally {
         clearTimeout(timeout);
       }

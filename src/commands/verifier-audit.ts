@@ -1,15 +1,20 @@
 import { defineCommand } from "citty";
-import { assertCheckCapacity } from "../policy.ts";
-import { api } from "../convex.ts";
-import { parseWaitNumber, waitForChecks } from "./checks.ts";
-import { printJson } from "../format.ts";
-import { normalizeDynamicChecks } from "../model.ts";
+import { assertCheckCapacity } from "../core/policy.ts";
+import { api } from "../platform/convex.ts";
+import { waitForChecks } from "../core/check-wait.ts";
+import { resolveWaitWindow } from "../shared/wait.ts";
+
+import { printJson } from "../terminal/format.ts";
+import { normalizeDynamicChecks } from "../core/model.ts";
 import {
   commonArgs,
   printResult,
   readOptionalFile,
   resolveCommandContext,
-} from "../command-utils.ts";
+} from "./command-utils.ts";
+
+/** Verifier audits run longer than ordinary quality checks. */
+const VERIFIER_AUDIT_WAIT_DEFAULTS = { intervalSeconds: 5, timeoutMinutes: 45 } as const;
 
 const view = defineCommand({
   meta: {
@@ -61,9 +66,9 @@ const run = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const intervalMs = args.wait ? parseWaitNumber(args.interval, 5, "--interval") * 1000 : undefined;
-    const timeoutMs = args.wait ? parseWaitNumber(args.timeout, 45, "--timeout") * 60 * 1000 : undefined;
-    const { client, problemId, version, versionId, versionNumber } = await resolveCommandContext(args);
+    const wait = resolveWaitWindow(args, VERIFIER_AUDIT_WAIT_DEFAULTS);
+    const { client, problemId, version, versionId, versionNumber } =
+      await resolveCommandContext(args);
     const [dynamic, isAdmin] = await Promise.all([
       client.query(api.runDynamicChecks.getDynamicChecks, { versionId }),
       client.query(api.admins.isCurrentUser, {}),
@@ -77,9 +82,9 @@ const run = defineCommand({
     }
     const verifySolution = checks.verifySolution;
     const solutionPassed =
-      verifySolution?.status === "completed" &&
-      verifySolution?.stale !== true &&
-      String(verifySolution?.output?.verdict ?? "").toUpperCase() === "PASS";
+      verifySolution?.status === "completed"
+      && verifySolution?.stale !== true
+      && String(verifySolution?.output?.verdict ?? "").toUpperCase() === "PASS";
     if (!isAdmin && !solutionPassed) {
       throw new Error("Verifier audit requires a fresh passing Verify Solution check");
     }
@@ -89,15 +94,14 @@ const run = defineCommand({
       checkKey: "verifierIncompleteness",
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
-    if (args.wait) {
+    if (wait) {
       await waitForChecks({
         client,
         problemId,
         version,
         jobId: result?.jobId,
         requestedKeys: result?.jobId ? undefined : ["verifierIncompleteness"],
-        intervalMs,
-        timeoutMs,
+        ...wait,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });
@@ -149,7 +153,8 @@ const decide = defineCommand({
     });
     const check = normalizeDynamicChecks(dynamic).verifierIncompleteness ?? null;
     const jobId = args.job ?? check?.jobId;
-    if (!jobId) throw new Error("No verifier audit job exists on this version; pass --job explicitly");
+    if (!jobId)
+      throw new Error("No verifier audit job exists on this version; pass --job explicitly");
     if (args.decision !== "rejected") {
       if (!check || check.jobId !== jobId) {
         throw new Error("Acceptance requires the current verifier audit job");
@@ -163,7 +168,7 @@ const decide = defineCommand({
     const payload: Record<string, unknown> = {
       jobId,
       decision: args.decision,
-      ...(finalPatch !== undefined ? { finalPatch } : {}),
+      ...(finalPatch === undefined ? {} : { finalPatch }),
       ...(args.comment?.trim() ? { comment: args.comment.trim() } : {}),
     };
     const result = await client.mutation(

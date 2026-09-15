@@ -1,12 +1,6 @@
 import { emitKeypressEvents } from "node:readline";
-import { renderDashboard } from "./dashboard-ui.ts";
-import {
-  clean,
-  dashboardRows,
-  observedChanges,
-  type Snapshot,
-  type Row,
-} from "./dashboard.ts";
+import { renderDashboard } from "./ui.ts";
+import { clean, dashboardRows, observedChanges, type Snapshot } from "./data.ts";
 
 export type ViewState = {
   snapshot?: Snapshot;
@@ -23,13 +17,9 @@ export type ViewState = {
   history?: boolean;
   events: string[];
 };
-export { fit, renderDashboard } from "./dashboard-ui.ts";
 
 export async function runDashboard(
-  load: (
-    previous: Snapshot | undefined,
-    signal: AbortSignal,
-  ) => Promise<Snapshot>,
+  load: (previous: Snapshot | undefined, signal: AbortSignal) => Promise<Snapshot>,
   intervalMs: number,
 ): Promise<void> {
   const state: ViewState = {
@@ -56,11 +46,7 @@ export async function runDashboard(
   const paint = () => {
     if (!stopped)
       process.stdout.write(
-        renderDashboard(
-          state,
-          process.stdout.columns || 80,
-          process.stdout.rows || 24,
-        ),
+        renderDashboard(state, process.stdout.columns || 80, process.stdout.rows || 24),
       );
   };
   const stop = () => {
@@ -91,9 +77,7 @@ export async function runDashboard(
       state.events = state.events.slice(-100);
       state.snapshot = snapshot;
       state.error = undefined;
-      const partial = Object.values(snapshot.sources).some(
-        (source) => source.error,
-      );
+      const partial = Object.values(snapshot.sources).some((source) => source.error);
       failures = partial ? failures + 1 : 0;
     } catch (error) {
       if (!stopped) {
@@ -106,10 +90,7 @@ export async function runDashboard(
       if (!stopped) {
         const delay = pending
           ? 0
-          : Math.min(
-              intervalMs * 2 ** Math.min(failures, 5),
-              Math.max(intervalMs, 60000),
-            );
+          : Math.min(intervalMs * 2 ** Math.min(failures, 5), Math.max(intervalMs, 60000));
         pending = false;
         state.nextAt = Date.now() + delay;
         timer = setTimeout(() => void refresh(), delay);
@@ -126,17 +107,12 @@ export async function runDashboard(
     if (state.details && ["pageup", "pagedown"].includes(key?.name ?? "")) {
       state.detailOffset = Math.max(
         0,
-        (state.detailOffset ?? 0) +
-          (key.name === "pageup" ? -1 : 1) * (state.detailPageSize ?? 1),
+        (state.detailOffset ?? 0) + (key.name === "pageup" ? -1 : 1) * (state.detailPageSize ?? 1),
       );
       paint();
       return;
     }
-    if (
-      ["tab", "return", "h", "up", "down", "pageup", "pagedown"].includes(
-        key?.name ?? "",
-      )
-    )
+    if (["tab", "return", "h", "up", "down", "pageup", "pagedown"].includes(key?.name ?? ""))
       state.detailOffset = 0;
     if (key?.name === "tab") state.section = (state.section + 1) % 3;
     if (key?.name === "return") state.details = !state.details;
@@ -148,9 +124,7 @@ export async function runDashboard(
       const rows = dashboardRows(state.snapshot);
       const size = [
         rows.checks,
-        state.history
-          ? rows.runs
-          : rows.runs.filter((item) => item.freshness === "current"),
+        state.history ? rows.runs : rows.runs.filter((item) => item.freshness === "current"),
         rows.readiness,
       ][state.section].length;
       const delta =
