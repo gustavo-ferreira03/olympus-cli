@@ -6,6 +6,7 @@ import { resolveCommandContext } from "./command-utils.ts";
 import { resolveCostCatalog } from "../core/pricing.ts";
 import { toPublicCheckKey } from "../core/expected.ts";
 import { sumBudgetAmounts } from "../core/budget.ts";
+import { summarizeTokenUsage } from "../core/token-telemetry.ts";
 
 function number(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -20,6 +21,19 @@ function compactBalance(balance: any, revisionTokens: any[]) {
     balance: balance?.balance,
     cap: balance?.cap,
     tierName: balance?.tierName,
+    tierOrder: balance?.tierOrder,
+    tierColor: balance?.tierColor,
+    tierWindowDays: balance?.tierWindowDays,
+    tierDripAmount: balance?.tierDripAmount,
+    tierAcceptanceBonusUsd: balance?.tierAcceptanceBonusUsd,
+    tierFeatures: balance?.tierFeatures,
+    nextTierRequirement: balance?.nextTierRequirement,
+    acceptedInWindow: balance?.acceptedInWindow,
+    olympusAcceptedInWindow: balance?.olympusAcceptedInWindow,
+    lifetimeAccepted: balance?.lifetimeAccepted,
+    pendingDrip: balance?.pendingDrip,
+    dripPaused: balance?.dripPaused,
+    dripUnlimited: balance?.dripUnlimited,
     nextDripAt: balance?.nextDripAt,
     revisionTokenBalance: balance?.revisionTokenBalance ?? totalRevision,
     generalTokenBalance: balance?.generalTokenBalance,
@@ -182,6 +196,7 @@ const usage = defineCommand({
         ? { challengeId: args.challenge, source: "ledger-filter" }
         : { source: "ledger" },
       ...summarizeTransactions(transactions, args.full),
+      tokenUsage: summarizeTokenUsage(transactions),
     };
     if (args.full) (result as any).raw = transactions;
     if (args.challenge) result.localBudget = await localBudgetStatus(client, args.challenge);

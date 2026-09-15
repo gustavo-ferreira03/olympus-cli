@@ -4,7 +4,13 @@ import { ConvexHttpClient } from "convex/browser";
 import { requireAuth } from "../platform/auth.ts";
 import { printJson } from "../terminal/format.ts";
 import { CliError } from "../shared/errors.ts";
-import { readDashboard, type Snapshot } from "../dashboard/data.ts";
+import {
+  readDashboard,
+  readDashboardOverview,
+  type DashboardOverviewFilters,
+  type OverviewSnapshot,
+  type Snapshot,
+} from "../dashboard/data.ts";
 import { runDashboard } from "../dashboard/tui.ts";
 
 export default defineCommand({
@@ -15,8 +21,8 @@ export default defineCommand({
   args: {
     id: {
       type: "positional",
-      description: "Challenge ID; follows the latest version",
-      required: true,
+      description: "Optional challenge ID; omit to choose from the general dashboard",
+      required: false,
     },
     interval: {
       type: "string",
@@ -26,6 +32,26 @@ export default defineCommand({
     json: {
       type: "boolean",
       description: "Return one read-only snapshot instead of opening the live terminal dashboard",
+    },
+    status: {
+      type: "string",
+      description: "Overview filter: status value, or all",
+    },
+    language: {
+      type: "string",
+      description: "Overview filter: language value, or all",
+    },
+    difficulty: {
+      type: "string",
+      description: "Overview filter: difficulty value, or all",
+    },
+    category: {
+      type: "string",
+      description: "Overview filter: category value, or all",
+    },
+    "include-archived": {
+      type: "boolean",
+      description: "Include archived challenges (hidden by default)",
     },
   },
   run: async ({ args }) => {
@@ -44,6 +70,25 @@ export default defineCommand({
         retryable: false,
         hint: "Run in a terminal, or use --json for one snapshot.",
       });
+    const overviewFilters: DashboardOverviewFilters = {
+      includeArchived: args["include-archived"],
+      status: args.status,
+      language: args.language,
+      difficulty: args.difficulty,
+      category: args.category,
+    };
+    const hasOverviewFilter =
+      args["include-archived"] === true
+      || [args.status, args.language, args.difficulty, args.category].some(
+        (value) => value !== undefined,
+      );
+    if (args.id && hasOverviewFilter)
+      throw new CliError("Overview filters require dashboard without a challenge ID", {
+        kind: "usage",
+        code: "dashboard.filters_with_id",
+        retryable: false,
+        hint: "Run olympus dashboard --status <status> to filter the overview.",
+      });
     const base = await getClient();
     const { token, identity } = requireAuth();
     let requestSignal: AbortSignal;
@@ -53,22 +98,34 @@ export default defineCommand({
       fetch: (input, init) => fetch(input, { ...init, signal: requestSignal }),
     });
     installPolicyGuards(client, base.url, identity.sub);
-    const load = async (previous: Snapshot | undefined, signal: AbortSignal) => {
+    const loadOverview = async (_previous: OverviewSnapshot | undefined, signal: AbortSignal) => {
       requestSignal = signal;
-      return readDashboard(client, args.id, previous);
+      return readDashboardOverview(client, overviewFilters);
+    };
+    const loadChallenge = async (
+      id: string,
+      previous: Snapshot | undefined,
+      signal: AbortSignal,
+    ) => {
+      requestSignal = signal;
+      return readDashboard(client, id, previous);
     };
     if (args.json) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
       try {
-        const snapshot = await load(undefined, controller.signal);
-        printJson(snapshot);
-        if (Object.values(snapshot.sources).some((source) => source.error)) process.exitCode = 1;
+        if (args.id) {
+          const snapshot = await loadChallenge(args.id, undefined, controller.signal);
+          printJson(snapshot);
+          if (Object.values(snapshot.sources).some((source) => source.error)) process.exitCode = 1;
+        } else {
+          printJson(await loadOverview(undefined, controller.signal));
+        }
       } finally {
         clearTimeout(timeout);
       }
       return;
     }
-    await runDashboard(load, interval * 1000);
+    await runDashboard({ loadOverview, loadChallenge, initialId: args.id }, interval * 1000);
   },
 });

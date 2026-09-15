@@ -1,17 +1,43 @@
-import { clean, dashboardRows, type Row } from "./data.ts";
+import { clean, dashboardRows, type OverviewSnapshot, type Row } from "./data.ts";
 import { type ViewState } from "./tui.ts";
 
-const reset = "\x1b[0m";
+const colorEnabled =
+  process.stdout.isTTY && !("NO_COLOR" in process.env) && process.env.TERM !== "dumb";
+const ansi = (value: string): string => (colorEnabled ? value : "");
+const semanticColor = {
+  green: 114,
+  red: 210,
+  amber: 222,
+  blue: 117,
+} as const;
+const foreground = (color: keyof typeof semanticColor): string =>
+  ansi(`\x1b[0;1;38;5;${semanticColor[color]}m`);
+const statusBackground = (color: keyof typeof semanticColor): string =>
+  ansi(`\x1b[0;1;38;5;232;48;5;${semanticColor[color]}m`);
+const reset = ansi("\x1b[0m");
 const colors = {
-  green: "\x1b[0;1;38;5;232;48;5;114m",
-  red: "\x1b[0;1;38;5;232;48;5;210m",
-  amber: "\x1b[0;1;38;5;232;48;5;222m",
-  blue: "\x1b[0;1;38;5;232;48;5;117m",
-  muted: "\x1b[0;38;5;245;49m",
-  accent: "\x1b[0;1;38;5;255;49m",
-  card: "\x1b[0;1;38;5;252;49m",
-  white: "\x1b[0;38;5;252;49m",
-  dim: "\x1b[0;38;5;245;49m",
+  green: foreground("green"),
+  red: foreground("red"),
+  amber: foreground("amber"),
+  blue: foreground("blue"),
+  muted: ansi("\x1b[0;38;5;145m"),
+  purple: ansi("\x1b[0;1;38;5;141m"),
+  accent: ansi("\x1b[0;1;38;5;159m"),
+  card: ansi("\x1b[0;1;38;5;159m"),
+  white: ansi("\x1b[0;38;5;252m"),
+  dim: ansi("\x1b[0;38;5;145m"),
+  bronze: ansi("\x1b[0;1;38;5;215m"),
+  silver: ansi("\x1b[0;1;38;5;250m"),
+  gold: ansi("\x1b[0;1;38;5;220m"),
+  platinum: ansi("\x1b[0;1;38;5;159m"),
+};
+const statusColors = {
+  green: statusBackground("green"),
+  red: statusBackground("red"),
+  amber: statusBackground("amber"),
+  blue: statusBackground("blue"),
+  muted: ansi("\x1b[0;38;5;245;49m"),
+  accent: ansi("\x1b[0;1;38;5;255;49m"),
 };
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const cellWidth = (char: string): number => {
@@ -62,31 +88,60 @@ function wrap(value: unknown, width: number): string[] {
 }
 const cell = (text: unknown, width: number, color = colors.white) =>
   color + fit(text, width) + reset;
-const age = (time: number | null | undefined, now: number) =>
-  time ? `${Math.max(0, Math.floor((now - time) / 1000))}s` : "never";
+const animated = (row: Row) =>
+  /^(running|pending|queued|processing|building)$/i.test(row.status)
+  && !["stale", "scratched", "outdated"].includes(row.freshness);
 const num = (value: unknown) =>
   typeof value === "number" && Number.isFinite(value) ? String(Math.round(value * 100) / 100) : "?";
-function badge(row: Row): { text: string; color: string } {
+const spinner = (now: number) =>
+  ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][Math.floor(now / 300) % 10];
+function badge(row: Row, now: number): { text: string; color: string } {
   if (["stale", "scratched", "outdated"].includes(row.freshness))
-    return { text: row.freshness.toUpperCase(), color: colors.muted };
+    return { text: row.freshness.toUpperCase(), color: statusColors.muted };
   const status = `${row.status} ${row.verdict}`.toLowerCase();
-  if (/running|pending|queued|processing|building/.test(row.status))
-    return { text: "RUNNING", color: colors.blue };
+  if (animated(row)) return { text: `${spinner(now)} RUN`, color: statusColors.blue };
   const text = row.verdict || (row.status === "not_run" ? "NOT RUN" : row.status.toUpperCase());
   if (row.verdict.startsWith("BAND ")) {
     const band = Number(row.verdict.slice(5));
     return {
       text: `${band}/3`,
-      color: band >= 3 ? colors.green : band === 2 ? colors.amber : colors.red,
+      color: band >= 3 ? statusColors.green : band === 2 ? statusColors.amber : statusColors.red,
     };
   }
-  if (/fail|error|reject|cancel|below_bar/.test(status)) return { text: "FAIL", color: colors.red };
-  if (/warn|caveat/.test(status)) return { text: "WARN", color: colors.amber };
+  if (/fail|error|reject|cancel|below_bar/.test(status))
+    return { text: "FAIL", color: statusColors.red };
+  if (/warn|caveat/.test(status)) return { text: "WARN", color: statusColors.amber };
   if (/pass|accepted|approved|available|meets_bar/.test(status))
-    return { text: "PASS", color: colors.green };
-  if (row.status === "completed") return { text: "DONE", color: colors.accent };
-  return { text, color: row.verdict ? colors.accent : colors.muted };
+    return { text: "PASS", color: statusColors.green };
+  if (row.status === "completed") return { text: "DONE", color: statusColors.accent };
+  return { text, color: row.verdict ? statusColors.accent : statusColors.muted };
 }
+export function dashboardBadge(row: Row, width: number, now: number): string {
+  width = Math.max(0, Math.floor(width));
+  const b = badge(row, now);
+  const running = animated(row);
+  const text =
+    running && row.progress !== undefined ? `${spinner(now)} ${Math.floor(row.progress)}%` : b.text;
+  const clipped = fit(text, width).trimEnd();
+  const visibleWidth = [...graphemes.segment(clipped)].reduce(
+    (sum, part) => sum + cellWidth(part.segment),
+    0,
+  );
+  const left = Math.max(0, Math.floor((width - visibleWidth) / 2));
+  const label = " ".repeat(left) + clipped + " ".repeat(Math.max(0, width - left - visibleWidth));
+  if (!running || width < 3) return b.color + label + reset;
+  const filled = row.progress === undefined ? null : Math.floor((width * row.progress) / 100);
+  const position = (Math.floor(now / 300) % (width + 3)) - 3;
+  let result = "",
+    index = 0;
+  for (const { segment } of graphemes.segment(label)) {
+    const active = filled === null ? index >= position && index < position + 3 : index < filled;
+    result += (active ? statusColors.blue : ansi("\x1b[0;1;38;5;255;48;5;238m")) + segment;
+    index += cellWidth(segment);
+  }
+  return result + reset;
+}
+
 const shortLabel = (label: string) =>
   label
     .replace("Verify ", "")
@@ -96,14 +151,6 @@ const shortLabel = (label: string) =>
     .replace("Task Quality", "Task quality")
     .replace("Verifier Incompleteness", "Verifier audit")
     .replace(" · re-eval ", " / RE ");
-
-/** Status abbreviations used when a tile is too narrow for the full word. */
-const DENSE_STATUS_ABBREVIATIONS: Array<[string, string]> = [
-  ["RUNNING", "RUN"],
-  ["WARNING", "WARN"],
-  ["MEETS BAR", "MEETS"],
-  ["BAND ", "B"],
-];
 
 /** Label abbreviations used when a tile is too narrow for the full name. */
 const DENSE_LABEL_ABBREVIATIONS: Array<[string, string]> = [
@@ -131,36 +178,548 @@ type TileContext = {
   item: Row | undefined;
   tileWidth: number;
   dense: boolean;
+  tileHeight: number;
   /** Which of the tile's `tileHeight` lines is being drawn. */
   lineIndex: number;
   /** True when this tile holds the cursor. */
   isSelected: boolean;
+  now: number;
 };
 
 /** Render a single dashboard tile line. */
-function renderTile({ item, tileWidth, dense, lineIndex, isSelected }: TileContext): string {
+function renderTile({
+  item,
+  tileWidth,
+  dense,
+  tileHeight,
+  lineIndex,
+  isSelected,
+  now,
+}: TileContext): string {
   if (!item) return cell("", tileWidth);
   const marker = isSelected ? "▸" : " ";
   if (dense) {
-    const b = badge(item);
-    const status = abbreviate(b.text, DENSE_STATUS_ABBREVIATIONS);
-    const badgeWidth = Math.min(Math.max(0, tileWidth - 2), status.length + 2);
+    const badgeWidth = Math.min(Math.max(0, tileWidth - 2), 10);
     const label = abbreviate(shortLabel(item.label), DENSE_LABEL_ABBREVIATIONS);
     return (
       cell(`${marker}${label}`, tileWidth - badgeWidth, colors.card)
-      + cell(` ${status} `, badgeWidth, b.color)
+      + dashboardBadge(item, badgeWidth, now)
     );
   }
-  if (lineIndex) {
-    const b = badge(item);
-    const badgeWidth = Math.min(tileWidth - 3, b.text.length + 2);
+  if (lineIndex === Math.floor(tileHeight / 2)) {
+    const left = Math.min(3, tileWidth);
+    const badgeWidth = Math.min(Math.max(0, tileWidth - left), 10);
     return (
-      cell("   ", 3)
-      + cell(` ${b.text} `, badgeWidth, b.color)
-      + cell("", tileWidth - 3 - badgeWidth)
+      cell("", left)
+      + dashboardBadge(item, badgeWidth, now)
+      + cell("", tileWidth - left - badgeWidth)
     );
   }
+  if (lineIndex !== 0) return cell("", tileWidth);
   return cell(` ${marker} ${item.label}`, tileWidth, colors.card);
+}
+
+function overviewState(status: string): { label: string; color: string } {
+  const value = status.toLowerCase();
+  if (value === "accepted" || value === "approved" || value === "finalized")
+    return { label: "ACCEPTED", color: colors.green };
+  if (value.includes("review") || value === "submitted" || value === "finalizing_review")
+    return { label: "IN REVIEW", color: colors.blue };
+  if (value.includes("reject") || value.includes("fail"))
+    return { label: "ACTION", color: colors.red };
+  if (value === "archived") return { label: "ARCHIVED", color: colors.muted };
+  if (value.includes("revision") || value.includes("edit"))
+    return { label: "NEEDS EDIT", color: colors.amber };
+  if (value === "draft") return { label: "DRAFT", color: colors.muted };
+  return { label: value.toUpperCase() || "UNKNOWN", color: colors.muted };
+}
+function relativeTime(timestamp: number | null, now: number): string {
+  if (timestamp === null) return "no activity";
+  const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  if (seconds < 604800) return `${Math.floor(seconds / 86400)}d ago`;
+  return new Date(timestamp).toLocaleDateString();
+}
+function overviewRunCount(challenge: {
+  totalRuns: number | null;
+  passedRuns: number | null;
+}): string {
+  if (challenge.totalRuns === null) return "runs —";
+  return `runs ${challenge.passedRuns ?? 0}/${challenge.totalRuns} pass`;
+}
+function tokenAmount(value: number | null): string {
+  return value === null ? "—" : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+function nextTokenDrip(timestamp: number | null, now: number): string {
+  if (timestamp === null) return "not scheduled";
+  const seconds = Math.floor((timestamp - now) / 1000);
+  if (seconds <= 0) return "due";
+  if (seconds < 3600) return `in ${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `in ${Math.floor(seconds / 3600)}h`;
+  return new Date(timestamp).toLocaleDateString();
+}
+function nextRotation(timestamp: number | null, now: number): string {
+  if (timestamp === null) return "not scheduled";
+  const seconds = Math.floor((timestamp - now) / 1000);
+  if (seconds <= 0) return "due";
+  if (seconds < 3600) return `in ${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `in ${Math.floor(seconds / 3600)}h`;
+  return `in ${Math.floor(seconds / 86400)}d`;
+}
+function tokenTier(name: string | null): { label: string; color: string } {
+  const normalized = name?.trim().toLowerCase() ?? "";
+  const label = name ?? "Unknown";
+  if (normalized.includes("platinum")) return { label, color: colors.platinum };
+  if (normalized.includes("gold")) return { label, color: colors.gold };
+  if (normalized.includes("silver")) return { label, color: colors.silver };
+  if (normalized.includes("bronze")) return { label, color: colors.bronze };
+  return { label: name ?? "Unknown", color: colors.muted };
+}
+function tokenTone(balance: number | null, cap: number | null): string {
+  if (balance === null) return colors.muted;
+  if (cap === null || cap <= 0) return colors.blue;
+  const ratio = balance / cap;
+  if (ratio <= 0.1) return colors.red;
+  if (ratio <= 0.3) return colors.amber;
+  return colors.green;
+}
+function tokenUsage(balance: number | null, cap: number | null): string {
+  if (balance === null || cap === null || cap <= 0) return "usage —";
+  const ratio = Math.max(0, Math.min(1, balance / cap));
+  const width = 14;
+  const filled = Math.round(width * ratio);
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)} ${Math.round(ratio * 100)}%`;
+}
+const SPARK_LEVELS = ["·", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
+function timelineBars(values: number[], maximum: number, slotWidth: number): string {
+  return values
+    .map((value) => {
+      const level =
+        maximum <= 0 || value <= 0
+          ? 0
+          : Math.max(1, Math.min(SPARK_LEVELS.length - 1, Math.round((value / maximum) * 8)));
+      return SPARK_LEVELS[level].repeat(slotWidth);
+    })
+    .join(" ");
+}
+function acceptedWindowDelta(tokens: OverviewSnapshot["tokens"]): number | null {
+  if (tokens.lifetimeAccepted === null || tokens.acceptedInWindow === null) return null;
+  return Math.max(0, tokens.lifetimeAccepted - tokens.acceptedInWindow);
+}
+function renderTierDetails(tokens: OverviewSnapshot["tokens"]): string {
+  const drip =
+    tokens.dripPaused === true
+      ? "drip paused"
+      : tokens.dripUnlimited === true
+        ? "unlimited drip"
+        : tokens.tierDripAmount === null
+          ? "drip rate —"
+          : `+${tokenAmount(tokens.tierDripAmount)}/hr drip`;
+  const cap = tokens.cap === null ? "cap —" : `${tokenAmount(tokens.cap)} cap`;
+  const bonus =
+    tokens.tierAcceptanceBonusUsd === null
+      ? "accepted bonus —"
+      : `+$${tokenAmount(tokens.tierAcceptanceBonusUsd)} accepted bonus`;
+  return `Tier ${tokens.tierName ?? "Unknown"} · ${drip} · ${cap} · ${bonus}`;
+}
+function renderAcceptedDetails(tokens: OverviewSnapshot["tokens"]): string {
+  const window = tokens.tierWindowDays === null ? "—" : `${tokenAmount(tokens.tierWindowDays)}d`;
+  const accepted = tokens.acceptedInWindow === null ? "—" : tokenAmount(tokens.acceptedInWindow);
+  const olympus =
+    tokens.olympusAcceptedInWindow === null ? "—" : tokenAmount(tokens.olympusAcceptedInWindow);
+  const lifetime = tokens.lifetimeAccepted === null ? "—" : tokenAmount(tokens.lifetimeAccepted);
+  const agedOut = acceptedWindowDelta(tokens);
+  return `Accepted · last ${window} ${accepted} · ${olympus} Olympus · ${agedOut === null ? "aged out —" : `${agedOut} aged out`} · lifetime ${lifetime}`;
+}
+function renderNextTierDetails(tokens: OverviewSnapshot["tokens"]): string | null {
+  const next = tokens.nextTierRequirement;
+  if (!next?.tierName) return null;
+  const accepted = tokens.acceptedInWindow === null ? "—" : tokenAmount(tokens.acceptedInWindow);
+  const required = next.requiredAccepted === null ? "—" : tokenAmount(next.requiredAccepted);
+  const window = tokens.tierWindowDays === null ? "—" : `${tokenAmount(tokens.tierWindowDays)}d`;
+  return `${next.tierName} requires ${accepted}/${required} accepted in ${window}`;
+}
+function renderEloDetails(elo: OverviewSnapshot["elo"], now: number): string[] {
+  if (!elo.available) return [elo.note];
+  const toPrestige =
+    elo.seatCutElo === null || elo.value === null ? null : Math.max(0, elo.seatCutElo - elo.value);
+  const current = tokenAmount(elo.value);
+  const projected =
+    elo.projectedValue === null
+      ? "est. — at rotation"
+      : `est. ${tokenAmount(elo.projectedValue)} at rotation`;
+  const gap = toPrestige === null ? "to Prestige —" : `to Prestige ${tokenAmount(toPrestige)}`;
+  const window = elo.windowDays === null ? "window —" : `window ${tokenAmount(elo.windowDays)}d`;
+  const cutoff =
+    elo.seatCutElo === null ? "seat cutoff —" : `seat cutoff ${tokenAmount(elo.seatCutElo)}`;
+  return [
+    `ELO ${current} · ${gap} · ${projected}`,
+    `${window} · ${cutoff} · rotates ${nextRotation(elo.nextRotationAt, now)}`,
+  ];
+}
+function chartLine(cells: Array<{ text: string; color: string }>, width: number): string {
+  const text = cells.map((cell) => cell.text).join("");
+  const visible = [...graphemes.segment(text)].reduce(
+    (sum, part) => sum + cellWidth(part.segment),
+    0,
+  );
+  return (
+    cells.map((cell) => cell.color + cell.text + reset).join("")
+    + cell("", Math.max(0, width - visible))
+  );
+}
+function renderPrestigeUsageChart(
+  elo: OverviewSnapshot["elo"],
+  now: number,
+  width: number,
+): Array<{ text: string; color: string }> {
+  const bins = elo.usage.bins;
+  if (bins.length === 0 || elo.windowDays === null) return [];
+  const binMs = elo.usage.binMs ?? 6 * 60 * 60 * 1000;
+  const chartNow = elo.timelineNow ?? now;
+  const bufferMs = Math.max(0, elo.agedOutBufferMs ?? 0);
+  const spanMs = Math.max(binMs * bins.length, elo.windowDays * 24 * 60 * 60 * 1000 + bufferMs);
+  const agedOutBins = Math.min(bins.length, Math.floor(bufferMs / binMs));
+  const maximum = Math.max(1, ...bins);
+  const total = bins.reduce((sum, value) => sum + value, 0);
+  const slotWidth = width >= 120 ? 2 : 1;
+  const plotWidth = bins.length * slotWidth;
+  const toLevel = (value: number, max: number) =>
+    max <= 0 || value <= 0
+      ? 0
+      : Math.max(1, Math.min(SPARK_LEVELS.length - 1, Math.round((value / max) * 8)));
+  const usageCells = bins.map((value, index) => ({
+    text: SPARK_LEVELS[toLevel(value, maximum)].repeat(slotWidth),
+    color: index < agedOutBins ? colors.muted : colors.amber,
+  }));
+  let accumulated = 0;
+  const trendCells = bins.map((value, index) => {
+    accumulated += value;
+    return {
+      text: SPARK_LEVELS[toLevel(accumulated, total)].repeat(slotWidth),
+      color: index < agedOutBins ? colors.muted : colors.white,
+    };
+  });
+  const markerCells = Array.from({ length: plotWidth }, () => ({ text: "·", color: colors.dim }));
+  for (const mark of elo.marks) {
+    const position = Math.max(
+      0,
+      Math.min(plotWidth - 1, Math.round(((mark.at - (chartNow - spanMs)) / spanMs) * plotWidth)),
+    );
+    markerCells[position] = {
+      text: "◆",
+      color: mark.countsAtRotation ? colors.green : mark.inWindow ? colors.amber : colors.muted,
+    };
+  }
+  const axis = `        aged out${" ".repeat(Math.max(1, plotWidth - 15))}now`;
+  const hours = Math.max(1, Math.round(binMs / (60 * 60 * 1000)));
+  const chartLabelWidth = 18;
+  const chartRow = (
+    label: string,
+    cells: Array<{ text: string; color: string }>,
+    color: string,
+  ) => ({
+    text: `${fit(` ${label}`, chartLabelWidth)}${chartLine(cells, Math.max(0, width - chartLabelWidth))}`,
+    color,
+  });
+  return [
+    { text: ` Usage · ${hours}h bins · ${elo.windowDays}d window`, color: colors.white },
+    chartRow(`usage`, usageCells, colors.amber),
+    chartRow("cumulative usage", trendCells, colors.white),
+    chartRow("accepted markers", markerCells, colors.dim),
+    { text: axis, color: colors.dim },
+    {
+      text: ` ${tokenAmount(elo.acceptedAtRotation)} count at rotation · ${tokenAmount(elo.agingOutByRotation)} aging out`,
+      color: colors.dim,
+    },
+  ];
+}
+function renderAcceptedTimeline(
+  timeline: OverviewSnapshot["acceptedTimeline"],
+  acceptedInWindow: number | null,
+  width: number,
+): Array<{ text: string; color: string }> {
+  if (!timeline || (timeline.marks.length === 0 && acceptedInWindow === 0)) return [];
+  const dayMs = 24 * 60 * 60 * 1000;
+  const windowMs = timeline.windowDays * dayMs;
+  const spanMs = Math.max(dayMs, (timeline.windowDays + timeline.bufferDays) * dayMs);
+  const from = timeline.now - spanMs;
+  const plotWidth = Math.max(30, Math.min(76, width - 18));
+  const cells = Array.from({ length: plotWidth }, () => ({ text: "·", color: colors.dim }));
+  const laneCounts = new Map<string, number>();
+  let inWindow = 0;
+  let agedOut = 0;
+  for (const mark of timeline.marks) {
+    const position = Math.max(
+      0,
+      Math.min(plotWidth - 1, Math.round(((mark.at - from) / spanMs) * (plotWidth - 1))),
+    );
+    const counts = timeline.now - mark.at <= windowMs;
+    if (counts) {
+      inWindow++;
+      laneCounts.set(mark.lane, (laneCounts.get(mark.lane) ?? 0) + 1);
+    } else {
+      agedOut++;
+    }
+    cells[position] = { text: "◆", color: counts ? colors.green : colors.muted };
+  }
+  const boundary = Math.max(
+    0,
+    Math.min(
+      plotWidth - 1,
+      Math.round((timeline.bufferDays / (timeline.windowDays + timeline.bufferDays)) * plotWidth),
+    ),
+  );
+  if (cells[boundary].text === "·") cells[boundary] = { text: "┆", color: colors.dim };
+  const laneSummary = [...laneCounts.entries()]
+    .toSorted(([a], [b]) => a.localeCompare(b))
+    .map(([lane, count]) => `${count} ${lane}`)
+    .join(" · ");
+  const acceptedLabel = `${colors.green}${acceptedInWindow ?? inWindow} accepted${reset}`;
+  return [
+    { text: ` Accepted · last ${timeline.windowDays}d`, color: colors.white },
+    { text: chartLine(cells, width), color: colors.dim },
+    { text: ` ${alignedTimelineAxis(plotWidth)}`, color: colors.dim },
+    {
+      text: ` ${acceptedLabel} · ${agedOut} aged out · ${timeline.windowDays}d window${laneSummary ? ` · ${laneSummary}` : ""}`,
+      color: colors.dim,
+    },
+    ...(agedOut > 0
+      ? [
+          {
+            text: ` ${agedOut} accepted just aged out of the window`,
+            color: colors.amber,
+          },
+        ]
+      : []),
+  ];
+}
+function panelRows(title: string, content: string[], width: number): string[] {
+  const rule = "─".repeat(Math.max(0, width - title.length - 2));
+  return [`${colors.accent} ${title} ${rule}${reset}`, ...content.map((line) => ` ${line}`)];
+}
+function styleOverviewRow(row: { text: string; color: string }): string {
+  return row.text.includes("\x1b[") ? row.text : `${row.color}${row.text}${reset}`;
+}
+function alignedTimelineAxis(plotWidth: number): string {
+  const labels = ["aged out", "24d window", "now"];
+  const chars = Array.from({ length: plotWidth }, () => " ");
+  const positions = [
+    0,
+    Math.max(labels[0].length + 1, Math.floor((plotWidth - labels[1].length) / 2)),
+    Math.max(0, plotWidth - labels[2].length),
+  ];
+  for (const [index, label] of labels.entries()) {
+    const position = Math.min(positions[index], plotWidth - label.length);
+    for (const [offset, char] of [...label].entries()) {
+      if (position + offset >= 0 && position + offset < chars.length)
+        chars[position + offset] = char;
+    }
+  }
+  return chars.join("");
+}
+function renderOverviewBody(
+  state: ViewState,
+  width: number,
+  height: number,
+  now: number,
+): string[] {
+  const lines: string[] = [];
+  const add = (text: unknown, color = colors.white) => lines.push(cell(text, width, color));
+  const addSection = (title: string, color = colors.accent) => {
+    const label = ` ${title.toUpperCase()} `;
+    add(`${label}${"─".repeat(Math.max(0, width - label.length))}`, color);
+  };
+  const snapshot = state.overview;
+  if (!snapshot) {
+    add(
+      state.busy ? `${spinner(now)} Loading your challenges...` : "Waiting for challenges...",
+      colors.white,
+    );
+    add("q exit", colors.dim);
+    return lines;
+  }
+  const challenges = snapshot.challenges;
+  const activeStatuses = new Set([
+    "draft",
+    "submitted",
+    "pending_review",
+    "revision_requested",
+    "finalizing_review",
+  ]);
+  const active = challenges.filter((challenge) =>
+    activeStatuses.has(challenge.status.toLowerCase()),
+  ).length;
+  const accepted = challenges.filter((challenge) =>
+    ["accepted", "approved", "finalized"].includes(challenge.status.toLowerCase()),
+  ).length;
+  const attention = challenges.filter((challenge) => {
+    const value = challenge.status.toLowerCase();
+    return value.includes("reject") || value.includes("revision") || value.includes("fail");
+  }).length;
+  const tokenToneColor = snapshot.tokens.error
+    ? colors.red
+    : tokenTone(snapshot.tokens.balance, snapshot.tokens.cap);
+  const tier = tokenTier(snapshot.tokens.tierName);
+  add(
+    ` HOME · ${challenges.length} visible · updated ${relativeTime(snapshot.fetchedAt, now)}`,
+    colors.dim,
+  );
+  addSection("Summary", colors.blue);
+  const visibleSummary =
+    snapshot.totalChallenges === challenges.length
+      ? `${challenges.length} challenges`
+      : `${challenges.length}/${snapshot.totalChallenges} shown`;
+  lines.push(
+    `${colors.white} ${visibleSummary}${reset}`
+      + `${accepted > 0 ? colors.green : colors.muted} · ${accepted} accepted${reset}`
+      + `${active > 0 ? colors.blue : colors.muted} · ${active} active${reset}`
+      + `${attention > 0 ? colors.amber : colors.green} · ${attention} attention${reset}`,
+  );
+
+  const wide = width >= 100 && height >= 32;
+  const panelContentWidth = Math.max(1, width - 1);
+  const acceptedTimeline = renderAcceptedTimeline(
+    snapshot.acceptedTimeline,
+    snapshot.tokens.acceptedInWindow,
+    wide ? panelContentWidth : width,
+  );
+  const nextTier = renderNextTierDetails(snapshot.tokens);
+  const account: string[] = [`${colors.amber}BALANCE${reset}`];
+  if (snapshot.tokens.error) {
+    account.push(`${colors.red}Tokens unavailable: ${snapshot.tokens.error}${reset}`);
+  } else {
+    account.push(
+      `${tokenToneColor}Balance  ${tokenAmount(snapshot.tokens.balance)} / ${tokenAmount(snapshot.tokens.cap)}  ${tokenUsage(snapshot.tokens.balance, snapshot.tokens.cap)} · drip ${nextTokenDrip(snapshot.tokens.nextDripAt, now)}${reset}`,
+    );
+    account.push(`${tier.color}${renderTierDetails(snapshot.tokens)}${reset}`);
+    if (nextTier) account.push(`${tier.color}Next ${nextTier}${reset}`);
+  }
+  if (
+    !snapshot.tokens.revisionError
+    && snapshot.tokens.revisionTokenBalance !== null
+    && snapshot.tokens.revisionTokenBalance > 0
+  ) {
+    account.push(
+      `${colors.purple}Revision tickets: ${tokenAmount(snapshot.tokens.revisionTokenBalance)}${reset}`,
+    );
+  }
+  account.push("", `${colors.green}ACCEPTANCE${reset}`);
+  if (acceptedTimeline.length > 0) {
+    if (wide) account.push(...acceptedTimeline.map(styleOverviewRow));
+    else
+      account.push(
+        `Accepted  last ${snapshot.acceptedTimeline?.windowDays ?? "—"}d · ${tokenAmount(snapshot.tokens.acceptedInWindow)} accepted · ${Math.max(0, (snapshot.acceptedTimeline?.marks.length ?? 0) - (snapshot.tokens.acceptedInWindow ?? 0))} aged out`,
+      );
+  } else if (!snapshot.tokens.error) {
+    account.push(renderAcceptedDetails(snapshot.tokens));
+  }
+
+  const prestige: string[] = [
+    `${colors.purple}PRESTIGE${reset}`,
+    ...(snapshot.elo.available
+      ? renderEloDetails(snapshot.elo, now).map(
+          (line, index) => `${index === 0 ? colors.white : colors.dim}${line}${reset}`,
+        )
+      : [`${colors.dim}${snapshot.elo.note}${reset}`]),
+  ];
+  const prestigeChart = renderPrestigeUsageChart(
+    snapshot.elo,
+    now,
+    wide ? panelContentWidth : width,
+  );
+  if (prestigeChart.length > 0) {
+    if (wide) prestige.push(...prestigeChart.map(styleOverviewRow));
+    else {
+      const hours = Math.max(1, Math.round((snapshot.elo.usage.binMs ?? 21_600_000) / 3_600_000));
+      prestige.push(
+        `Usage  ${timelineBars(snapshot.elo.usage.bins, Math.max(0, ...snapshot.elo.usage.bins), 1)} · ${hours}h bins`,
+      );
+    }
+  }
+
+  if (wide) {
+    lines.push(...panelRows("ACCOUNT", [...account, ...prestige], width));
+  } else {
+    addSection("Account", colors.accent);
+    add(" BALANCE", colors.amber);
+    if (snapshot.tokens.error) add(` Tokens unavailable: ${snapshot.tokens.error}`, colors.red);
+    else {
+      add(
+        ` Balance  ${tokenAmount(snapshot.tokens.balance)} / ${tokenAmount(snapshot.tokens.cap)}  ${tokenUsage(snapshot.tokens.balance, snapshot.tokens.cap)} · next drip ${nextTokenDrip(snapshot.tokens.nextDripAt, now)}`,
+        tokenToneColor,
+      );
+      add(` ${renderTierDetails(snapshot.tokens)}`, tier.color);
+      if (nextTier) add(` Next ${nextTier}`, tier.color);
+    }
+    if (
+      !snapshot.tokens.revisionError
+      && snapshot.tokens.revisionTokenBalance !== null
+      && snapshot.tokens.revisionTokenBalance > 0
+    )
+      add(` Revision tickets: ${tokenAmount(snapshot.tokens.revisionTokenBalance)}`, colors.purple);
+    add(" ACCEPTANCE", colors.green);
+    if (acceptedTimeline.length > 0) {
+      const acceptedCount = tokenAmount(snapshot.tokens.acceptedInWindow);
+      const agedOutCount = Math.max(
+        0,
+        (snapshot.acceptedTimeline?.marks.length ?? 0) - (snapshot.tokens.acceptedInWindow ?? 0),
+      );
+      lines.push(
+        ` ${colors.dim}Accepted · last ${snapshot.acceptedTimeline?.windowDays ?? "—"}d · ${colors.green}${acceptedCount} accepted${reset} · ${colors.dim}${agedOutCount} aged out${reset}`,
+      );
+    } else if (!snapshot.tokens.error)
+      add(` ${renderAcceptedDetails(snapshot.tokens)}`, colors.white);
+
+    add(" PRESTIGE", colors.purple);
+    for (const line of prestige) if (!line.includes("PRESTIGE")) lines.push(` ${line}`);
+  }
+
+  addSection("Challenges");
+  add(` ${state.busy ? `${spinner(now)} ` : ""}Select a challenge to monitor`, colors.white);
+  if (state.error) add(`! ${state.error}`, colors.red);
+  if (challenges.length === 0) {
+    add("No challenges found for this account.", colors.dim);
+    add("q exit  r refresh", colors.accent);
+    return lines;
+  }
+  const selectedIndex = Math.max(0, Math.min(state.overviewSelected, challenges.length - 1));
+  const footerLines = 1;
+  const detailLines = 3;
+  const listRoom = Math.max(1, height - lines.length - footerLines - detailLines);
+  const maxStart = Math.max(0, challenges.length - listRoom);
+  const start = Math.max(0, Math.min(selectedIndex - Math.floor(listRoom / 2), maxStart));
+  if (start > 0) add(`  ↑ ${start} more above`, colors.dim);
+  const titleWidth = Math.max(14, Math.min(42, Math.floor(width * 0.42)));
+  const statusWidth = Math.min(12, Math.max(8, Math.floor(width * 0.18)));
+  const runWidth = Math.max(12, width - titleWidth - statusWidth - 10);
+  for (const [offset, challenge] of challenges.slice(start, start + listRoom).entries()) {
+    const index = start + offset;
+    const selected = index === selectedIndex;
+    const status = overviewState(challenge.status);
+    const meta = `${overviewRunCount(challenge)} · ${relativeTime(challenge.lastActivityAt, now)}`;
+    add(
+      ` ${selected ? "▸" : " "} ${fit(challenge.title, titleWidth)} ${cell(status.label, statusWidth, status.color)} ${fit(meta, runWidth)}`,
+      selected ? colors.card : colors.white,
+    );
+  }
+  if (start + listRoom < challenges.length)
+    add(`  ↓ ${challenges.length - start - listRoom} more below`, colors.dim);
+  const selected = challenges[selectedIndex];
+  const selectedStatus = overviewState(selected.status);
+  add(` SELECTED · ${selected.title}`, colors.accent);
+  add(
+    ` ID ${selected.id} · ${selectedStatus.label} · ${selected.language ?? "language unknown"} · ${selected.difficulty ?? "difficulty unknown"}`,
+    colors.white,
+  );
+  add(
+    ` Enter monitor this challenge · olympus dashboard ${selected.id} · updated ${relativeTime(snapshot.fetchedAt, now)}`,
+    colors.dim,
+  );
+  add(" ↑↓ select   Enter monitor   r refresh   q exit", colors.accent);
+  return lines;
 }
 
 export function renderDashboard(
@@ -168,14 +727,18 @@ export function renderDashboard(
   columns: number,
   rowsCount: number,
   now = Date.now(),
+  info?: { animating: boolean },
 ): string {
   const width = Math.max(1, Math.min(columns - 1, 400)),
     height = Math.max(1, Math.min(rowsCount - 1, 150));
   const lines: string[] = [];
+  const animatedLines = new Set<string>();
   const put = (text: unknown, color = colors.white) => lines.push(cell(text, width, color));
   const snapshot = state.snapshot;
   put(" OLYMPUS", colors.accent);
-  if (snapshot) {
+  if (state.mode === "overview") {
+    lines.push(...renderOverviewBody(state, width, height, now));
+  } else if (snapshot) {
     if (height >= 18) put(` ${snapshot.title}`, colors.white);
     if (height >= 16)
       lines.push(
@@ -185,12 +748,14 @@ export function renderDashboard(
           snapshot.status === "accepted" ? colors.green : colors.blue,
         )
           + cell(
-            `   v${snapshot.version ?? "—"}  ·  read only  ·  updated ${age(snapshot.fetchedAt, now)} ago`,
+            `   v${snapshot.version ?? "—"}  ·  read only  ·  updated ${new Date(snapshot.fetchedAt).toLocaleTimeString()}`,
             width - Math.min(width, 22, snapshot.status.length + 2),
             colors.dim,
           ),
       );
-    const data = dashboardRows(snapshot);
+    if (state.rowCache?.snapshot !== snapshot)
+      state.rowCache = { snapshot, rows: dashboardRows(snapshot) };
+    const data = state.rowCache.rows;
     const current = data.runs.filter((item) => item.freshness === "current");
     const passing = current.filter((item) => ["PASS", "PASS_LEGITIMATE"].includes(item.verdict));
     const running = current.filter((item) =>
@@ -231,12 +796,11 @@ export function renderDashboard(
       state.selected[i] = Math.max(0, Math.min(state.selected[i] ?? 0, items.length - 1));
     });
     const dense = height < 35 || width < 80;
-    const tileHeight = dense ? 1 : 2;
+    const tileHeight = dense ? 1 : 3;
     const cols = Math.max(1, Math.floor((width + 2) / (dense ? (width < 60 ? 28 : 25) : 28)));
-    const footerSize =
-      (height >= 5 ? 1 : 0)
-      + (height >= 18 ? 1 : 0)
-      + (height >= 18 && readinessKnown && blockers.length > 0 ? 1 : 0);
+    const showBudget = height >= 18 && budget?.data?.enabled === true;
+    const showReady = height >= 18 && readinessKnown?.canSubmit === true;
+    const footerSize = (height >= 5 ? 1 : 0) + Number(showBudget) + Number(showReady);
     const preparation = data.checks.filter(
       (item) => item.key.startsWith("stage:") || item.key === "scope" || item.key === "image",
     );
@@ -282,24 +846,42 @@ export function renderDashboard(
       const start = 0;
       const focused = state.section === group.section && group.items.includes(selectedItem);
       const groupStart = lines.length;
-      const heading = ` ${focused ? "▸ " : ""}${group.title}${group.items.length > capacity ? `  ${start + 1}–${Math.min(start + capacity, group.items.length)} / ${group.items.length}` : ""} `;
-      put(`╭─${heading}${"─".repeat(Math.max(0, width - heading.length - 3))}╮`, colors.accent);
+      const heading = ` ${focused ? "▸ " : "  "}${group.title} · ${group.items.length}${group.items.length > capacity ? `  ${start + 1}–${Math.min(start + capacity, group.items.length)} / ${group.items.length}` : ""} `;
+      put(
+        `${heading}${"─".repeat(Math.max(0, width - heading.length))}`,
+        focused ? colors.accent : colors.dim,
+      );
       const tileWidth = Math.floor((width - (cols - 1) * 3) / cols);
       for (let r = 0; r < rowCount; r++) {
         for (let lineIndex = 0; lineIndex < tileHeight; lineIndex++) {
           let line = "";
+          let lineAnimates = false;
           for (let c = 0; c < cols; c++) {
             const item = group.items[start + r * cols + c];
+            const badgeWidth = dense
+              ? Math.min(Math.max(0, tileWidth - 2), 10)
+              : Math.min(Math.max(0, tileWidth - 3), 10);
+            if (
+              item
+              && (dense || lineIndex === Math.floor(tileHeight / 2))
+              && badgeWidth > 0
+              && animated(item)
+            )
+              lineAnimates = true;
             line += renderTile({
               item,
               tileWidth,
               dense,
+              tileHeight,
               lineIndex,
               isSelected: focused && item === selectedItem,
+              now,
             });
             if (c < cols - 1) line += "   ";
           }
-          lines.push(line + cell("", width - tileWidth * cols - (cols - 1) * 3));
+          const renderedLine = line + cell("", width - tileWidth * cols - (cols - 1) * 3);
+          lines.push(renderedLine);
+          if (lineAnimates) animatedLines.add(renderedLine);
         }
       }
       if (focused || (state.section === group.section && original.length === 0)) {
@@ -335,18 +917,15 @@ export function renderDashboard(
     }
     const footer: string[] = [];
     const budgetData = budget?.data;
-    if (height >= 18)
+    if (showBudget)
       footer.push(
         cell(
-          ` LOCAL BUDGET ${budgetData?.enabled === false ? "DISABLED" : budgetData ? `${num(budgetData.remaining)} LEFT  /  ${num(budgetData.spent)} SPENT  /  ${num(budgetData.reserved)} RESERVED` : "UNAVAILABLE"}  |  ${snapshot.id}`,
+          ` LOCAL BUDGET ${num(budgetData.remaining)} LEFT  /  ${num(budgetData.spent)} SPENT  /  ${num(budgetData.reserved)} RESERVED`,
           width,
           colors.dim,
         ),
       );
-    if (height >= 18 && readinessKnown && blockers.length > 0)
-      footer.push(
-        cell(` BLOCKED: ${blockers.map((item) => item.label).join(", ")}`, width, colors.red),
-      );
+    if (showReady) footer.push(cell(" READY TO SUBMIT", width, colors.green));
     if (height >= 5)
       footer.push(
         cell(
@@ -354,7 +933,7 @@ export function renderDashboard(
             ? " PgUp/PgDn details · Enter close · q exit"
             : width < 95
               ? " Tab/↑↓ select · Enter info · q exit"
-              : " q exit  r refresh  Tab section  arrows select  Enter details  h history  PgUp/PgDn page",
+              : " q exit  r refresh  Tab section  arrows select  Enter details  b overview  h history  PgUp/PgDn page",
           width,
           colors.accent,
         ),
@@ -380,12 +959,15 @@ export function renderDashboard(
     lines.push(...details, ...footer);
   } else {
     put("");
-    put("Connecting to challenge...", colors.white);
-    put("q / Ctrl-C exit | r refresh", colors.dim);
+    put(
+      state.busy ? `${spinner(now)} Connecting to challenge...` : "Waiting for challenge · r retry",
+      colors.white,
+    );
+    if (state.busy) animatedLines.add(lines[lines.length - 1]);
+    put("q exit · r refresh · b overview", colors.dim);
   }
   while (lines.length < height) put("");
-  return `\x1b[H${lines
-    .slice(0, height)
-    .map((line) => `${line + reset}\x1b[K`)
-    .join("\r\n")}\x1b[J`;
+  const visibleLines = lines.slice(0, height);
+  if (info) info.animating = visibleLines.some((line) => animatedLines.has(line));
+  return `\x1b[H${visibleLines.map((line) => `${line + reset}\x1b[K`).join("\r\n")}\x1b[J`;
 }

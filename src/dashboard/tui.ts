@@ -1,9 +1,34 @@
+import { createLogUpdate } from "log-update";
 import { emitKeypressEvents } from "node:readline";
 import { renderDashboard } from "./ui.ts";
-import { clean, dashboardRows, observedChanges, type Snapshot } from "./data.ts";
+import {
+  clean,
+  dashboardRows,
+  observedChanges,
+  type OverviewSnapshot,
+  type Snapshot,
+} from "./data.ts";
+
+export type DashboardLoaders = {
+  loadOverview: (
+    previous: OverviewSnapshot | undefined,
+    signal: AbortSignal,
+  ) => Promise<OverviewSnapshot>;
+  loadChallenge: (
+    id: string,
+    previous: Snapshot | undefined,
+    signal: AbortSignal,
+  ) => Promise<Snapshot>;
+  initialId?: string;
+};
 
 export type ViewState = {
+  mode: "overview" | "challenge";
+  overview?: OverviewSnapshot;
+  overviewSelected: number;
+  selectedChallengeId?: string;
   snapshot?: Snapshot;
+  rowCache?: { snapshot: Snapshot; rows: ReturnType<typeof dashboardRows> };
   error?: string;
   busy: boolean;
   polls: number;
@@ -18,11 +43,11 @@ export type ViewState = {
   events: string[];
 };
 
-export async function runDashboard(
-  load: (previous: Snapshot | undefined, signal: AbortSignal) => Promise<Snapshot>,
-  intervalMs: number,
-): Promise<void> {
+export async function runDashboard(loaders: DashboardLoaders, intervalMs: number): Promise<void> {
   const state: ViewState = {
+    mode: loaders.initialId ? "challenge" : "overview",
+    overviewSelected: 0,
+    selectedChallengeId: loaders.initialId,
     busy: false,
     polls: 0,
     nextAt: Date.now(),
@@ -35,7 +60,8 @@ export async function runDashboard(
     failures = 0,
     pending = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let redraw: ReturnType<typeof setInterval> | undefined;
+  let animationTimer: ReturnType<typeof setTimeout> | undefined;
+  let paintRequest: ReturnType<typeof setImmediate> | undefined;
   let active: AbortController | undefined;
   const wasRaw = process.stdin.isRaw;
   const wasFlowing = process.stdin.readableFlowing === true;
@@ -43,17 +69,39 @@ export async function runDashboard(
   const done = new Promise<void>((resolve) => {
     finish = resolve;
   });
+  const update = createLogUpdate(process.stdout, { showCursor: true });
+  let lastFrame: string | undefined;
+  let lastColumns = 0,
+    lastRows = 0;
+  const flushPaint = () => {
+    paintRequest = undefined;
+    clearTimeout(animationTimer);
+    animationTimer = undefined;
+    if (stopped) return;
+    const columns = process.stdout.columns || 80;
+    const rows = process.stdout.rows || 24;
+    const info = { animating: false };
+    const frame = renderDashboard(state, columns, rows, Date.now(), info)
+      // eslint-disable-next-line no-control-regex -- Strip terminal escapes for width measurement.
+      .replaceAll(/\x1b\[(?:H|K|J)/g, "")
+      .replaceAll("\r\n", "\n");
+    if (frame !== lastFrame || columns !== lastColumns || rows !== lastRows) {
+      update(frame);
+      lastFrame = frame;
+      lastColumns = columns;
+      lastRows = rows;
+    }
+    if (info.animating) animationTimer = setTimeout(paint, 300);
+  };
   const paint = () => {
-    if (!stopped)
-      process.stdout.write(
-        renderDashboard(state, process.stdout.columns || 80, process.stdout.rows || 24),
-      );
+    if (!stopped && !paintRequest) paintRequest = setImmediate(flushPaint);
   };
   const stop = () => {
     if (stopped) return;
     stopped = true;
     clearTimeout(timer);
-    clearInterval(redraw);
+    clearTimeout(animationTimer);
+    clearImmediate(paintRequest);
     active?.abort();
     finish();
   };
@@ -70,15 +118,29 @@ export async function runDashboard(
     const timeout = setTimeout(() => active?.abort(), 15000);
     paint();
     try {
-      const snapshot = await load(state.snapshot, active.signal);
+      const snapshot =
+        state.mode === "overview"
+          ? await loaders.loadOverview(state.overview, active.signal)
+          : await loaders.loadChallenge(state.selectedChallengeId!, state.snapshot, active.signal);
       if (stopped) return;
-      for (const event of observedChanges(state.snapshot, snapshot))
-        state.events.push(`${new Date().toLocaleTimeString()} ${event}`);
-      state.events = state.events.slice(-100);
-      state.snapshot = snapshot;
+      if (state.mode === "overview") {
+        state.overview = snapshot as OverviewSnapshot;
+        state.overviewSelected = Math.max(
+          0,
+          Math.min(state.overviewSelected, state.overview.challenges.length - 1),
+        );
+      } else {
+        const challengeSnapshot = snapshot as Snapshot;
+        for (const event of observedChanges(state.snapshot, challengeSnapshot))
+          state.events.push(`${new Date().toLocaleTimeString()} ${event}`);
+        state.events = state.events.slice(-100);
+        state.snapshot = challengeSnapshot;
+        state.error = undefined;
+        const partial = Object.values(challengeSnapshot.sources).some((source) => source.error);
+        failures = partial ? failures + 1 : 0;
+      }
       state.error = undefined;
-      const partial = Object.values(snapshot.sources).some((source) => source.error);
-      failures = partial ? failures + 1 : 0;
+      if (state.mode === "overview") failures = 0;
     } catch (error) {
       if (!stopped) {
         state.error = clean(error instanceof Error ? error.message : error);
@@ -98,10 +160,60 @@ export async function runDashboard(
       }
     }
   };
+  const switchToChallenge = () => {
+    const selected = state.overview?.challenges[state.overviewSelected];
+    if (!selected) return;
+    state.mode = "challenge";
+    state.selectedChallengeId = selected.id;
+    state.snapshot = undefined;
+    state.rowCache = undefined;
+    state.error = undefined;
+    state.details = false;
+    state.detailOffset = 0;
+    active?.abort();
+    pending = true;
+    void refresh();
+    paint();
+  };
+  const switchToOverview = () => {
+    if (!state.overview) return;
+    state.mode = "overview";
+    state.snapshot = undefined;
+    state.rowCache = undefined;
+    state.error = undefined;
+    state.details = false;
+    state.detailOffset = 0;
+    active?.abort();
+    pending = true;
+    void refresh();
+    paint();
+  };
   const keypress = (_: string, key: { name?: string; ctrl?: boolean }) => {
     if (key?.name === "q" || (key?.ctrl && key.name === "c")) return stop();
     if (key?.name === "r") {
       void refresh();
+      return;
+    }
+    if (state.mode === "overview") {
+      const size = state.overview?.challenges.length ?? 0;
+      const delta =
+        key?.name === "down"
+          ? 1
+          : key?.name === "up"
+            ? -1
+            : key?.name === "pagedown"
+              ? 10
+              : key?.name === "pageup"
+                ? -10
+                : 0;
+      if (delta !== 0 && size > 0)
+        state.overviewSelected = Math.max(0, Math.min(size - 1, state.overviewSelected + delta));
+      if (key?.name === "return") switchToChallenge();
+      paint();
+      return;
+    }
+    if ((key?.name === "b" || key?.name === "escape") && state.overview) {
+      switchToOverview();
       return;
     }
     if (state.details && ["pageup", "pagedown"].includes(key?.name ?? "")) {
@@ -121,7 +233,10 @@ export async function runDashboard(
       state.selected[1] = 0;
     }
     if (state.snapshot) {
-      const rows = dashboardRows(state.snapshot);
+      const rows =
+        state.rowCache?.snapshot === state.snapshot
+          ? state.rowCache.rows
+          : dashboardRows(state.snapshot);
       const size = [
         rows.checks,
         state.history ? rows.runs : rows.runs.filter((item) => item.freshness === "current"),
@@ -154,11 +269,11 @@ export async function runDashboard(
     process.on("SIGTERM", stop);
     process.on("SIGHUP", stop);
     process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J");
-    redraw = setInterval(paint, 1000);
     void refresh();
     await done;
   } finally {
     stop();
+    update.done();
     process.stdin.off("keypress", keypress);
     process.stdout.off("resize", paint);
     process.off("SIGINT", stop);

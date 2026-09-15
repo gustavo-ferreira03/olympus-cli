@@ -1,6 +1,7 @@
 import { api, localBudgetStatus } from "../platform/convex.ts";
 import { getDynamicCheckEntries, formatDynamicCheckLabel } from "../core/model.ts";
 import { sanitizeDiagnostic } from "../shared/errors.ts";
+import { summarizeTokenUsage, type TokenUsageSnapshot } from "../core/token-telemetry.ts";
 
 export type Source = {
   data: any;
@@ -16,6 +17,101 @@ export type Snapshot = {
   fetchedAt: number;
   sources: Record<string, Source>;
 };
+export type OverviewChallenge = {
+  id: string;
+  title: string;
+  status: string;
+  archived: boolean;
+  version: number | null;
+  versionId: string | null;
+  language: string | null;
+  difficulty: string | null;
+  category: string | null;
+  lastActivityAt: number | null;
+  totalRuns: number | null;
+  passedRuns: number | null;
+  finalized: boolean | null;
+  reviewState: string | null;
+};
+export type OverviewSnapshot = {
+  fetchedAt: number;
+  totalChallenges: number;
+  archivedHidden: number;
+  filters: {
+    includeArchived: boolean;
+    status: string | null;
+    language: string | null;
+    difficulty: string | null;
+    category: string | null;
+  };
+  availableFilters: {
+    status: string[];
+    language: string[];
+    difficulty: string[];
+    category: string[];
+  };
+  challenges: OverviewChallenge[];
+  tokens: {
+    balance: number | null;
+    cap: number | null;
+    tierName: string | null;
+    nextDripAt: number | null;
+    acceptedInWindow: number | null;
+    olympusAcceptedInWindow: number | null;
+    lifetimeAccepted: number | null;
+    pendingDrip: number | null;
+    dripPaused: boolean | null;
+    dripUnlimited: boolean | null;
+    nextTierRequirement: {
+      tierName: string | null;
+      requiredAccepted: number | null;
+      requiredOlympus: number | null;
+      discounted: boolean | null;
+    } | null;
+    tierAcceptanceBonusUsd: number | null;
+    tierDripAmount: number | null;
+    tierWindowDays: number | null;
+    generalTokenBalance: number | null;
+    revisionTokenBalance: number | null;
+    revisionError: string | null;
+    usage: TokenUsageSnapshot;
+    error: string | null;
+  };
+  elo: {
+    value: number | null;
+    projectedValue: number | null;
+    rank: number | null;
+    seatCutElo: number | null;
+    isMember: boolean | null;
+    acceptedAtRotation: number | null;
+    acceptedNow: number | null;
+    windowDays: number | null;
+    nextRotationAt: number | null;
+    timelineNow: number | null;
+    agedOutBufferMs: number | null;
+    agingOutByRotation: number | null;
+    usage: {
+      binMs: number | null;
+      bins: number[];
+    };
+    marks: Array<{
+      at: number;
+      countsAtRotation: boolean;
+      inWindow: boolean;
+    }>;
+    available: boolean;
+    note: string;
+  };
+  acceptedTimeline: {
+    windowDays: number;
+    bufferDays: number;
+    now: number;
+    marks: Array<{
+      at: number;
+      lane: string;
+    }>;
+  } | null;
+};
 export type Row = {
   key: string;
   label: string;
@@ -24,11 +120,276 @@ export type Row = {
   freshness: string;
   detail: string;
   batch?: string;
+  progress?: number;
 };
 export const clean = (value: unknown): string =>
   sanitizeDiagnostic(String(value ?? "")).replaceAll(/[\r\n\t]/g, " ");
 const errorText = (error: unknown) =>
   clean(error instanceof Error ? error.message : error).slice(0, 300);
+const numberValue = (value: unknown): number | null => {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value)))
+    return Number(value);
+  return null;
+};
+const latestActivity = (problem: any): number | null => {
+  const timestamps = [
+    problem.lastDraftEditedAt,
+    problem.lastReviewedAt,
+    problem.lastSubmittedAt,
+    problem.currentStatusEnteredAt,
+    problem._creationTime,
+  ].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return timestamps.length > 0 ? Math.max(...timestamps) : null;
+};
+const runSummary = (problem: any): Pick<OverviewChallenge, "totalRuns" | "passedRuns"> => {
+  const stats = problem.aggStats;
+  return {
+    totalRuns: typeof stats?.totalRuns === "number" ? stats.totalRuns : null,
+    passedRuns: typeof stats?.passedRuns === "number" ? stats.passedRuns : null,
+  };
+};
+export type DashboardOverviewFilters = {
+  includeArchived?: boolean;
+  status?: string;
+  language?: string;
+  difficulty?: string;
+  category?: string;
+};
+const normalizedFilter = (value: string | undefined): string | null => {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && normalized !== "all" ? normalized : null;
+};
+const matchesFilter = (value: string | null, expected: string | null): boolean =>
+  expected === null || value?.toLowerCase() === expected;
+export async function readDashboardOverview(
+  client: any,
+  requested: DashboardOverviewFilters = {},
+): Promise<OverviewSnapshot> {
+  const prestigeRequest = (async () => {
+    try {
+      return await client.query(api.tierRotation.getMyPrestigeOutlook, {});
+    } catch (error) {
+      return { error: errorText(error) };
+    }
+  })();
+  const [problems, balance, revisionTokens, prestige, transactions, tierTimeline] =
+    await Promise.all([
+      client.query(api.problems.listByUser, {}),
+      client.query(api.contributorTokens.getBalance, {}).catch((error: unknown) => ({
+        error: errorText(error),
+      })),
+      client.query(api.contributorTokens.getAllRevisionTokens, {}).catch((error: unknown) => ({
+        error: errorText(error),
+      })),
+      prestigeRequest,
+      client.query(api.contributorTokens.getTransactions, {}).catch((error: unknown) => ({
+        error: errorText(error),
+      })),
+      client.query(api.contributorTokens.getTierWindowTimeline, {}).catch((error: unknown) => ({
+        error: errorText(error),
+      })),
+    ]);
+  if (!Array.isArray(problems)) throw new Error("Invalid challenge list response");
+  const allChallenges = problems
+    .filter((problem: any) => problem && typeof problem === "object" && problem._id != null)
+    .map((problem: any): OverviewChallenge => {
+      const latest = problem.latestVersion;
+      const summary = runSummary(problem);
+      const status = clean(problem.status ?? "unknown");
+      return {
+        id: String(problem._id),
+        title: clean(problem.title ?? "Untitled challenge"),
+        status,
+        archived: problem.archived === true || status.toLowerCase() === "archived",
+        version: typeof latest?.version === "number" ? latest.version : null,
+        versionId: latest?._id == null ? null : String(latest._id),
+        language: clean(latest?.language ?? problem.language) || null,
+        difficulty: clean(latest?.difficulty ?? problem.difficulty) || null,
+        category: clean(latest?.category ?? problem.category) || null,
+        lastActivityAt: latestActivity(problem),
+        totalRuns: summary.totalRuns,
+        passedRuns: summary.passedRuns,
+        finalized: typeof problem.finalized === "boolean" ? problem.finalized : null,
+        reviewState: clean(latest?.reviewState ?? problem.reviewState) || null,
+      };
+    })
+    .toSorted(
+      (a, b) =>
+        (b.lastActivityAt ?? -1) - (a.lastActivityAt ?? -1)
+        || a.title.localeCompare(b.title, undefined, { sensitivity: "base" })
+        || a.id.localeCompare(b.id),
+    );
+  const filters = {
+    includeArchived: requested.includeArchived === true,
+    status: normalizedFilter(requested.status),
+    language: normalizedFilter(requested.language),
+    difficulty: normalizedFilter(requested.difficulty),
+    category: normalizedFilter(requested.category),
+  };
+  const available = (field: "status" | "language" | "difficulty" | "category") =>
+    allChallenges
+      .map((challenge) => challenge[field])
+      .filter((value): value is string => value !== null)
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .toSorted((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  const challenges = allChallenges.filter(
+    (challenge) =>
+      (filters.includeArchived || !challenge.archived)
+      && matchesFilter(challenge.status, filters.status)
+      && matchesFilter(challenge.language, filters.language)
+      && matchesFilter(challenge.difficulty, filters.difficulty)
+      && matchesFilter(challenge.category, filters.category),
+  );
+  const archivedHidden = allChallenges.filter(
+    (challenge) => challenge.archived && !filters.includeArchived,
+  ).length;
+  const balanceRecord =
+    balance && typeof balance === "object" ? (balance as Record<string, any>) : {};
+  const revisionRecord =
+    revisionTokens && typeof revisionTokens === "object"
+      ? (revisionTokens as Record<string, any>)
+      : {};
+  const prestigeRecord =
+    prestige && typeof prestige === "object" && !Array.isArray(prestige)
+      ? (prestige as Record<string, any>)
+      : {};
+  const balanceError = typeof balanceRecord.error === "string" ? balanceRecord.error : null;
+  const revisionError = typeof revisionRecord.error === "string" ? revisionRecord.error : null;
+  const prestigeError = typeof prestigeRecord.error === "string" ? prestigeRecord.error : null;
+  const tierTimelineRecord =
+    tierTimeline && typeof tierTimeline === "object" && !Array.isArray(tierTimeline)
+      ? (tierTimeline as Record<string, any>)
+      : {};
+  const eloValue = numberValue(prestigeRecord.currentElo);
+  const projectedElo = numberValue(prestigeRecord.projectedElo);
+  const seatCutElo = numberValue(prestigeRecord.seatCutElo);
+  const isMember = typeof prestigeRecord.isMember === "boolean" ? prestigeRecord.isMember : null;
+  const acceptedAtRotation = numberValue(prestigeRecord.acceptedAtRotation);
+  const acceptedNow = numberValue(prestigeRecord.acceptedNow);
+  const windowDays = numberValue(prestigeRecord.windowDays);
+  const nextRotationAt = numberValue(prestigeRecord.nextRotationAt);
+  const timelineNow = numberValue(prestigeRecord.now);
+  const agedOutBufferMs = numberValue(prestigeRecord.agedOutBufferMs);
+  const agingOutByRotation = numberValue(prestigeRecord.agingOutByRotation);
+  const usageRecord =
+    prestigeRecord.usage
+    && typeof prestigeRecord.usage === "object"
+    && !Array.isArray(prestigeRecord.usage)
+      ? prestigeRecord.usage
+      : {};
+  const usageBins = Array.isArray(usageRecord.bins)
+    ? usageRecord.bins
+        .map((value: unknown) => numberValue(value))
+        .filter((value: number | null): value is number => value !== null)
+    : [];
+  const marks = Array.isArray(prestigeRecord.marks)
+    ? prestigeRecord.marks
+        .filter((mark: any) => numberValue(mark?.at) !== null)
+        .map((mark: any) => ({
+          at: numberValue(mark.at)!,
+          countsAtRotation: mark.countsAtRotation === true,
+          inWindow: mark.inWindow === true,
+        }))
+    : [];
+  const revisionTotal = Array.isArray(revisionTokens)
+    ? revisionTokens.reduce((sum: number, item: any) => sum + (numberValue(item?.balance) ?? 0), 0)
+    : null;
+  const nextTierRecord =
+    balanceRecord.nextTierRequirement
+    && typeof balanceRecord.nextTierRequirement === "object"
+    && !Array.isArray(balanceRecord.nextTierRequirement)
+      ? balanceRecord.nextTierRequirement
+      : null;
+  const fetchedAt = Date.now();
+  const usage = summarizeTokenUsage(transactions, fetchedAt);
+  const acceptedTimeline =
+    typeof tierTimelineRecord.windowDays === "number"
+    && typeof tierTimelineRecord.bufferDays === "number"
+    && typeof tierTimelineRecord.now === "number"
+    && Array.isArray(tierTimelineRecord.marks)
+      ? {
+          windowDays: tierTimelineRecord.windowDays,
+          bufferDays: tierTimelineRecord.bufferDays,
+          now: tierTimelineRecord.now,
+          marks: tierTimelineRecord.marks
+            .filter((mark: any) => numberValue(mark?.at) !== null)
+            .map((mark: any) => ({
+              at: numberValue(mark.at)!,
+              lane: clean(mark.lane) || "unknown",
+            })),
+        }
+      : null;
+  return {
+    fetchedAt,
+    totalChallenges: allChallenges.length,
+    archivedHidden,
+    filters,
+    availableFilters: {
+      status: available("status"),
+      language: available("language"),
+      difficulty: available("difficulty"),
+      category: available("category"),
+    },
+    challenges,
+    tokens: {
+      balance: numberValue(balanceRecord.balance),
+      cap: numberValue(balanceRecord.cap),
+      tierName: clean(balanceRecord.tierName) || null,
+      nextDripAt: numberValue(balanceRecord.nextDripAt),
+      acceptedInWindow: numberValue(balanceRecord.acceptedInWindow),
+      olympusAcceptedInWindow: numberValue(balanceRecord.olympusAcceptedInWindow),
+      lifetimeAccepted: numberValue(balanceRecord.lifetimeAccepted),
+      pendingDrip: numberValue(balanceRecord.pendingDrip),
+      dripPaused: typeof balanceRecord.dripPaused === "boolean" ? balanceRecord.dripPaused : null,
+      dripUnlimited:
+        typeof balanceRecord.dripUnlimited === "boolean" ? balanceRecord.dripUnlimited : null,
+      nextTierRequirement: nextTierRecord
+        ? {
+            tierName: clean(nextTierRecord.tierName) || null,
+            requiredAccepted: numberValue(nextTierRecord.requiredAccepted),
+            requiredOlympus: numberValue(nextTierRecord.requiredOlympus),
+            discounted:
+              typeof nextTierRecord.discounted === "boolean" ? nextTierRecord.discounted : null,
+          }
+        : null,
+      tierAcceptanceBonusUsd: numberValue(balanceRecord.tierAcceptanceBonusUsd),
+      tierDripAmount: numberValue(balanceRecord.tierDripAmount),
+      tierWindowDays: numberValue(balanceRecord.tierWindowDays),
+      generalTokenBalance: numberValue(balanceRecord.generalTokenBalance),
+      revisionTokenBalance: numberValue(balanceRecord.revisionTokenBalance) ?? revisionTotal,
+      revisionError,
+      usage,
+      error: balanceError,
+    },
+    elo: {
+      value: eloValue,
+      projectedValue: projectedElo,
+      rank: null,
+      seatCutElo,
+      isMember,
+      acceptedAtRotation,
+      acceptedNow,
+      windowDays,
+      nextRotationAt,
+      timelineNow,
+      agedOutBufferMs,
+      agingOutByRotation,
+      usage: {
+        binMs: numberValue(usageRecord.binMs),
+        bins: usageBins,
+      },
+      marks,
+      available: eloValue !== null,
+      note: prestigeError
+        ? `Olympus prestige ELO unavailable: ${prestigeError}`
+        : eloValue === null
+          ? "Olympus prestige ELO is unavailable"
+          : "Source: tierRotation.getMyPrestigeOutlook",
+    },
+    acceptedTimeline,
+  };
+}
 /** Describe how current a record is, from its `scratched`/`stale` markers. */
 const fresh = (data: any): "scratched" | "current" | "stale" | "unknown" => {
   if (data?.scratched) return "scratched";
@@ -143,12 +504,30 @@ function compactSource(name: string, data: any): any {
         pick(item, ["id", "label", "status", "stale", "detail", "verdict"]),
       ),
     };
-  return pick(
-    data,
-    name === "balance"
-      ? ["balance", "cap", "tokenCap", "generalTokenBalance", "revisionTokenBalance", "tierName"]
-      : ["enabled", "scope", "limit", "spent", "reserved", "remaining"],
-  );
+  if (name === "balance")
+    return {
+      ...pick(data, [
+        "balance",
+        "cap",
+        "tokenCap",
+        "generalTokenBalance",
+        "revisionTokenBalance",
+        "tierName",
+        "tierOrder",
+        "tierWindowDays",
+        "tierDripAmount",
+        "tierAcceptanceBonusUsd",
+        "acceptedInWindow",
+        "olympusAcceptedInWindow",
+        "lifetimeAccepted",
+        "pendingDrip",
+        "dripPaused",
+        "dripUnlimited",
+        "nextDripAt",
+      ]),
+      nextTierRequirement: data.nextTierRequirement,
+    };
+  return pick(data, ["enabled", "scope", "limit", "spent", "reserved", "remaining"]);
 }
 
 export async function readDashboard(
@@ -234,6 +613,13 @@ function row(key: string, label: unknown, item: any): Row {
   return {
     key,
     label: clean(label),
+    progress:
+      typeof item?.progress === "number"
+      && Number.isFinite(item.progress)
+      && item.progress >= 0
+      && item.progress <= 100
+        ? item.progress
+        : undefined,
     status: clean(item?.inFlight ? "running" : (item?.status ?? item?.state ?? "not_run")),
     verdict: clean(verdict),
     freshness: fresh(item),
@@ -259,20 +645,30 @@ type SourceReader = (name: string) => any;
  */
 function precheckRows(source: SourceReader): Row[] {
   const latest = new Map<string, any>();
-  for (const stage of source("prechecks") ?? []) {
+  for (const stage of Array.isArray(source("prechecks")) ? source("prechecks") : []) {
+    if (!stage || typeof stage !== "object") continue;
     const key = String(stage.stageId ?? stage.id ?? stage._id);
     const previous = latest.get(key);
     const stageAt = stage.createdAt ?? stage._creationTime ?? 0;
     const previousAt = previous ? (previous.createdAt ?? previous._creationTime ?? 0) : -1;
     if (!previous || stageAt >= previousAt) latest.set(key, stage);
   }
-  if (latest.size === 0) {
-    const criterion = source("readiness")?.criteria?.find((item: any) => item.id === "prechecks");
-    return [row("stage:summary", "Prechecks", criterion)];
-  }
-  return [...latest].map(([key, stage]) =>
-    row(`stage:${key}`, stage.stageName ?? stage.name ?? key, stage),
+  const criterion = source("readiness")?.criteria?.find((item: any) => item.id === "prechecks");
+  const stageDetails = [...latest.entries()].map(
+    ([key, stage]) =>
+      `${clean(stage.stageName ?? stage.name ?? key)}: ${clean(stage.status ?? "unknown")}${stage.error ? ` — ${clean(stage.error)}` : ""}`,
   );
+  return [
+    row("stage:summary", "Prechecks", {
+      ...criterion,
+      status: criterion?.status ?? "unknown",
+      detail: [
+        criterion?.detail
+          ?? "Precheck readiness unavailable; stage results do not establish freshness.",
+        ...stageDetails,
+      ].join(" | "),
+    }),
+  ];
 }
 
 /** Scope Gate row, merging the in-flight flag over the last recorded verdict. */
@@ -323,7 +719,7 @@ function checkRank(item: Row): number {
 }
 
 /** Titles for the orchestrator review slots. */
-const REVIEW_SLOT_KEYS = ["description", "tests", "solution", "agents", "synthesis"];
+const REVIEW_SLOT_KEYS = ["description", "tests", "solution", "agents"];
 
 /** Verdict text for one orchestrator review slot. */
 function reviewVerdict(key: string, output: any, criterion: any): string | undefined {
