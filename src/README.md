@@ -41,3 +41,19 @@ touching an over-budget function means paying some of it down. Everything
 outside that set is an error and fails the build.
 
 When the count drops, lower `--max-warnings` in `package.json` to match.
+
+## Policy ownership
+
+`core/policy.ts` is the facade for configuration, state-aware decisions and
+`dispatchWithPolicy`. It applies fixed rules, graph authorization and local
+budget reservation in one dispatch path. `core/policy-graph.ts` is its internal
+predicate/transition/confirmation implementation; it does not load a second
+configuration. `core/action-catalog.ts` defines factual operations, not a default
+workflow. Neither missing graph edges nor absent/null rules are inferred.
+
+`platform/convex.ts` supplies account/version scope and transport; it no longer
+owns graph evaluation. `commands/policy.ts` provides configuration and optional
+context through `policy show [id]`. Read-only
+inspection is not an execution permit: paid actions still require the complete
+live preflight and atomic budget reservation. Platform readiness remains a fact,
+not a user-defined policy verdict.

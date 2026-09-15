@@ -19,7 +19,8 @@ Use it to inspect and edit challenges, run prechecks and quality checks, manage 
 - [JSON behavior for agents](#json-behavior-for-agents)
 - [Download a challenge locally](#download-a-challenge-locally)
 - [Create, edit, and version drafts](#create-edit-and-version-drafts)
-- [Guardrails](#guardrails)
+- [Policy](#policy)
+  - [Action graph](#action-graph)
 - [Environment](#environment)
 - [Development](#development)
 
@@ -35,15 +36,13 @@ pnpm run build
 pnpm link --global
 ```
 
-Verify the active CLI:
+Verify the installation:
 
 ```bash
 command -v olympus
 olympus --version
 olympus --help
 ```
-
-The banner should identify `Olympus CLI — Gustavo's Fork`.
 
 ## Get started
 
@@ -77,7 +76,7 @@ olympus auto-review      Auto Review inspection and execution
 olympus contest          Quality-check contests
 olympus runs             Rollout batches, runs, artifacts, and re-evaluation
 olympus tokens           Token balance, usage history, and challenge costs
-olympus policy           Local guardrails
+olympus policy           Policy rules and optional action graph
 olympus dashboard        Read-only terminal dashboard with polling
 olympus schema           JSON command discovery from the running CLI
 ```
@@ -112,7 +111,7 @@ readiness
 description
 ```
 
-Request the complete backend payload only when necessary:
+Request the complete response only when necessary:
 
 ```bash
 olympus problems view <challenge-id> --json --full
@@ -121,16 +120,39 @@ olympus problems view <challenge-id> --json --full
 ## Live terminal dashboard
 
 ```bash
-olympus dashboard <challenge-id>
+olympus dashboard                      # account overview; choose a challenge
+olympus dashboard <challenge-id>       # open one challenge directly
 olympus dashboard <challenge-id> --interval=5
 olympus dashboard <challenge-id> --json
+olympus dashboard --json               # one overview snapshot
 ```
 
-The interactive dashboard follows the latest version and polls automatically (1–300 seconds; default 5). It only reads data: it never starts checks, rollouts, builds, or submissions. Both stdin and stdout must be a TTY; use `--json` for a single snapshot in scripts. Interactive fetch failures retain the last data and retry silently; `--json` retains per-source diagnostics and exits non-zero on partial failure.
+Without an ID, the interactive dashboard shows account metrics and a selectable
+challenge list. Archived challenges are hidden by default. Use
+`--include-archived` to show them, or combine `--status`, `--language`,
+`--difficulty` and `--category` to filter the overview. Filter values are
+case-insensitive; `all` clears a filter. The filter state remains available in
+`--json` output.
 
-Status badges stay abbreviated (`PASS`, `FAIL`, `WARN`); full verdicts remain in details. Auto Review bands appear as `1/3`, `2/3`, and `3/3`. The terminal background is preserved.
+Use Up/Down (or PgUp/PgDn) to select a challenge and Enter to open its live
+monitor. Press `b` or Escape in the monitor to return to the overview; `q` exits
+and `r` refreshes. The overview contains the Home summary, Account information
+and the selectable Challenges list. The detail monitor displays the selected
+challenge state.
 
-Keys: `q` or Ctrl-C exits, `r` refreshes, Tab switches selection between checks, runs and readiness, Up/Down selects an item, and Enter toggles details. PgUp/PgDn moves by ten items, or scrolls the text while details are open. `h` toggles run history. Resize does not stop polling. On very small screens the viewport follows the selected item without changing the section order.
+Colors are emitted only in a TTY; set `NO_COLOR` to disable them.
+
+The account telemetry is also available without opening the TUI:
+
+```bash
+olympus tokens balance --json
+olympus tokens usage --json
+olympus tokens usage --json --from 2026-09-14 --to 2026-09-15
+```
+
+`tokens balance` exposes the current tier, cap, drip, acceptance-window and
+lifetime counters, next-tier requirement, and feature flags. `tokens usage`
+provides grants, spending totals and usage bins for the selected period.
 
 ## Build the version image
 
@@ -167,6 +189,7 @@ Run prechecks:
 
 ```bash
 olympus checks run-prechecks <challenge-id> --json
+olympus checks run-prechecks <challenge-id> --wait --json
 ```
 
 Inspect current state:
@@ -233,6 +256,7 @@ Prefer integrated `--wait`. When separate waiting is useful, always select the i
 olympus checks wait <challenge-id> --job=<job-id> --json
 olympus checks wait <challenge-id> --check=testQuality --json
 olympus checks wait <challenge-id> --checks=verifyTests,testQuality --json
+olympus checks wait-prechecks <challenge-id> --version=<version> --baseline=<stage-baseline> --json
 ```
 
 An unscoped wait watches only active current checks and returns a compact `idle` response when none exist.
@@ -385,7 +409,7 @@ Machine-readable commands follow these rules:
 
 - stdout contains exactly one JSON document;
 - polling progress is suppressed in JSON mode;
-- command exceptions preserve `status`, the text `error`, and guardrail `rule`/details, and add `kind`, `code`, `retryable` and `hint`;
+- command exceptions preserve `status`, the text `error`, and policy `rule`/details, and add `kind`, `code`, `retryable` and `hint`;
 - empty waits return `status: "idle"` instead of historical payloads;
 - null and empty fields are removed from compact responses;
 - large raw payloads require `--full`;
@@ -393,18 +417,10 @@ Machine-readable commands follow these rules:
 - wait commands retry transient connection failures while polling.
 
 Error kinds include `usage`, `auth`, `permission`, `not_found`, `rate_limit`,
-`network`, `config`, `policy`, `budget` and `unknown`. Classification uses typed
-errors, known codes and HTTP statuses, not message wording. Unknown failures
-have `retryable: null`. A transient error is not proof that a paid request was
-rejected: inspect remote state before retrying. Existing exit codes and explicit
-`--json` behavior are unchanged; schema is always JSON except its help.
+`network`, `config`, `policy`, `budget` and `unknown`. Unknown failures use
+`retryable: null`. A transient error should be inspected before retrying a paid
+request. Existing exit codes and `--json` behavior remain stable.
 
-Diagnostic stderr and top-level error messages are stripped of terminal control,
-bidi and zero-width characters. Artifact content and successful stdout data are
-not rewritten. Sanitization is not a prompt-injection defense for ordinary prose.
-Version checks are skipped for JSON output and help, and cancelled on completion.
-
-This removes the need for ad-hoc `sleep`, polling loops, `jq`, grep, head, or tail in normal agent workflows.
 
 ## Download a challenge locally
 
@@ -437,47 +453,78 @@ Submission remains explicit:
 olympus problems submit <challenge-id> --json
 ```
 
-## Guardrails
+## Policy
 
-`olympus policy show --json` shows and validates the guardrails.
-`olympus policy init` explicitly creates `~/.shipd/olympus/policy.yml` with the suggested rules below, without overwriting it.
-`policy init` also creates `policy.schema.json` beside the `.yml` file. The
-`# yaml-language-server: $schema=./policy.schema.json` directive enables autocomplete
-and validation in editors with YAML Language Server support (such as VS Code with
-the Red Hat YAML extension).
+Policies define permissions, limits and optional action-graph requirements.
+Validation occurs when the policy is loaded; decisions are evaluated when the
+corresponding command runs.
 
-`olympus policy edit` opens a staged copy in `$VISUAL`, `$EDITOR`, or `vi` on a
-TTY (editor arguments such as `code --wait` are supported), validates it, then
-saves it. Editing requires `flock` (util-linux); its OS lock is released on process exit,
-including crashes. The `.policy-edit.flock` file is persistent, not a stale lock;
-do not delete it while editing. For non-interactive edits, use YAML-typed values or `null`:
+`policy show` displays configured rules and graph nodes. Use `--full` to expand
+predicates, arguments and notes. With a challenge ID, it also displays the
+current state relevant to those rules. Colors are TTY-only and respect
+`NO_COLOR`.
+
+```bash
+olympus policy show                        # human rules and graph, no API calls
+olympus policy show --full                 # expanded human policy definitions
+olympus policy show <challenge-id>         # current blockers and suggestions
+olympus policy show --json                 # effective configuration, no API calls
+olympus policy show <challenge-id> --json  # configuration plus state-aware decisions
+olympus policy show <challenge-id> --full --json  # also include canonical state
+```
+
+For agent-authored policies, discover the contract instead of guessing field names
+or graph behavior:
+
+```bash
+olympus schema policy --json                # policy schema, action catalog and examples
+olympus schema --json                       # same contract plus the full CLI schema
+olympus policy init --json                  # optional human/editor starter
+olympus policy edit <key> <yaml-value> --json  # typed single-key update
+```
+
+The `policyAuthoring` object returned by `olympus schema policy` is the source of
+truth for policy creation. It contains the JSON Schema, canonical root keys,
+all governable actions with their CLI commands and configurable arguments,
+valid predicate operators, omission/null semantics, and minimal YAML examples.
+Agents should select only actions from `actionCatalog`, write only schema-valid
+YAML, and keep `graph: null` unless they intentionally declare sequencing. The
+CLI does not infer edges, gates, defaults, or a start action from omitted fields.
+
+Contextual inspection uses the same core decision evaluator as dispatch. Check
+allowlists, request-size limits, passing-check protection and graph requirements
+appear together. `executionPreflight: required` distinguishes inspection from
+execution permission. Exact arguments, cross-version capacity, live costs, balance,
+budget reservations and platform prerequisites are checked at execution time.
+The platform's `canSubmit` fact is reported separately from policy decisions.
+
+`policy edit` validates the resulting file before saving it. For non-interactive
+edits, provide a dotted key and a YAML-typed value. Use `null` to disable an
+optional rule:
 
 ```bash
 olympus policy edit tokens.challenge_budget 100 --json
 olympus policy edit tokens.min_remaining_balance 20 --json
 ```
 
-`--json` requires a key and value. Comments and other settings are preserved;
-a missing file starts with no rules. Existing disabled settings are not
-automatically enabled.
+A rejected operation reports the policy rule and structured details. It does not
+start the operation.
 
-A minimum-balance rejection reports the required balance, shortfall, and an
-estimated wait/retry time using the account's reported next drip and current
-hourly tier rate. This is not a guarantee: spending, tier/cap changes, pauses,
-and server timing can change it. Unknown or stale schedules report an unknown
-wait; a required balance above the current cap cannot be reached by drip alone.
-The CLI does not wait, refresh tokens, or submit a paid operation on rejection.
+`checks.allow_rerun_passing: false` blocks a completed, current (`stale: false`)
+PASS check or precheck bundle before paid dispatch. Stale results remain eligible
+for rerun; unreadable or ambiguous state is rejected.
 
-Every omitted or explicit `null` rule is disabled. Missing or `null` groups disable all rules inside them, including `runs.re_evaluation` and `runs.max_runs`. A missing, empty, or `null` policy file leaves every local policy guard inactive; malformed values and unknown keys still fail validation. Platform eligibility and basic request validation remain independent of local policy.
-
-Explicit `false` values for `allow_*` and re-evaluation `enabled` prohibit the operation; `true` permits it. `require_explicit_selection: true` requires selection, while `false` does not. Numeric `0` is an active limit, not a disabled rule: zero run/check/attempt limits block requests, a zero challenge budget blocks positive costs, and a zero minimum balance prevents spending below zero. `checks.allowed: []` permits no checks. An omitted or `null` model under `runs.max_runs` has no local run cap, even when another model has a cap.
+`workflow` is accepted as a legacy input alias for `graph`. The canonical output
+uses `graph`. Omitted or `null` rules are inactive. Numeric zero is an active
+limit. Platform eligibility and request validation remain independent of local
+policy.
 
 `policy show --json` normalizes disabled leaves to `null` and reports `source: "missing"` when no file exists. The following is the optional `policy init` template, not runtime defaults; editor schema defaults are suggestions only:
 
 ```yaml
 # yaml-language-server: $schema=./policy.schema.json
 runs:
-  max_runs: {nova: 10, vega: 0, orion: 0, castor: 0} # Maximum current original runs per model
+  max_runs: { nova: 10, vega: 0, orion: 0, castor: 0 } # Maximum current original runs per model
   allow_full_preset: false # Allow the full rollout preset
   allow_manual_batch_name: false # Allow explicit batch names
   allow_cancellations: false # Allow run cancellations
@@ -492,25 +539,133 @@ tokens:
   challenge_budget: null # Local per-challenge quoted-token budget; null disables
 
 checks:
-  allowed: [verifyTests, verifySolution, verifyFlakiness, testQuality, taskQuality, solutionQuality, descriptionQuality, autoReview, verifierIncompleteness] # Allowed dynamic checks
+  allowed: [
+      verifyTests,
+      verifySolution,
+      verifyFlakiness,
+      testQuality,
+      taskQuality,
+      solutionQuality,
+      descriptionQuality,
+      autoReview,
+      verifierIncompleteness,
+    ] # Allowed dynamic checks
   require_explicit_selection: true # Require explicit check selection
   max_checks_per_request: 3 # Maximum distinct checks submitted together
   max_active: 3 # Maximum active dynamic checks per challenge
+  allow_rerun_passing: false # Prevent rerunning completed, current PASS checks
   allow_contests: false # Allow check contests
 
 auto_review:
   allow_force_refresh: false # Allow forced reruns of all review dimensions
+
+# The action graph is disabled until explicitly configured.
+graph: null
+```
+
+### Action graph
+
+`graph` is optional. Set `graph: null` or omit it to disable sequencing. The
+available modes are `off`, `advise` and `enforce`. Requirements, transitions and
+notes are evaluated only when declared in the policy.
+
+`olympus policy show <challenge-id> --json` includes the current state used for
+policy decisions. Platform readiness and technical prerequisites are reported
+separately.
+
+Predicates support exactly one operation: `equals`, `empty`, `greater_than`, or
+`at_least`. Paths use safe dotted property names. Missing or invalid values do
+not satisfy predicates. `start` is optional; without it, no sequence is inferred.
+`confirmation` is required in `advise` mode.
+
+Nodes can include an `arguments` mapping for recommended CLI invocations. A
+transition with `action: null` ends that branch. Cycles in active transitions are
+reported as errors.
+
+Example:
+```yaml
+graph:
+  mode: advise
+  start: checks.solutionQuality
+  confirmation:
+    method: token
+    expires_after: 5m
+  gates:
+    description_ready:
+      check: descriptionQuality
+      all:
+        - { path: status, equals: completed }
+        - { path: checkInputs.description.changedSinceCheck, equals: false }
+        - { path: output.verdict, equals: PASS }
+        - { path: output.evaluation.comments, empty: true }
+    tests_ready:
+      check: testQuality
+      all:
+        - { path: status, equals: completed }
+        - { path: checkInputs.description.changedSinceCheck, equals: false }
+        - { path: checkInputs.tests.changedSinceCheck, equals: false }
+        - { path: output.verdict, equals: PASS }
+        - { path: output.coverageSummary.fullyCoveredRatio, at_least: 0.8 }
+        - { path: output.coverageSummary.untestedGapCount, equals: 0 }
+    solution_ready:
+      check: solutionQuality
+      all:
+        - { path: status, equals: completed }
+        - { path: checkInputs.description.changedSinceCheck, equals: false }
+        - { path: checkInputs.tests.changedSinceCheck, equals: false }
+        - { path: checkInputs.solution.changedSinceCheck, equals: false }
+        - { path: output.verdict, equals: PASS }
+        - { path: output.evaluation.solution_comprehensiveness.score, equals: 3 }
+        - { path: output.evaluation.code_quality.score, equals: 3 }
+        - { path: output.evaluation.issues, empty: true }
+  actions:
+    checks.solutionQuality:
+      next:
+        - action: image.build
+          all:
+            - { path: checks.solutionQuality.status, equals: completed }
+            - {
+                path: checks.solutionQuality.checkInputs.description.changedSinceCheck,
+                equals: false,
+              }
+            - { path: checks.solutionQuality.checkInputs.tests.changedSinceCheck, equals: false }
+            - { path: checks.solutionQuality.checkInputs.solution.changedSinceCheck, equals: false }
+            - { path: checks.solutionQuality.output.verdict, equals: PASS }
+    image.build:
+      requires: [solution_ready]
+      on_unmet: checks.solutionQuality
+      next:
+        - action: checks.testQuality
+          all:
+            - { path: image.hasImage, equals: true }
+    checks.testQuality:
+      requires: [tests_ready]
+      on_unmet: checks.testQuality
+      next: []
+    artifacts.update:
+      requires: [description_ready]
+      on_unmet: checks.descriptionQuality
+      next: []
+  notes:
+    - id: unfair-tests-local-first
+      when:
+        check: testQuality
+        all:
+          - { path: output.verdict, equals: FAIL }
+          - { path: output.unfairTestCount, greater_than: 0 }
+      severity: warning
+      message: Verify locally, correct the tests if needed, then perform at most one rerun.
 ```
 
 ## Environment
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `OLYMPUS_URL` | `https://shipd.ai/quests/olympus` | Frontend base URL for authentication and configuration |
-| `OLYMPUS_CONVEX_URL` | fetched from `/api/cli/config` | Convex deployment override |
-| `OLYMPUS_API_URL` | `https://shipd-mars-v2.convex.site` | HTTP API override |
-| `OLYMPUS_NO_UPDATE_CHECK` | unset | Disable the non-blocking version check |
-| `OLYMPUS_UPDATE_PACKAGE` | unset | Optional published package used by self-update |
+| Variable                  | Default                             | Purpose                                                |
+| ------------------------- | ----------------------------------- | ------------------------------------------------------ |
+| `OLYMPUS_URL`             | `https://shipd.ai/quests/olympus`   | Frontend base URL for authentication and configuration |
+| `OLYMPUS_CONVEX_URL`      | fetched from `/api/cli/config`      | Convex deployment override                             |
+| `OLYMPUS_API_URL`         | `https://shipd-mars-v2.convex.site` | HTTP API override                                      |
+| `OLYMPUS_NO_UPDATE_CHECK` | unset                               | Disable the non-blocking version check                 |
+| `OLYMPUS_UPDATE_PACKAGE`  | unset                               | Optional published package used by self-update         |
 
 Credentials are stored at:
 
