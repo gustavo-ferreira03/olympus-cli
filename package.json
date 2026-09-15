@@ -1,7 +1,7 @@
 {
   "name": "olympus-cli-gustavos-fork",
   "version": "0.2.0-gustavo.1",
-  "description": "Olympus CLI — Gustavo's Fork, maintained in TypeScript with current check APIs",
+  "description": "Olympus CLI \u2014 Gustavo's Fork, maintained in TypeScript with current check APIs",
   "type": "module",
   "homepage": "https://shipd.ai/quests/olympus",
   "keywords": [
@@ -39,6 +39,7 @@
     "acorn": "^8.18.0",
     "citty": "^0.2.1",
     "convex": "^1.29.0",
+    "log-update": "^7.2.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
