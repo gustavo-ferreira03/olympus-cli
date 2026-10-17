@@ -1,5 +1,7 @@
 import { api, localBudgetStatus } from "../platform/convex.ts";
+import { queryPrecheckStages, validationResultsToStages } from "../platform/prechecks.ts";
 import { getDynamicCheckEntries, formatDynamicCheckLabel } from "../core/model.ts";
+import { PRECHECK_STAGE_IDS } from "../core/expected.ts";
 import { sanitizeDiagnostic } from "../shared/errors.ts";
 import { summarizeTokenUsage, type TokenUsageSnapshot } from "../core/token-telemetry.ts";
 
@@ -12,6 +14,7 @@ export type Snapshot = {
   id: string;
   title: string;
   status: string;
+  submissionType: string | null;
   version: number | null;
   versionId: string | null;
   fetchedAt: number;
@@ -62,6 +65,9 @@ export type OverviewSnapshot = {
     pendingDrip: number | null;
     dripPaused: boolean | null;
     dripUnlimited: boolean | null;
+    rejectedInWindow: number | null;
+    tierIsBeginner: boolean | null;
+    comeback: Record<string, unknown> | null;
     nextTierRequirement: {
       tierName: string | null;
       requiredAccepted: number | null;
@@ -162,34 +168,106 @@ const normalizedFilter = (value: string | undefined): string | null => {
 };
 const matchesFilter = (value: string | null, expected: string | null): boolean =>
   expected === null || value?.toLowerCase() === expected;
+// Mirrors the web: a balance flagged needsRefresh is re-synced once before it is shown.
+async function readFreshBalance(client: any): Promise<any> {
+  const balance = await client.query(api.contributorTokens.getBalance, {});
+  if (balance?.needsRefresh !== true) return balance;
+  await client.mutation(api.contributorTokens.refreshBalance, {});
+  return client.query(api.contributorTokens.getBalance, {});
+}
+
+/** A query the dashboard reads, shared by the one-shot reader and live subscriptions. */
+export type SourceQuery = { name: string; reference: any; args: Record<string, unknown> };
+
+/** Account-level queries behind the overview. */
+export const OVERVIEW_QUERIES: SourceQuery[] = [
+  { name: "problems", reference: api.problems.listByUser, args: {} },
+  { name: "balance", reference: api.contributorTokens.getBalance, args: {} },
+  { name: "revisionTokens", reference: api.contributorTokens.getAllRevisionTokens, args: {} },
+  { name: "prestige", reference: api.tierRotation.getMyPrestigeOutlook, args: {} },
+  { name: "transactions", reference: api.contributorTokens.getTransactions, args: {} },
+  { name: "tierTimeline", reference: api.contributorTokens.getTierWindowTimeline, args: {} },
+];
+
+/** Raw overview inputs by query name; a failed account read is carried as `{ error }`. */
+export type OverviewRaw = Record<string, unknown>;
+
+/** Reduce a raw overview result to what the dashboard keeps. */
+export function overviewValue(name: string, value: unknown): unknown {
+  return name === "problems" ? slimProblems(value) : value;
+}
+
+/** Overview as one HTTP read, for `--json`. */
 export async function readDashboardOverview(
   client: any,
   requested: DashboardOverviewFilters = {},
 ): Promise<OverviewSnapshot> {
-  const prestigeRequest = (async () => {
-    try {
-      return await client.query(api.tierRotation.getMyPrestigeOutlook, {});
-    } catch (error) {
-      return { error: errorText(error) };
-    }
-  })();
-  const [problems, balance, revisionTokens, prestige, transactions, tierTimeline] =
-    await Promise.all([
-      client.query(api.problems.listByUser, {}),
-      client.query(api.contributorTokens.getBalance, {}).catch((error: unknown) => ({
-        error: errorText(error),
-      })),
-      client.query(api.contributorTokens.getAllRevisionTokens, {}).catch((error: unknown) => ({
-        error: errorText(error),
-      })),
-      prestigeRequest,
-      client.query(api.contributorTokens.getTransactions, {}).catch((error: unknown) => ({
-        error: errorText(error),
-      })),
-      client.query(api.contributorTokens.getTierWindowTimeline, {}).catch((error: unknown) => ({
-        error: errorText(error),
-      })),
-    ]);
+  const raw: OverviewRaw = {};
+  await Promise.all(
+    OVERVIEW_QUERIES.map(async ({ name, reference, args }) => {
+      try {
+        const value =
+          name === "balance" ? await readFreshBalance(client) : await client.query(reference, args);
+        raw[name] = overviewValue(name, value);
+      } catch (error) {
+        if (name === "problems") throw error;
+        raw[name] = { error: errorText(error) };
+      }
+    }),
+  );
+  return buildOverview(raw, requested);
+}
+
+/** The fields the overview reads; the full documents carry every latest version's patches. */
+function slimProblems(problems: unknown): unknown {
+  if (!Array.isArray(problems)) return problems;
+  const keep = (value: any, keys: string[]) =>
+    value && typeof value === "object"
+      ? Object.fromEntries(keys.filter((key) => key in value).map((key) => [key, value[key]]))
+      : value;
+  return problems.map((problem: any) =>
+    problem && typeof problem === "object"
+      ? Object.assign(
+          keep(problem, [
+            "_id",
+            "_creationTime",
+            "title",
+            "status",
+            "archived",
+            "language",
+            "difficulty",
+            "category",
+            "finalized",
+            "reviewState",
+            "lastDraftEditedAt",
+            "lastReviewedAt",
+            "lastSubmittedAt",
+            "currentStatusEnteredAt",
+          ]),
+          {
+            aggStats: keep(problem.aggStats, ["totalRuns", "passedRuns"]),
+            latestVersion: keep(problem.latestVersion, [
+              "_id",
+              "version",
+              "language",
+              "difficulty",
+              "category",
+              "reviewState",
+            ]),
+          },
+        )
+      : problem,
+  );
+}
+
+export function buildOverview(
+  raw: OverviewRaw,
+  requested: DashboardOverviewFilters = {},
+): OverviewSnapshot {
+  const { problems, balance, revisionTokens, prestige, transactions, tierTimeline } = raw as Record<
+    string,
+    any
+  >;
   if (!Array.isArray(problems)) throw new Error("Invalid challenge list response");
   const allChallenges = problems
     .filter((problem: any) => problem && typeof problem === "object" && problem._id != null)
@@ -320,6 +398,9 @@ export async function readDashboardOverview(
             })),
         }
       : null;
+  let prestigeNote = "Source: tierRotation.getMyPrestigeOutlook";
+  if (eloValue === null) prestigeNote = "Olympus prestige ELO is unavailable";
+  if (prestigeError) prestigeNote = `Olympus prestige ELO unavailable: ${prestigeError}`;
   return {
     fetchedAt,
     totalChallenges: allChallenges.length,
@@ -344,6 +425,13 @@ export async function readDashboardOverview(
       dripPaused: typeof balanceRecord.dripPaused === "boolean" ? balanceRecord.dripPaused : null,
       dripUnlimited:
         typeof balanceRecord.dripUnlimited === "boolean" ? balanceRecord.dripUnlimited : null,
+      rejectedInWindow: numberValue(balanceRecord.rejectedInWindow),
+      tierIsBeginner:
+        typeof balanceRecord.tierIsBeginner === "boolean" ? balanceRecord.tierIsBeginner : null,
+      comeback:
+        balanceRecord.comeback && typeof balanceRecord.comeback === "object"
+          ? balanceRecord.comeback
+          : null,
       nextTierRequirement: nextTierRecord
         ? {
             tierName: clean(nextTierRecord.tierName) || null,
@@ -381,11 +469,7 @@ export async function readDashboardOverview(
       },
       marks,
       available: eloValue !== null,
-      note: prestigeError
-        ? `Olympus prestige ELO unavailable: ${prestigeError}`
-        : eloValue === null
-          ? "Olympus prestige ELO is unavailable"
-          : "Source: tierRotation.getMyPrestigeOutlook",
+      note: prestigeNote,
     },
     acceptedTimeline,
   };
@@ -425,6 +509,7 @@ const compactItem = (item: any) => ({
     "currentStep",
     "error",
     "jobId",
+    "contested",
   ]),
   output: {
     ...pick(item?.output, ["verdict", "message", "summary"]),
@@ -461,6 +546,15 @@ function compactSource(name: string, data: any): any {
     return Object.fromEntries(
       getDynamicCheckEntries(data).map((item) => [item.key, compactItem(item)]),
     );
+  if (name === "delivery")
+    return pick(data, [
+      "status",
+      "progress",
+      "progressStep",
+      "failureSummary",
+      "clickedAt",
+      "updatedAt",
+    ]);
   if (name === "scope")
     return {
       ...pick(data, ["fresh", "freshPass", "latestVerdict", "inFlight", "status"]),
@@ -530,80 +624,112 @@ function compactSource(name: string, data: any): any {
   return pick(data, ["enabled", "scope", "limit", "spent", "reserved", "remaining"]);
 }
 
-export async function readDashboard(
-  client: any,
-  id: string,
-  previous?: Snapshot,
-): Promise<Snapshot> {
-  const data = await client.query(api.problems.getWithLatestVersion, {
-    problemId: id,
-  });
+type Head = Pick<Snapshot, "title" | "status" | "submissionType" | "version" | "versionId">;
+
+/** Title, status and latest version from `problems.getWithLatestVersion`. */
+export function headFromProblem(data: any): Head {
   if (!data) throw new Error("Challenge not found");
-  const version = data.latestVersion;
-  const versionId = version?._id ?? null;
-  const same = previous?.versionId === versionId;
-  const jobs: Record<string, () => Promise<any>> = {
-    balance: () => client.query(api.contributorTokens.getBalance, {}),
+  return {
+    title: clean(data.title),
+    status: clean(data.status),
+    submissionType: clean(data.submissionType) || null,
+    version: data.latestVersion?.version ?? null,
+    versionId: data.latestVersion?._id ?? null,
+  };
+}
+
+/**
+ * Remote queries behind a challenge snapshot. Version-scoped ones are keyed by
+ * versionId, so results for different versions never mix. Prechecks fall back to
+ * {@link PRECHECK_FALLBACK} when `stages.getByVersion` is unavailable.
+ */
+export function challengeQueries(id: string, versionId: string | null): SourceQuery[] {
+  const queries: SourceQuery[] = [
+    { name: "balance", reference: api.contributorTokens.getBalance, args: {} },
+    {
+      name: "readiness",
+      reference: api.submissionReadiness.getSubmissionReadiness,
+      args: { problemId: id },
+    },
+    {
+      name: "delivery",
+      reference: api.deliveryVerify.getSubmitVerification,
+      args: { problemId: id },
+    },
+  ];
+  if (!versionId) return queries;
+  const scoped = (name: string, reference: any) => ({ name, reference, args: { versionId } });
+  return [
+    ...queries,
+    scoped("prechecks", api.stages.getByVersion),
+    scoped("review", api.orchestratorReview.getOrchestratorReview),
+    scoped("checks", api.runDynamicChecks.getDynamicChecks),
+    scoped("runs", api.runAgentRuns.getAgentRuns),
+    scoped("scope", api.scopeGate.getScopeGate),
+    scoped("image", api.dockerImage.getImageStatus),
+    scoped("build", api.dockerImage.getLatestBuildJobForVersion),
+    scoped("fp", api.fpReview.getFpCheckForVersion),
+  ];
+}
+
+/** Precheck source the web app reads, normalized to the getByVersion row shape. */
+export const PRECHECK_FALLBACK: {
+  reference: any;
+  args: (id: string, versionId: string) => Record<string, unknown>;
+  transform: (raw: unknown) => any[];
+} = {
+  reference: api.stages.getValidationResults,
+  args: (id: string, versionId: string) => ({ itemId: id, versionId }),
+  transform: validationResultsToStages,
+};
+
+/** Validate and compact one source result; throws on a malformed response. */
+export function sourceFromResult(name: string, result: any): Source {
+  if (result?.error && name === "budget") throw new Error(result.error);
+  if (["prechecks", "runs"].includes(name) && !Array.isArray(result))
+    throw new Error("Invalid list response");
+  return { data: compactSource(name, result), updatedAt: Date.now(), error: null };
+}
+
+/** A failed source keeps its last data so the dashboard shows it as stale, not empty. */
+export function failedSource(error: unknown, previous?: Source): Source {
+  return {
+    data: previous?.data ?? null,
+    updatedAt: previous?.updatedAt ?? null,
+    error: errorText(error),
+  };
+}
+
+export function buildSnapshot(id: string, head: Head, sources: Record<string, Source>): Snapshot {
+  return { id, ...head, fetchedAt: Date.now(), sources };
+}
+
+/** Challenge snapshot as one HTTP read, for `--json`. */
+export async function readDashboard(client: any, id: string): Promise<Snapshot> {
+  const head = headFromProblem(
+    await client.query(api.problems.getWithLatestVersion, { problemId: id }),
+  );
+  const reads: Record<string, () => Promise<any>> = {
     budget: () => localBudgetStatus(client, id),
   };
-  if (versionId)
-    Object.assign(jobs, {
-      prechecks: () => client.query(api.stages.getByVersion, { versionId }),
-      review: () =>
-        client.query(api.orchestratorReview.getOrchestratorReview, {
-          versionId,
-        }),
-      checks: () => client.query(api.runDynamicChecks.getDynamicChecks, { versionId }),
-      runs: () => client.query(api.runAgentRuns.getAgentRuns, { versionId }),
-      readiness: () =>
-        client.query(api.submissionReadiness.getSubmissionReadiness, {
-          problemId: id,
-        }),
-      scope: () => client.query(api.scopeGate.getScopeGate, { versionId }),
-      image: () => client.query(api.dockerImage.getImageStatus, { versionId }),
-      build: () =>
-        client.query(api.dockerImage.getLatestBuildJobForVersion, {
-          versionId,
-        }),
-      fp: () => client.query(api.fpReview.getFpCheckForVersion, { versionId }),
-    });
+  for (const { name, reference, args } of challengeQueries(id, head.versionId))
+    reads[name] = () => client.query(reference, args);
+  reads.balance = () => readFreshBalance(client);
+  if (head.versionId) {
+    const versionId = head.versionId;
+    reads.prechecks = () => queryPrecheckStages(client, { problemId: id, versionId });
+  }
   const sources: Record<string, Source> = {};
   await Promise.all(
-    Object.entries(jobs).map(async ([name, query]) => {
+    Object.entries(reads).map(async ([name, read]) => {
       try {
-        const result = await query();
-        if (result?.error && name === "budget") throw new Error(result.error);
-        if (["prechecks", "runs"].includes(name) && !Array.isArray(result))
-          throw new Error("Invalid list response");
-        sources[name] = {
-          data: compactSource(name, result),
-          updatedAt: Date.now(),
-          error: null,
-        };
+        sources[name] = sourceFromResult(name, await read());
       } catch (error) {
-        const old = same ? previous?.sources[name] : undefined;
-        sources[name] = {
-          data: old?.data ?? null,
-          updatedAt: old?.updatedAt ?? null,
-          error: errorText(error),
-        };
+        sources[name] = failedSource(error);
       }
     }),
   );
-  const confirm = await client.query(api.problems.getWithLatestVersion, {
-    problemId: id,
-  });
-  if ((confirm?.latestVersion?._id ?? null) !== versionId)
-    throw new Error("Version changed during refresh; retrying without mixing versions");
-  return {
-    id,
-    title: clean(data.title),
-    status: clean(data.status),
-    version: version?.version ?? null,
-    versionId,
-    fetchedAt: Date.now(),
-    sources,
-  };
+  return buildSnapshot(id, head, sources);
 }
 
 function row(key: string, label: unknown, item: any): Row {
@@ -639,9 +765,31 @@ function row(key: string, label: unknown, item: any): Row {
 /** Reads one named source out of a snapshot. */
 type SourceReader = (name: string) => any;
 
+/** Stage names as the platform shows them. */
+const PRECHECK_STAGE_LABELS: Record<string, string> = {
+  github_setup: "GitHub Repository",
+  problem_and_tests: "Problem Description & Tests",
+  plagiarism_review: "Plagiarism Review",
+  dockerfile: "Dockerfile",
+  solution_patch: "Solution Patch",
+};
+
+/** Failing sub-checks and missing fields of one stage, for its detail line. */
+function stageDetail(stage: any): string {
+  const failures = (Array.isArray(stage.checks) ? stage.checks : [])
+    .filter((check: any) => /fail|error/i.test(String(check?.status ?? "")))
+    .map((check: any) => clean(`${check.id ?? "check"}: ${check.message ?? check.status}`));
+  const missing = Array.isArray(stage.missingFields)
+    ? [`missing ${stage.missingFields.map(clean).join(", ")}`]
+    : [];
+  return [stage.error ? clean(stage.error) : "", ...missing, ...failures]
+    .filter(Boolean)
+    .join(" | ");
+}
+
 /**
- * Collapse the precheck stages to the newest record per stage, falling back to
- * the readiness criterion when no stage has reported yet.
+ * One row per precheck stage (newest record wins), in the platform's stage order;
+ * the readiness criterion stands in while no stage has reported yet.
  */
 function precheckRows(source: SourceReader): Row[] {
   const latest = new Map<string, any>();
@@ -653,22 +801,28 @@ function precheckRows(source: SourceReader): Row[] {
     const previousAt = previous ? (previous.createdAt ?? previous._creationTime ?? 0) : -1;
     if (!previous || stageAt >= previousAt) latest.set(key, stage);
   }
-  const criterion = source("readiness")?.criteria?.find((item: any) => item.id === "prechecks");
-  const stageDetails = [...latest.entries()].map(
-    ([key, stage]) =>
-      `${clean(stage.stageName ?? stage.name ?? key)}: ${clean(stage.status ?? "unknown")}${stage.error ? ` — ${clean(stage.error)}` : ""}`,
-  );
-  return [
-    row("stage:summary", "Prechecks", {
-      ...criterion,
-      status: criterion?.status ?? "unknown",
-      detail: [
-        criterion?.detail
-          ?? "Precheck readiness unavailable; stage results do not establish freshness.",
-        ...stageDetails,
-      ].join(" | "),
-    }),
-  ];
+  if (latest.size === 0) {
+    const criterion = source("readiness")?.criteria?.find((item: any) => item.id === "prechecks");
+    return [
+      row("stage:summary", "Prechecks", {
+        ...criterion,
+        status: criterion?.status ?? "not_run",
+        detail: criterion?.detail ?? "No precheck stage has reported for this version.",
+      }),
+    ];
+  }
+  const order = (key: string) => {
+    const index = (PRECHECK_STAGE_IDS as readonly string[]).indexOf(key);
+    return index === -1 ? PRECHECK_STAGE_IDS.length : index;
+  };
+  return [...latest.entries()]
+    .toSorted(([a], [b]) => order(a) - order(b) || a.localeCompare(b))
+    .map(([key, stage]) =>
+      row(`stage:${key}`, PRECHECK_STAGE_LABELS[key] ?? stage.stageName ?? stage.name ?? key, {
+        ...stage,
+        detail: stageDetail(stage),
+      }),
+    );
 }
 
 /** Scope Gate row, merging the in-flight flag over the last recorded verdict. */
@@ -694,32 +848,44 @@ function imageRow(source: SourceReader): Row {
   });
 }
 
-/** Display order for the dynamic quality checks. */
+/** Quality checks in the platform's order, then the later-stage audits. */
 const CHECK_UI_ORDER = [
   "verifyTests",
   "verifySolution",
-  "verifyFairness",
   "testQuality",
   "verifyFlakiness",
   "taskQuality",
   "solutionQuality",
   "descriptionQuality",
+  "verifierIncompleteness",
+  "rolloutCoach",
 ];
+/** Checks shown with the later-stage audits rather than the quality checks. */
+const AUDIT_CHECK_KEYS = new Set(["check:verifierIncompleteness", "check:rolloutCoach"]);
+const BUILD_ROW_KEYS = new Set(["image", "scope"]);
 
 /**
- * Sort key for a check row: pipeline stages first, then scope and image, then
- * the quality checks in {@link CHECK_UI_ORDER}; unknown keys sort last.
+ * Sort key for a check row, matching the section order: prechecks, build and scope,
+ * quality checks, audits, review, FP check, delivery; unknown keys sort last.
  */
 function checkRank(item: Row): number {
-  if (item.key.startsWith("stage:")) return -3;
-  if (item.key === "scope") return -2;
-  if (item.key === "image") return -1;
+  if (item.key.startsWith("stage:")) return -10;
+  if (item.key === "image") return -9;
+  if (item.key === "scope") return -8;
+  if (item.key.startsWith("review:")) return 100;
+  if (item.key === "fp") return 101;
+  if (item.key === "delivery") return 102;
   const index = CHECK_UI_ORDER.indexOf(item.key.replace("check:", ""));
   return index >= 0 ? index : CHECK_UI_ORDER.length;
 }
 
 /** Titles for the orchestrator review slots. */
-const REVIEW_SLOT_KEYS = ["description", "tests", "solution", "agents"];
+const REVIEW_SLOT_LABELS: Record<string, string> = {
+  description: "Task Prompt",
+  tests: "Tests",
+  solution: "Solution",
+  agents: "Agent runs",
+};
 
 /** Verdict text for one orchestrator review slot. */
 function reviewVerdict(key: string, output: any, criterion: any): string | undefined {
@@ -735,7 +901,7 @@ function reviewVerdict(key: string, output: any, criterion: any): string | undef
  */
 function reviewRows(slots: any): Row[] {
   const rows: Row[] = [];
-  for (const key of REVIEW_SLOT_KEYS) {
+  for (const [key, label] of Object.entries(REVIEW_SLOT_LABELS)) {
     const slot = slots[key];
     const output = slot?.output;
     const synthesis = slots.synthesis;
@@ -747,7 +913,7 @@ function reviewRows(slots: any): Row[] {
     const resultSlot = useSynthesis ? synthesis : slot;
     const criterion = useSynthesis ? synthesis.output[key] : output;
     rows.push(
-      row(`review:${key}`, key === "synthesis" ? "Overall" : key[0].toUpperCase() + key.slice(1), {
+      row(`review:${key}`, label, {
         ...resultSlot,
         output: {
           verdict: reviewVerdict(key, output, criterion),
@@ -819,11 +985,23 @@ function runRows(source: SourceReader): Row[] {
   return runs;
 }
 
+/** Delivery verification row; present only once a submission started verification. */
+function deliveryRow(source: SourceReader): Row | undefined {
+  const delivery = source("delivery");
+  if (!delivery?.status) return undefined;
+  const status = String(delivery.status).toLowerCase();
+  return row("delivery", "Delivery Verification", {
+    status: status === "verifying" ? "running" : status,
+    progress: delivery.progress,
+    detail: delivery.failureSummary ?? delivery.progressStep,
+  });
+}
+
 /**
  * Flatten a snapshot into the three row lists the dashboard renders.
  *
  * Each section is built by its own helper above; this function only decides
- * which sections appear and in what order.
+ * which rows appear and in what order.
  */
 export function dashboardRows(snapshot: Snapshot): {
   checks: Row[];
@@ -835,19 +1013,24 @@ export function dashboardRows(snapshot: Snapshot): {
     ...precheckRows(source),
     scopeRow(source),
     imageRow(source),
-    ...getDynamicCheckEntries(source("checks")).map((check) =>
+    ...Object.values<any>(source("checks") ?? {}).map((check) =>
       row(`check:${check.key}`, formatDynamicCheckLabel(check.key), check),
     ),
   ];
-  checks.sort((a, b) => checkRank(a) - checkRank(b));
-
   const slots = source("review")?.slots;
   if (slots && Object.values(slots).some(Boolean)) {
     const prior = checks.findIndex((item) => item.key === "check:autoReview");
     if (prior >= 0) checks.splice(prior, 1);
     checks.push(...reviewRows(slots));
+  } else {
+    // A standalone Auto Review check result belongs with the review rows.
+    const prior = checks.find((item) => item.key === "check:autoReview");
+    if (prior) prior.key = "review:autoReview";
   }
   checks.push(fpRow(source));
+  const delivery = deliveryRow(source);
+  if (delivery) checks.push(delivery);
+  checks.sort((a, b) => checkRank(a) - checkRank(b));
 
   const readiness = (source("readiness")?.criteria ?? []).map((criterion: any) =>
     row(`ready:${criterion.id}`, criterion.label, criterion),
@@ -855,12 +1038,55 @@ export function dashboardRows(snapshot: Snapshot): {
   return { checks, runs: runRows(source), readiness };
 }
 
-export function observedChanges(before: Snapshot | undefined, after: Snapshot): string[] {
+export function dashboardSections(
+  data: ReturnType<typeof dashboardRows>,
+  history: boolean,
+  showReadiness = false,
+): Array<{ title: string; items: Row[]; section: number }> {
+  const group = (match: (item: Row) => boolean) => data.checks.filter(match);
+  const sections = [
+    { title: "Prechecks", items: group((item) => item.key.startsWith("stage:")), section: 0 },
+    { title: "Build & Scope", items: group((item) => BUILD_ROW_KEYS.has(item.key)), section: 0 },
+    {
+      title: "Quality Checks",
+      items: group(
+        (item) =>
+          item.key.startsWith("check:")
+          && !BUILD_ROW_KEYS.has(item.key)
+          && !AUDIT_CHECK_KEYS.has(item.key),
+      ),
+      section: 0,
+    },
+    { title: "Audits", items: group((item) => AUDIT_CHECK_KEYS.has(item.key)), section: 0 },
+    { title: "Auto Review", items: group((item) => item.key.startsWith("review:")), section: 0 },
+    {
+      title: "FP Check & Delivery",
+      items: group((item) => item.key === "fp" || item.key === "delivery"),
+      section: 0,
+    },
+    {
+      title: history ? "Rollouts · history" : "Rollouts",
+      items: history ? data.runs : data.runs.filter((item) => item.freshness === "current"),
+      section: 1,
+    },
+  ].filter((section) => section.section !== 0 || section.items.length > 0);
+  if (showReadiness) sections.push({ title: "Readiness", items: data.readiness, section: 2 });
+  return sections;
+}
+
+type Rows = ReturnType<typeof dashboardRows>;
+
+/** Status lines for what changed between two snapshots; reuses already computed rows. */
+export function observedChanges(
+  before: Snapshot | undefined,
+  after: Snapshot,
+  rows: { before?: Rows; after?: Rows } = {},
+): string[] {
   if (!before) return ["First snapshot received; activity covers this session only"];
   if (before.versionId !== after.versionId)
     return [`Version changed: v${before.version ?? "none"} -> v${after.version ?? "none"}`];
-  const old = dashboardRows(before),
-    next = dashboardRows(after);
+  const old = rows.before ?? dashboardRows(before),
+    next = rows.after ?? dashboardRows(after);
   const changes: string[] = [];
   if (before.status !== after.status)
     changes.push(`Challenge: ${before.status} -> ${after.status}`);

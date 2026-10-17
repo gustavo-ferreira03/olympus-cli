@@ -1,24 +1,22 @@
 import { createLogUpdate } from "log-update";
 import { emitKeypressEvents } from "node:readline";
 import { renderDashboard } from "./ui.ts";
-import {
-  clean,
-  dashboardRows,
-  observedChanges,
-  type OverviewSnapshot,
-  type Snapshot,
-} from "./data.ts";
+import { dashboardRows, observedChanges, type OverviewSnapshot, type Snapshot } from "./data.ts";
 
-export type DashboardLoaders = {
-  loadOverview: (
-    previous: OverviewSnapshot | undefined,
-    signal: AbortSignal,
-  ) => Promise<OverviewSnapshot>;
-  loadChallenge: (
-    id: string,
-    previous: Snapshot | undefined,
-    signal: AbortSignal,
-  ) => Promise<Snapshot>;
+/** Live data behind the dashboard; see LiveDashboard. */
+export type DashboardFeed = {
+  showOverview(): void;
+  showChallenge(id: string): void;
+  overview(): OverviewSnapshot | undefined;
+  snapshot(): Snapshot | undefined;
+  error(): string | undefined;
+  connected(): boolean;
+  /** Re-read local state that has no subscription (the token budget file). */
+  tick(): Promise<void>;
+  resubscribe(): void;
+  /** Register the callback invoked whenever subscribed data changes. */
+  onChange(listener: () => void): void;
+  close(): Promise<void>;
   initialId?: string;
 };
 
@@ -31,11 +29,15 @@ export type ViewState = {
   rowCache?: { snapshot: Snapshot; rows: ReturnType<typeof dashboardRows> };
   error?: string;
   busy: boolean;
+  /** False while the live connection is down; data shown is the last received. */
+  connected?: boolean;
   polls: number;
   nextAt: number;
   section: number;
   selected: number[];
   details: boolean;
+  autoPageStartedAt?: number;
+  autoPausedUntil?: number;
   detailOffset?: number;
   detailPageSize?: number;
   viewportTop?: number;
@@ -43,12 +45,20 @@ export type ViewState = {
   events: string[];
 };
 
-export async function runDashboard(loaders: DashboardLoaders, intervalMs: number): Promise<void> {
+function keyDelta(name: string | undefined): number {
+  if (name === "down") return 1;
+  if (name === "up") return -1;
+  if (name === "pagedown") return 10;
+  if (name === "pageup") return -10;
+  return 0;
+}
+
+export async function runDashboard(feed: DashboardFeed, intervalMs: number): Promise<void> {
   const state: ViewState = {
-    mode: loaders.initialId ? "challenge" : "overview",
+    mode: feed.initialId ? "challenge" : "overview",
     overviewSelected: 0,
-    selectedChallengeId: loaders.initialId,
-    busy: false,
+    selectedChallengeId: feed.initialId,
+    busy: true,
     polls: 0,
     nextAt: Date.now(),
     section: 0,
@@ -56,13 +66,11 @@ export async function runDashboard(loaders: DashboardLoaders, intervalMs: number
     details: false,
     events: [],
   };
-  let stopped = false,
-    failures = 0,
-    pending = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
   let animationTimer: ReturnType<typeof setTimeout> | undefined;
   let paintRequest: ReturnType<typeof setImmediate> | undefined;
-  let active: AbortController | undefined;
+  let syncRequest: ReturnType<typeof setImmediate> | undefined;
   const wasRaw = process.stdin.isRaw;
   const wasFlowing = process.stdin.readableFlowing === true;
   let finish!: () => void;
@@ -99,120 +107,97 @@ export async function runDashboard(loaders: DashboardLoaders, intervalMs: number
   const stop = () => {
     if (stopped) return;
     stopped = true;
-    clearTimeout(timer);
+    clearInterval(timer);
     clearTimeout(animationTimer);
     clearImmediate(paintRequest);
-    active?.abort();
+    clearImmediate(syncRequest);
     finish();
   };
-  const refresh = async () => {
+  /** Pull the feed's current data into the view state; data arrives by subscription. */
+  const sync = () => {
+    syncRequest = undefined;
     if (stopped) return;
-    if (state.busy) {
-      pending = true;
-      return;
-    }
-    clearTimeout(timer);
-    state.busy = true;
-    state.polls++;
-    active = new AbortController();
-    const timeout = setTimeout(() => active?.abort(), 15000);
-    paint();
-    try {
-      const snapshot =
-        state.mode === "overview"
-          ? await loaders.loadOverview(state.overview, active.signal)
-          : await loaders.loadChallenge(state.selectedChallengeId!, state.snapshot, active.signal);
-      if (stopped) return;
-      if (state.mode === "overview") {
-        state.overview = snapshot as OverviewSnapshot;
+    state.connected = feed.connected();
+    state.error = feed.error();
+    if (state.mode === "overview") {
+      const overview = feed.overview();
+      if (overview) {
+        state.overview = overview;
         state.overviewSelected = Math.max(
           0,
-          Math.min(state.overviewSelected, state.overview.challenges.length - 1),
+          Math.min(state.overviewSelected, overview.challenges.length - 1),
         );
-      } else {
-        const challengeSnapshot = snapshot as Snapshot;
-        for (const event of observedChanges(state.snapshot, challengeSnapshot))
+      }
+      state.busy = !state.overview;
+    } else {
+      const next = feed.snapshot();
+      if (next && next !== state.snapshot) {
+        const rows = dashboardRows(next);
+        const before =
+          state.rowCache?.snapshot === state.snapshot ? state.rowCache?.rows : undefined;
+        for (const event of observedChanges(state.snapshot, next, { before, after: rows }))
           state.events.push(`${new Date().toLocaleTimeString()} ${event}`);
-        state.events = state.events.slice(-100);
-        state.snapshot = challengeSnapshot;
-        state.error = undefined;
-        const partial = Object.values(challengeSnapshot.sources).some((source) => source.error);
-        failures = partial ? failures + 1 : 0;
+        if (state.events.length > 100) state.events.splice(0, state.events.length - 100);
+        state.snapshot = next;
+        state.rowCache = { snapshot: next, rows };
       }
-      state.error = undefined;
-      if (state.mode === "overview") failures = 0;
-    } catch (error) {
-      if (!stopped) {
-        state.error = clean(error instanceof Error ? error.message : error);
-        failures++;
-      }
-    } finally {
-      clearTimeout(timeout);
-      state.busy = false;
-      if (!stopped) {
-        const delay = pending
-          ? 0
-          : Math.min(intervalMs * 2 ** Math.min(failures, 5), Math.max(intervalMs, 60000));
-        pending = false;
-        state.nextAt = Date.now() + delay;
-        timer = setTimeout(() => void refresh(), delay);
-        paint();
-      }
+      state.busy = !state.snapshot;
     }
+    paint();
+  };
+  // Subscription updates arrive in bursts; one sync per turn of the event loop is enough.
+  const scheduleSync = () => {
+    if (!stopped && !syncRequest) syncRequest = setImmediate(sync);
+  };
+  const resetChallengeView = () => {
+    state.snapshot = undefined;
+    state.rowCache = undefined;
+    state.error = undefined;
+    state.details = false;
+    state.autoPageStartedAt = undefined;
+    state.autoPausedUntil = undefined;
+    state.detailOffset = 0;
   };
   const switchToChallenge = () => {
     const selected = state.overview?.challenges[state.overviewSelected];
     if (!selected) return;
     state.mode = "challenge";
     state.selectedChallengeId = selected.id;
-    state.snapshot = undefined;
-    state.rowCache = undefined;
-    state.error = undefined;
-    state.details = false;
-    state.detailOffset = 0;
-    active?.abort();
-    pending = true;
-    void refresh();
-    paint();
+    state.events = [];
+    resetChallengeView();
+    feed.showChallenge(selected.id);
+    sync();
   };
   const switchToOverview = () => {
-    if (!state.overview) return;
     state.mode = "overview";
-    state.snapshot = undefined;
-    state.rowCache = undefined;
-    state.error = undefined;
-    state.details = false;
-    state.detailOffset = 0;
-    active?.abort();
-    pending = true;
-    void refresh();
-    paint();
+    resetChallengeView();
+    feed.showOverview();
+    sync();
   };
   const keypress = (_: string, key: { name?: string; ctrl?: boolean }) => {
     if (key?.name === "q" || (key?.ctrl && key.name === "c")) return stop();
     if (key?.name === "r") {
-      void refresh();
+      feed.resubscribe();
+      if (state.mode === "challenge") resetChallengeView();
+      sync();
       return;
     }
     if (state.mode === "overview") {
       const size = state.overview?.challenges.length ?? 0;
-      const delta =
-        key?.name === "down"
-          ? 1
-          : key?.name === "up"
-            ? -1
-            : key?.name === "pagedown"
-              ? 10
-              : key?.name === "pageup"
-                ? -10
-                : 0;
+      const delta = keyDelta(key?.name);
       if (delta !== 0 && size > 0)
         state.overviewSelected = Math.max(0, Math.min(size - 1, state.overviewSelected + delta));
       if (key?.name === "return") switchToChallenge();
       paint();
       return;
     }
-    if ((key?.name === "b" || key?.name === "escape") && state.overview) {
+    if (key?.name === "escape" && state.details) {
+      state.details = false;
+      state.detailOffset = 0;
+      paint();
+      return;
+    }
+    if (key?.name === "b" || key?.name === "escape") {
       switchToOverview();
       return;
     }
@@ -224,8 +209,11 @@ export async function runDashboard(loaders: DashboardLoaders, intervalMs: number
       paint();
       return;
     }
-    if (["tab", "return", "h", "up", "down", "pageup", "pagedown"].includes(key?.name ?? ""))
+    if (["tab", "return", "h", "up", "down", "pageup", "pagedown"].includes(key?.name ?? "")) {
       state.detailOffset = 0;
+      state.autoPausedUntil = Date.now() + 15000;
+      state.autoPageStartedAt = undefined;
+    }
     if (key?.name === "tab") state.section = (state.section + 1) % 3;
     if (key?.name === "return") state.details = !state.details;
     if (key?.name === "h") {
@@ -242,16 +230,7 @@ export async function runDashboard(loaders: DashboardLoaders, intervalMs: number
         state.history ? rows.runs : rows.runs.filter((item) => item.freshness === "current"),
         rows.readiness,
       ][state.section].length;
-      const delta =
-        key?.name === "down"
-          ? 1
-          : key?.name === "up"
-            ? -1
-            : key?.name === "pagedown"
-              ? 10
-              : key?.name === "pageup"
-                ? -10
-                : 0;
+      const delta = keyDelta(key?.name);
       state.selected[state.section] = Math.max(
         0,
         Math.min(size - 1, state.selected[state.section] + delta),
@@ -269,10 +248,26 @@ export async function runDashboard(loaders: DashboardLoaders, intervalMs: number
     process.on("SIGTERM", stop);
     process.on("SIGHUP", stop);
     process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J");
-    void refresh();
+    feed.onChange(scheduleSync);
+    if (state.mode === "challenge") feed.showChallenge(state.selectedChallengeId!);
+    else feed.showOverview();
+    // No network polling: the interval only re-reads local state and refreshes relative times.
+    timer = setInterval(() => {
+      state.polls++;
+      state.nextAt = Date.now() + intervalMs;
+      void (async () => {
+        try {
+          await feed.tick();
+        } finally {
+          scheduleSync();
+        }
+      })();
+    }, intervalMs);
+    sync();
     await done;
   } finally {
     stop();
+    await feed.close().catch(() => {});
     update.done();
     process.stdin.off("keypress", keypress);
     process.stdout.off("resize", paint);

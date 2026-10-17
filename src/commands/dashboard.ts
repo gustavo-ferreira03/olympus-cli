@@ -1,6 +1,6 @@
 import { defineCommand } from "citty";
-import { getClient, installPolicyGuards } from "../platform/convex.ts";
-import { ConvexHttpClient } from "convex/browser";
+import { api, getClient, installPolicyGuards, localBudgetStatus } from "../platform/convex.ts";
+import { ConvexClient, ConvexHttpClient } from "convex/browser";
 import { requireAuth } from "../platform/auth.ts";
 import { printJson } from "../terminal/format.ts";
 import { CliError } from "../shared/errors.ts";
@@ -8,9 +8,8 @@ import {
   readDashboard,
   readDashboardOverview,
   type DashboardOverviewFilters,
-  type OverviewSnapshot,
-  type Snapshot,
 } from "../dashboard/data.ts";
+import { LiveDashboard } from "../dashboard/live.ts";
 import { runDashboard } from "../dashboard/tui.ts";
 
 export default defineCommand({
@@ -26,7 +25,7 @@ export default defineCommand({
     },
     interval: {
       type: "string",
-      description: "Polling interval in seconds (1-300)",
+      description: "Local refresh interval in seconds (1-300); remote data streams live",
       default: "5",
     },
     json: {
@@ -91,41 +90,61 @@ export default defineCommand({
       });
     const base = await getClient();
     const { token, identity } = requireAuth();
-    let requestSignal: AbortSignal;
+    let requestSignal: AbortSignal | undefined;
     const client = new ConvexHttpClient(base.url, {
       auth: token,
       logger: false,
       fetch: (input, init) => fetch(input, { ...init, signal: requestSignal }),
     });
     installPolicyGuards(client, base.url, identity.sub);
-    const loadOverview = async (_previous: OverviewSnapshot | undefined, signal: AbortSignal) => {
-      requestSignal = signal;
-      return readDashboardOverview(client, overviewFilters);
-    };
-    const loadChallenge = async (
-      id: string,
-      previous: Snapshot | undefined,
-      signal: AbortSignal,
-    ) => {
-      requestSignal = signal;
-      return readDashboard(client, id, previous);
-    };
     if (args.json) {
       const controller = new AbortController();
+      requestSignal = controller.signal;
       const timeout = setTimeout(() => controller.abort(), 15000);
       try {
         if (args.id) {
-          const snapshot = await loadChallenge(args.id, undefined, controller.signal);
+          const snapshot = await readDashboard(client, args.id);
           printJson(snapshot);
           if (Object.values(snapshot.sources).some((source) => source.error)) process.exitCode = 1;
         } else {
-          printJson(await loadOverview(undefined, controller.signal));
+          printJson(await readDashboardOverview(client, overviewFilters));
         }
       } finally {
         clearTimeout(timeout);
       }
       return;
     }
-    await runDashboard({ loadOverview, loadChallenge, initialId: args.id }, interval * 1000);
+    // Like the web app, the live dashboard subscribes over one WebSocket instead of polling.
+    const subscriptions = new ConvexClient(base.url, { logger: false });
+    subscriptions.setAuth(async () => token);
+    let listener = () => {};
+    const live = new LiveDashboard(
+      subscriptions,
+      {
+        refreshBalance: async () => {
+          await client.mutation(api.contributorTokens.refreshBalance, {});
+        },
+        readBudget: (id) => localBudgetStatus(client, id),
+      },
+      () => listener(),
+    );
+    await runDashboard(
+      {
+        initialId: args.id,
+        showOverview: () => live.showOverview(),
+        showChallenge: (id) => live.showChallenge(id),
+        overview: () => live.overview(overviewFilters),
+        snapshot: () => live.snapshot(),
+        error: () => live.error(),
+        connected: () => live.connected(),
+        tick: () => live.tick(),
+        resubscribe: () => live.resubscribe(),
+        onChange: (next) => {
+          listener = next;
+        },
+        close: () => live.close(),
+      },
+      interval * 1000,
+    );
   },
 });

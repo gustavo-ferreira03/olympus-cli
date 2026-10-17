@@ -1,5 +1,8 @@
-import { clean, dashboardRows, type OverviewSnapshot, type Row } from "./data.ts";
+import { cellWidth, fit, graphemes, wrap } from "./text.ts";
+import { dashboardRows, dashboardSections, type OverviewSnapshot, type Row } from "./data.ts";
 import { type ViewState } from "./tui.ts";
+
+export { fit } from "./text.ts";
 
 const colorEnabled =
   process.stdout.isTTY && !("NO_COLOR" in process.env) && process.env.TERM !== "dumb";
@@ -39,53 +42,6 @@ const statusColors = {
   muted: ansi("\x1b[0;38;5;245;49m"),
   accent: ansi("\x1b[0;1;38;5;255;49m"),
 };
-const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const cellWidth = (char: string): number => {
-  // Matching the ZWJ and variation selector individually is exactly what
-  // grapheme width measurement needs here.
-  // eslint-disable-next-line no-misleading-character-class
-  if (/^[\p{Mark}\u200d\ufe0f]+$/u.test(char)) return 0;
-  if (/\p{Emoji_Presentation}|\uFE0F|\u20E3/u.test(char)) return 2;
-  const cp = char.codePointAt(0)!;
-  return cp >= 0x1100
-    && (cp <= 0x115f
-      || (cp >= 0x2e80 && cp <= 0xa4cf)
-      || (cp >= 0xac00 && cp <= 0xd7a3)
-      || (cp >= 0xf900 && cp <= 0xfaff)
-      || (cp >= 0xfe10 && cp <= 0xfe6f)
-      || (cp >= 0xff00 && cp <= 0xff60)
-      || (cp >= 0x20000 && cp <= 0x3ffff))
-    ? 2
-    : 1;
-};
-export function fit(value: unknown, width: number): string {
-  let result = "",
-    cells = 0;
-  for (const { segment } of graphemes.segment(clean(value))) {
-    const size = cellWidth(segment);
-    if (cells + size > width) break;
-    result += segment;
-    cells += size;
-  }
-  return result + " ".repeat(Math.max(0, width - cells));
-}
-function wrap(value: unknown, width: number): string[] {
-  const lines: string[] = [];
-  let line = "",
-    cells = 0;
-  for (const { segment } of graphemes.segment(clean(value))) {
-    const size = cellWidth(segment);
-    if (cells + size > width && line) {
-      lines.push(line);
-      line = "";
-      cells = 0;
-    }
-    line += size > width ? "�" : segment;
-    cells += Math.min(size, width);
-  }
-  lines.push(line);
-  return lines;
-}
 const cell = (text: unknown, width: number, color = colors.white) =>
   color + fit(text, width) + reset;
 const animated = (row: Row) =>
@@ -103,9 +59,12 @@ function badge(row: Row, now: number): { text: string; color: string } {
   const text = row.verdict || (row.status === "not_run" ? "NOT RUN" : row.status.toUpperCase());
   if (row.verdict.startsWith("BAND ")) {
     const band = Number(row.verdict.slice(5));
+    let color = statusColors.red;
+    if (band === 2) color = statusColors.amber;
+    else if (band >= 3) color = statusColors.green;
     return {
       text: `${band}/3`,
-      color: band >= 3 ? statusColors.green : band === 2 ? statusColors.amber : statusColors.red,
+      color,
     };
   }
   if (/fail|error|reject|cancel|below_bar/.test(status))
@@ -142,25 +101,34 @@ export function dashboardBadge(row: Row, width: number, now: number): string {
   return result + reset;
 }
 
-const shortLabel = (label: string) =>
-  label
-    .replace("Verify ", "")
-    .replace("Description Quality", "Description")
-    .replace("Solution Quality", "Solution quality")
-    .replace("Test Quality", "Test quality")
-    .replace("Task Quality", "Task quality")
-    .replace("Verifier Incompleteness", "Verifier audit")
-    .replace(" · re-eval ", " / RE ");
+/** Shorter tile labels; the full name stays in the details pane. */
+const SHORT_LABELS: Array<[string, string]> = [
+  ["Verify ", ""],
+  ["Task Prompt Quality", "Task prompt"],
+  ["Solution Quality", "Solution quality"],
+  ["Test Quality", "Test quality"],
+  ["Task Quality", "Task quality"],
+  ["Verifier Completeness Audit", "Verifier audit"],
+  ["Problem Description & Tests", "Description & tests"],
+  ["GitHub Repository", "GitHub repo"],
+  ["Delivery Verification", "Delivery"],
+  [" · re-eval ", " / RE "],
+];
+const shortLabel = (label: string) => abbreviate(label, SHORT_LABELS);
 
 /** Label abbreviations used when a tile is too narrow for the full name. */
 const DENSE_LABEL_ABBREVIATIONS: Array<[string, string]> = [
   ["Test quality", "Test Q."],
   ["Task quality", "Task Q."],
   ["Solution quality", "Sol. Q."],
-  ["Description Quality", "Desc. Q."],
-  ["Description", "Desc."],
+  ["Task prompt", "Prompt Q."],
+  ["Description & tests", "Desc+tests"],
+  ["Plagiarism Review", "Plagiarism"],
+  ["Solution Patch", "Sol. patch"],
+  ["Verifier audit", "Verifier"],
+  ["Rollout Coach", "Coach"],
   ["Effective scope", "Scope"],
-  ["Image / Build", "Build"],
+  ["Image / Build", "Image"],
   ["Scope Gate", "Scope"],
   [" · re-eval ", "/R"],
   [" / RE ", "/R"],
@@ -216,7 +184,8 @@ function renderTile({
     );
   }
   if (lineIndex !== 0) return cell("", tileWidth);
-  return cell(` ${marker} ${item.label}`, tileWidth, colors.card);
+  const label = item.label.length + 3 <= tileWidth ? item.label : shortLabel(item.label);
+  return cell(` ${marker} ${label}`, tileWidth, colors.card);
 }
 
 function overviewState(status: string): { label: string; color: string } {
@@ -309,14 +278,10 @@ function acceptedWindowDelta(tokens: OverviewSnapshot["tokens"]): number | null 
   return Math.max(0, tokens.lifetimeAccepted - tokens.acceptedInWindow);
 }
 function renderTierDetails(tokens: OverviewSnapshot["tokens"]): string {
-  const drip =
-    tokens.dripPaused === true
-      ? "drip paused"
-      : tokens.dripUnlimited === true
-        ? "unlimited drip"
-        : tokens.tierDripAmount === null
-          ? "drip rate —"
-          : `+${tokenAmount(tokens.tierDripAmount)}/hr drip`;
+  let drip = `+${tokenAmount(tokens.tierDripAmount)}/hr drip`;
+  if (tokens.dripPaused === true) drip = "drip paused";
+  else if (tokens.dripUnlimited === true) drip = "unlimited drip";
+  else if (tokens.tierDripAmount === null) drip = "drip rate —";
   const cap = tokens.cap === null ? "cap —" : `${tokenAmount(tokens.cap)} cap`;
   const bonus =
     tokens.tierAcceptanceBonusUsd === null
@@ -360,13 +325,13 @@ function renderEloDetails(elo: OverviewSnapshot["elo"], now: number): string[] {
   ];
 }
 function chartLine(cells: Array<{ text: string; color: string }>, width: number): string {
-  const text = cells.map((cell) => cell.text).join("");
+  const text = cells.map((item) => item.text).join("");
   const visible = [...graphemes.segment(text)].reduce(
     (sum, part) => sum + cellWidth(part.segment),
     0,
   );
   return (
-    cells.map((cell) => cell.color + cell.text + reset).join("")
+    cells.map((item) => item.color + item.text + reset).join("")
     + cell("", Math.max(0, width - visible))
   );
 }
@@ -408,10 +373,10 @@ function renderPrestigeUsageChart(
       0,
       Math.min(plotWidth - 1, Math.round(((mark.at - (chartNow - spanMs)) / spanMs) * plotWidth)),
     );
-    markerCells[position] = {
-      text: "◆",
-      color: mark.countsAtRotation ? colors.green : mark.inWindow ? colors.amber : colors.muted,
-    };
+    let markerColor = colors.muted;
+    if (mark.inWindow) markerColor = colors.amber;
+    if (mark.countsAtRotation) markerColor = colors.green;
+    markerCells[position] = { text: "◆", color: markerColor };
   }
   const axis = `        aged out${" ".repeat(Math.max(1, plotWidth - 15))}now`;
   const hours = Math.max(1, Math.round(binMs / (60 * 60 * 1000)));
@@ -733,9 +698,10 @@ export function renderDashboard(
     height = Math.max(1, Math.min(rowsCount - 1, 150));
   const lines: string[] = [];
   const animatedLines = new Set<string>();
+  let autoScrolling = false;
   const put = (text: unknown, color = colors.white) => lines.push(cell(text, width, color));
   const snapshot = state.snapshot;
-  put(" OLYMPUS", colors.accent);
+  if (height >= 3) put(" OLYMPUS", colors.accent);
   if (state.mode === "overview") {
     lines.push(...renderOverviewBody(state, width, height, now));
   } else if (snapshot) {
@@ -748,7 +714,7 @@ export function renderDashboard(
           snapshot.status === "accepted" ? colors.green : colors.blue,
         )
           + cell(
-            `   v${snapshot.version ?? "—"}  ·  read only  ·  updated ${new Date(snapshot.fetchedAt).toLocaleTimeString()}`,
+            `   v${snapshot.version ?? "—"}${snapshot.submissionType ? `  ·  ${snapshot.submissionType.toUpperCase()}` : ""}  ·  read only  ·  updated ${new Date(snapshot.fetchedAt).toLocaleTimeString()}`,
             width - Math.min(width, 22, snapshot.status.length + 2),
             colors.dim,
           ),
@@ -769,10 +735,14 @@ export function renderDashboard(
     const balance = snapshot.sources.balance,
       budget = snapshot.sources.budget;
     const tokens = `TOKENS ${num(balance?.data?.balance)}`;
+    const stages = data.checks.filter(
+      (item) => item.key.startsWith("stage:") && item.key !== "stage:summary",
+    );
+    const stagesPassing = stages.filter((item) => /pass|warn/i.test(item.status)).length;
     const cards = [
       tokens,
-      `RUNS ${passing.length}/${current.length} PASS`,
-      `${running.length} RUNNING`,
+      stages.length > 0 ? `PRECHECKS ${stagesPassing}/${stages.length}` : "PRECHECKS —",
+      `RUNS ${passing.length}/${current.length} PASS${running.length > 0 ? ` · ${running.length} RUN` : ""}`,
       readinessKnown
         ? `${blockers.length} BLOCKERS / ${warnings.length} WARN`
         : "READINESS UNKNOWN",
@@ -797,47 +767,20 @@ export function renderDashboard(
     });
     const dense = height < 35 || width < 80;
     const tileHeight = dense ? 1 : 3;
-    const cols = Math.max(1, Math.floor((width + 2) / (dense ? (width < 60 ? 28 : 25) : 28)));
+    const denseColumnWidth = width < 60 ? 24 : 25;
+    const columnWidth = dense ? denseColumnWidth : 28;
+    const cols = Math.max(1, Math.floor((width + 2) / columnWidth));
     const showBudget = height >= 18 && budget?.data?.enabled === true;
     const showReady = height >= 18 && readinessKnown?.canSubmit === true;
     const footerSize = (height >= 5 ? 1 : 0) + Number(showBudget) + Number(showReady);
-    const preparation = data.checks.filter(
-      (item) => item.key.startsWith("stage:") || item.key === "scope" || item.key === "image",
-    );
-    const reviews = data.checks.filter(
-      (item) =>
-        item.key === "fp" || item.key.startsWith("review:") || /auto.?review/i.test(item.key),
-    );
-    const quality = data.checks.filter(
-      (item) => !preparation.includes(item) && !reviews.includes(item),
-    );
-    const sections = [
-      { title: "Preparation", items: preparation, section: 0 },
-      { title: "Quality Checks", items: quality, section: 0 },
-      {
-        title: state.history ? "Rollouts · history" : "Rollouts",
-        items: displayRuns,
-        section: 1,
-      },
-      {
-        title: "Auto Review",
-        items: reviews.filter((item) => item.key !== "fp"),
-        section: 0,
-      },
-      {
-        title: "FP Check",
-        items: reviews.filter((item) => item.key === "fp"),
-        section: 0,
-      },
-    ];
-    if (state.section === 2)
-      sections.push({ title: "Readiness", items: data.readiness, section: 2 });
+    const sections = dashboardSections(data, Boolean(state.history), state.section === 2);
     const bodyStart = lines.length;
     let focusStart = bodyStart,
       focusEnd = bodyStart;
     for (const group of sections) {
-      const original =
-        group.section === 0 ? data.checks : group.section === 1 ? displayRuns : data.readiness;
+      let original = data.readiness;
+      if (group.section === 0) original = data.checks;
+      else if (group.section === 1) original = displayRuns;
       const selectedItem = original[state.selected[group.section]];
       const selected = Math.max(0, group.items.indexOf(selectedItem));
       const needed = Math.max(1, Math.ceil(group.items.length / cols));
@@ -926,18 +869,11 @@ export function renderDashboard(
         ),
       );
     if (showReady) footer.push(cell(" READY TO SUBMIT", width, colors.green));
-    if (height >= 5)
-      footer.push(
-        cell(
-          state.details
-            ? " PgUp/PgDn details · Enter close · q exit"
-            : width < 95
-              ? " Tab/↑↓ select · Enter info · q exit"
-              : " q exit  r refresh  Tab section  arrows select  Enter details  b overview  h history  PgUp/PgDn page",
-          width,
-          colors.accent,
-        ),
-      );
+    let footerHint =
+      " q exit  r refresh  Tab section  arrows select  Enter details  b overview  h history  PgUp/PgDn page";
+    if (state.details) footerHint = " PgUp/PgDn details · Enter close · q exit";
+    else if (width < 95) footerHint = " Tab/↑↓ select · Enter info · q exit";
+    if (height >= 5) footer.push(cell(footerHint, width, colors.accent));
     const body = lines.splice(bodyStart);
     const room = Math.max(1, height - bodyStart - footer.length - details.length);
     let top = Math.max(0, Math.min(state.viewportTop ?? 0, body.length - room));
@@ -947,10 +883,23 @@ export function renderDashboard(
     if (start < top && end - start <= room) top = start;
     if (end - tileHeight < top) top = Math.max(0, end - tileHeight);
     top = Math.max(0, Math.min(top, body.length - room));
+    if (
+      (width < 80 || height < 24)
+      && body.length > room
+      && !state.details
+      && now >= (state.autoPausedUntil ?? 0)
+    ) {
+      state.autoPageStartedAt ??= now;
+      const page =
+        Math.floor(Math.max(0, now - state.autoPageStartedAt) / 6000)
+        % Math.ceil(body.length / room);
+      top = Math.min(body.length - room, page * room);
+      autoScrolling = true;
+    }
     state.viewportTop = top;
-    if (body.length > room)
+    if (body.length > room && bodyStart > 0)
       lines[0] = cell(
-        ` OLYMPUS · view ${top + 1}–${Math.min(top + room, body.length)}/${body.length} ${top ? "↑" : ""}${top + room < body.length ? "↓" : ""}`,
+        ` OLYMPUS · ${autoScrolling ? "auto" : "view"} ${top + 1}–${Math.min(top + room, body.length)}/${body.length} ${top ? "↑" : ""}${top + room < body.length ? "↓" : ""}`,
         width,
         colors.accent,
       );
@@ -968,6 +917,6 @@ export function renderDashboard(
   }
   while (lines.length < height) put("");
   const visibleLines = lines.slice(0, height);
-  if (info) info.animating = visibleLines.some((line) => animatedLines.has(line));
+  if (info) info.animating = autoScrolling || visibleLines.some((line) => animatedLines.has(line));
   return `\x1b[H${visibleLines.map((line) => `${line + reset}\x1b[K`).join("\r\n")}\x1b[J`;
 }
