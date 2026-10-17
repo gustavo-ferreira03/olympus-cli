@@ -369,48 +369,6 @@ const mine = defineCommand({
     );
   },
 });
-const queue = defineCommand({
-  meta: { name: "problems queue", description: "List challenges available for review" },
-  args: {
-    limit: { type: "string", description: `Max results (default ${DEFAULT_LIMIT})` },
-    json: { type: "boolean", description: "Output as JSON" },
-  },
-  run: async ({ args }) => {
-    const client = await getClient();
-    const limit = clampResultLimit(args.limit, DEFAULT_LIMIT);
-    const problems = await client.query(api.problems.listForReview, {});
-    if (!problems || problems.length === 0) {
-      if (args.json) {
-        printJson([]);
-        return;
-      }
-      console.log("  Review queue is empty.");
-      return;
-    }
-    const display = problems.slice(0, limit);
-    if (args.json) {
-      printJson(display);
-      return;
-    }
-    printTable(
-      display.map((problem: Problem) => ({
-        id: String(problem._id),
-        title:
-          (problem.title?.length ?? 0) > 50
-            ? `${problem.title.slice(0, 47)}...`
-            : (problem.title ?? ""),
-        lang: problem.language ?? "",
-        diff: problem.difficulty ?? "",
-      })),
-      [
-        { key: "id", label: "ID" },
-        { key: "title", label: "Title", width: 52 },
-        { key: "lang", label: "Lang", width: 12 },
-        { key: "diff", label: "Diff", width: 8 },
-      ],
-    );
-  },
-});
 const view = defineCommand({
   meta: { name: "problems view", description: "View challenge details" },
   args: {
@@ -435,7 +393,7 @@ const view = defineCommand({
         kind: "not_found",
         code: "resource.not_found",
         retryable: false,
-        hint: "Verify the challenge ID with olympus problems mine or olympus problems queue.",
+        hint: "Verify the challenge ID with olympus problems mine.",
       });
     }
     const latestVersion = data.latestVersion;
@@ -610,7 +568,7 @@ const download = defineCommand({
         kind: "not_found",
         code: "resource.not_found",
         retryable: false,
-        hint: "Verify the challenge ID with olympus problems mine or olympus problems queue.",
+        hint: "Verify the challenge ID with olympus problems mine.",
       });
     }
     const latestVersion = data.latestVersion;
@@ -1139,7 +1097,6 @@ export default defineCommand({
   subCommands: {
     create,
     mine,
-    queue,
     view,
     download,
     edit,
