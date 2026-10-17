@@ -6,6 +6,9 @@ import { dirname, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { parseDocument, type Document } from "yaml";
 import { parsePolicy } from "./policy.ts";
+import { describeCondition } from "./policy-language.ts";
+import { formatDynamicCheckLabel } from "./model.ts";
+import { toPublicCheckKey } from "./expected.ts";
 
 export type PolicyEditorResult =
   | { status: "save"; text: string }
@@ -39,6 +42,8 @@ const actionLabels: Record<string, string> = {
 function humanize(value: string): string {
   if (actionLabels[value]) return actionLabels[value];
   const raw = value.startsWith("checks.") ? value.slice("checks.".length) : value;
+  const checkLabel = formatDynamicCheckLabel(toPublicCheckKey(raw));
+  if (checkLabel !== raw) return checkLabel;
   return raw
     .replaceAll(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replaceAll(/[_.-]+/g, " ")
@@ -185,26 +190,11 @@ export function policyFlowLines(value: unknown, colors = true, state?: PolicyFlo
     return index === -1 ? Number.MAX_SAFE_INTEGER : index;
   };
   const gates = graph.gates && typeof graph.gates === "object" ? graph.gates : {};
-  const predicateDetail = (predicate: any): string | undefined => {
+  const predicateDetail = (predicate: any, check?: string): string | undefined => {
     const rawPath = String(predicate?.path ?? "").replace(/^output\./, "");
     if (!rawPath || ["status", "stale", "verdict"].includes(rawPath)) return undefined;
     if (rawPath.startsWith("checkInputs.")) return undefined;
-    const label = rawPath
-      .split(".")
-      .map((part) => humanize(part))
-      .join(" ");
-    if (Object.hasOwn(predicate, "equals")) return `${label}: ${String(predicate.equals)}`;
-    if (Object.hasOwn(predicate, "empty"))
-      return `${label}: ${predicate.empty ? "empty" : "not empty"}`;
-    if (Object.hasOwn(predicate, "exists"))
-      return `${label}: ${predicate.exists ? "exists" : "missing"}`;
-    if (Object.hasOwn(predicate, "at_least"))
-      return `${label}: at least ${String(predicate.at_least)}`;
-    if (Object.hasOwn(predicate, "less_than"))
-      return `${label}: less than ${String(predicate.less_than)}`;
-    if (Object.hasOwn(predicate, "greater_than"))
-      return `${label}: greater than ${String(predicate.greater_than)}`;
-    return undefined;
+    return describeCondition(predicate, check);
   };
   const actionDetails = (action: string): string => {
     const check = action.startsWith("checks.") ? action.slice("checks.".length) : undefined;
@@ -212,7 +202,7 @@ export function policyFlowLines(value: unknown, colors = true, state?: PolicyFlo
       | { all?: any[] }
       | undefined;
     const details = (gate?.all ?? [])
-      .map(predicateDetail)
+      .map((predicate: any) => predicateDetail(predicate, check))
       .filter((detail: string | undefined): detail is string => Boolean(detail));
     return details.length > 0 ? ` ${color.dim}[${details.join(" · ")}]${color.reset}` : "";
   };
@@ -469,20 +459,7 @@ export function policyFlowLines(value: unknown, colors = true, state?: PolicyFlo
           details.push(`${checkSubject}failed`);
         else if (checkMatch?.[2] === "output.evaluation.comments" && predicate.empty === false)
           details.push(`${checkSubject}has comments`);
-        else if (typeof predicate.equals === "boolean")
-          details.push(
-            predicate.equals ? predicatePathLabel(path) : `${predicatePathLabel(path)} false`,
-          );
-        else if (Object.hasOwn(predicate, "equals"))
-          details.push(
-            `${predicatePathLabel(path)}: ${predicate.equals === null ? "absent" : String(predicate.equals)}`,
-          );
-        else if (Object.hasOwn(predicate, "empty"))
-          details.push(`${predicatePathLabel(path)}: ${predicate.empty ? "empty" : "not empty"}`);
-        else if (Object.hasOwn(predicate, "less_than"))
-          details.push(`${predicatePathLabel(path)}: less than ${String(predicate.less_than)}`);
-        else if (Object.hasOwn(predicate, "exists"))
-          details.push(`${predicatePathLabel(path)}: ${predicate.exists ? "exists" : "missing"}`);
+        else details.push(describeCondition(predicate));
       }
       return [...new Set(details)].join(" and ");
     });

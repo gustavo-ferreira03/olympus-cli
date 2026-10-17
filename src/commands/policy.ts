@@ -1,3 +1,9 @@
+import {
+  describeActual,
+  describeCondition,
+  describeShortfall,
+  type ConditionPredicate,
+} from "../core/policy-language.ts";
 import { defineCommand } from "citty";
 import {
   mkdirSync,
@@ -207,14 +213,7 @@ function renderRules(policy: Policy, line: PolicyLine): void {
 }
 
 function predicateLabel(predicate: Predicate): string {
-  if (Object.hasOwn(predicate, "equals"))
-    return `${predicate.path} = ${humanValue(predicate.equals)}`;
-  if (Object.hasOwn(predicate, "empty"))
-    return `${predicate.path} ${predicate.empty ? "is empty" : "is not empty"}`;
-  if (Object.hasOwn(predicate, "exists"))
-    return `${predicate.path} ${predicate.exists ? "exists" : "does not exist"}`;
-  if (Object.hasOwn(predicate, "at_least")) return `${predicate.path} ≥ ${predicate.at_least}`;
-  return `${predicate.path} > ${predicate.greater_than}`;
+  return describeCondition(predicate as ConditionPredicate);
 }
 
 function nodeLines(node: PolicyNode, graph: Graph, full: boolean): string[] {
@@ -442,63 +441,10 @@ function renderInspection(
   );
 }
 
-function guidanceStatusLabel(status: Guidance["status"]): string {
-  const labels: Record<Guidance["status"], string> = {
-    ready: "READY",
-    blocked: "BLOCKED",
-    waiting: "WAITING",
-    terminal: "TERMINAL",
-    stuck: "STUCK",
-    confirmation_required: "CONFIRMATION REQUIRED",
-    needs_arguments: "ARGUMENTS REQUIRED",
-    complete: "NO ACTIVE NEXT ACTION",
-    unguided: "NO ACTIVE GRAPH",
-  };
-  return labels[status];
-}
-
 function guidanceStatusColor(status: Guidance["status"]): string {
   if (status === "ready") return "1;32";
   if (status === "blocked" || status === "terminal" || status === "stuck") return "1;31";
   return "1;33";
-}
-
-function renderGuidanceStep(
-  step: Guidance["steps"][number],
-  policy: Policy,
-  line: PolicyLine,
-): void {
-  const role = step.role === "expected" ? "expected" : "prerequisite";
-  const label = actionLabel(
-    step.action,
-    policy.graph?.actions[step.action]?.arguments,
-    step.command,
-  );
-  line(`${step.order}. ${label} · ${role} · ${step.status}`, "  ");
-  if (step.recommendationError) line(`Arguments: ${step.recommendationError}`, "    ");
-}
-
-function renderGuidanceBlockers(steps: Guidance["steps"], line: PolicyLine, full: boolean): void {
-  const blockers = [
-    ...new Map(
-      steps
-        .flatMap((step) => step.unmetRequirements)
-        .map((failure) => [
-          JSON.stringify([failure.profile, failure.path, failure.expected, failure.actual]),
-          failure,
-        ]),
-    ).values(),
-  ];
-  if (blockers.length === 0) return;
-  line("BLOCKERS", "", "1;36");
-  const shown = full ? blockers : blockers.slice(0, 3);
-  for (const failure of shown)
-    line(
-      `${humanName(failure.profile)} / ${failure.path || "action"}: expected ${humanValue(failure.expected)}, actual ${humanValue(failure.actual)}`,
-      "  ",
-    );
-  if (blockers.length > shown.length)
-    line(`${blockers.length - shown.length} more; use --full.`, "  ");
 }
 
 function checkMeetsAcceptanceGate(
@@ -637,6 +583,131 @@ function challengeFlowState(inspection: Inspection, policy: Policy): PolicyFlowS
   };
 }
 
+const nodeArguments = (policy: Policy, action: string): Record<string, unknown> | undefined =>
+  (policy.graph?.actions as Record<string, { arguments?: Record<string, unknown> }> | undefined)?.[
+    action
+  ]?.arguments;
+
+const STEP_MARKS: Record<string, [string, string, string]> = {
+  pass: ["✓", "passed", "32"],
+  fail: ["✗", "failed", "31"],
+  running: ["●", "running", "33"],
+  stale: ["↻", "out of date", "33"],
+  pending: ["○", "not done", "90"],
+};
+
+function guidanceSummary(inspection: Inspection, policy: Policy): string {
+  const guidance = inspection.guidance;
+  const label = (action: string | null | undefined) =>
+    action ? actionLabel(action, nodeArguments(policy, action)) : "the next action";
+  const actions = guidance.nextActions.length > 0 ? guidance.nextActions : [guidance.nextAction];
+  const names = actions.filter(Boolean).map(label).join(", ");
+  const fixed: Partial<Record<Guidance["status"], string>> = {
+    waiting: "Waiting: an action is still running; refresh when it finishes",
+    terminal: "Done: the graph reached its end for this challenge",
+    complete: "No next action: the graph has nothing left to run",
+    stuck: "Stuck: no allowed action can make progress",
+    unguided: "No action graph is configured",
+  };
+  if (fixed[guidance.status]) return fixed[guidance.status]!;
+  if (guidance.status === "blocked")
+    return `Blocked at ${label(guidance.nextAction ?? guidance.expectedAction)}: see what is missing below`;
+  if (guidance.status === "confirmation_required")
+    return `Needs confirmation: ${names || label(guidance.expectedAction)} is off the graph's path`;
+  if (guidance.status === "needs_arguments")
+    return `Needs arguments: ${names || label(guidance.expectedAction)}`;
+  const target =
+    guidance.expectedAction && !actions.includes(guidance.expectedAction)
+      ? ` — needed before ${label(guidance.expectedAction)}`
+      : "";
+  return actions.length > 1
+    ? `Next: ${names} can start together${target}`
+    : `Next: ${names} is ready to run${target}`;
+}
+
+const PIPELINE_ORDER = [
+  "artifacts.update",
+  "prechecks.run",
+  "scope_gate.run",
+  "image.build",
+  "checks.verifyTests",
+  "checks.verifySolution",
+  "checks.testQuality",
+  "checks.verifyFlakiness",
+  "checks.taskQuality",
+  "checks.solutionQuality",
+  "checks.descriptionQuality",
+  "checks.run_all",
+  "rollouts.run",
+  "re_evaluation.run",
+  "fp_check.run",
+  "checks.verifierIncompleteness",
+  "verifier_audit.decide",
+  "checks.rolloutCoach",
+  "checks.autoReview",
+  "auto_review.orchestrate",
+  "submission.submit",
+];
+
+function renderGuidanceSteps(inspection: Inspection, policy: Policy, line: PolicyLine): void {
+  const rank = (action: string) => {
+    const index = PIPELINE_ORDER.indexOf(action);
+    return index === -1 ? PIPELINE_ORDER.length : index;
+  };
+  const actions = Object.keys(policy.graph?.actions ?? {}).toSorted(
+    (left, right) => rank(left) - rank(right),
+  );
+  if (actions.length === 0) return;
+  const flow = challengeFlowState(inspection, policy);
+  const next = new Set<string>(inspection.guidance.nextActions);
+  const width = Math.max(
+    ...actions.map((action) => actionLabel(action, nodeArguments(policy, action)).length),
+  );
+  line("STEPS", "", "1;36");
+  for (const action of actions) {
+    const status = flow.statuses?.[action] ?? "pending";
+    const [mark, word, color] = STEP_MARKS[status];
+    const isNext = next.has(action);
+    const detail = flow.details?.[action];
+    line(
+      `${isNext ? "→" : mark} ${actionLabel(action, nodeArguments(policy, action)).padEnd(width)}  ${isNext ? "next" : word}${detail ? ` · ${detail}` : ""}`,
+      "  ",
+      isNext ? "1;36" : color,
+    );
+  }
+}
+
+function renderGuidanceMissing(steps: Guidance["steps"], line: PolicyLine, full: boolean): void {
+  const missing = [
+    ...new Map(
+      steps
+        .flatMap((step) => step.unmetRequirements)
+        .map((failure) => {
+          const expected =
+            failure.expected && typeof failure.expected === "object"
+              ? (failure.expected as Record<string, unknown>)
+              : null;
+          const predicate = expected ? { path: failure.path, ...expected } : null;
+          const key = predicate
+            ? describeCondition(predicate, failure.check)
+            : `${humanName(failure.profile)}: ${humanValue(failure.expected)}`;
+          return [
+            key,
+            predicate
+              ? describeShortfall(predicate, failure.check, failure.actual)
+              : `${key} (now: ${describeActual(failure.actual)})`,
+          ];
+        }),
+    ).values(),
+  ];
+  if (missing.length === 0) return;
+  line("WHAT IS MISSING", "", "1;36");
+  const shown = full ? missing : missing.slice(0, 5);
+  for (const item of shown) line(`• ${item}`, "  ");
+  if (missing.length > shown.length)
+    line(`${missing.length - shown.length} more; use --full.`, "  ", "90");
+}
+
 function renderGuidance(
   inspection: Inspection,
   policy: Policy,
@@ -644,74 +715,33 @@ function renderGuidance(
   full: boolean,
 ): void {
   const guidance = inspection.guidance;
-  line(`Challenge ${inspection.challengeId}`);
-  line(`Version   ${inspection.versionId}`);
-  line(
-    `Status: ${guidanceStatusLabel(guidance.status)} · ${guidance.mode}`,
-    "",
-    guidanceStatusColor(guidance.status),
-  );
-  line(
-    `Workflow state: ${inspection.workflowState.status.toUpperCase()} · ${inspection.workflowState.reason}`,
-    "  ",
-    "90",
-  );
-  if (guidance.expectedAction && guidance.expectedAction !== guidance.nextAction)
+  const state = (inspection as { state?: any }).state;
+  const title = typeof state?.problem?.title === "string" ? state.problem.title : null;
+  const version = typeof state?.version?.version === "number" ? `v${state.version.version}` : null;
+  if (title) line(title, "  ", "1");
+  line([version, inspection.challengeId].filter(Boolean).join("  ·  "), "  ", "90");
+  line(guidanceSummary(inspection, policy), "  ", guidanceStatusColor(guidance.status));
+  if (guidance.mode !== "enforce" && policy.graph)
     line(
-      `Target: ${actionLabel(
-        guidance.expectedAction,
-        policy.graph?.actions[guidance.expectedAction]?.arguments,
-        guidance.steps.find((step) => step.action === guidance.expectedAction)?.command,
-      )}`,
+      guidance.mode === "advise"
+        ? "Advisory graph: other actions are allowed after confirmation."
+        : "The graph is off: actions are not sequenced.",
       "  ",
       "90",
     );
-  if (guidance.options.length > 1) {
-    line("Next step:", "  ", "1");
-    line("These actions can start together:", "    ", "90");
+  if (guidance.options.length > 1)
     guidance.options.forEach((option, index) => {
-      let status = "arguments required";
-      if (option.status === "ready") status = "ready";
-      else if (option.status === "confirmation_required") status = "confirmation required";
       line(
-        `${index + 1}. ${actionLabel(
-          option.action,
-          policy.graph?.actions[option.action]?.arguments,
-          option.command,
-        )} · ${status}`,
+        `${index + 1}. ${actionLabel(option.action, nodeArguments(policy, option.action), option.command)}${option.status === "ready" ? "" : ` · ${option.status.replaceAll("_", " ")}`}`,
         "    ",
-        "1",
       );
-      if (option.recommendationError) {
-        line(`Arguments: ${option.recommendationError}`, "      ");
-      }
+      if (option.recommendationError) line(`Arguments: ${option.recommendationError}`, "      ");
     });
-  } else {
-    if (guidance.nextAction) {
-      const label = guidance.status === "ready" ? "Next step" : "Blocked at";
-      line(
-        `${label}: ${actionLabel(
-          guidance.nextAction,
-          policy.graph?.actions[guidance.nextAction]?.arguments,
-          guidance.nextCommand ?? guidance.proposedCommand,
-        )}`,
-        "  ",
-        "1",
-      );
-    }
-    if (!guidance.nextCommand && guidance.proposedCommand)
-      renderCommand(guidance.proposedCommand, line, "Proposed:");
-  }
   if (guidance.nextCommand) renderCommand(guidance.nextCommand, line, "Run:");
-  const showPath =
-    guidance.steps.length > 1
-    || guidance.steps.some((step) => step.unmetRequirements.length > 0 || step.recommendationError);
-  if (showPath) {
-    line("PATH", "", "1;36");
-    for (const step of guidance.steps) renderGuidanceStep(step, policy, line);
-    renderGuidanceBlockers(guidance.steps, line, full);
-  }
-  if (policy.graph && policy.graph.mode !== "off") {
+  else if (guidance.proposedCommand) renderCommand(guidance.proposedCommand, line, "Proposed:");
+  if (policy.graph && policy.graph.mode !== "off") renderGuidanceSteps(inspection, policy, line);
+  renderGuidanceMissing(guidance.steps, line, full);
+  if (full && policy.graph && policy.graph.mode !== "off") {
     line("FLOW", "", "1;36");
     const flowColors = Boolean(
       process.stdout.isTTY && !("NO_COLOR" in process.env) && process.env.TERM !== "dumb",
@@ -725,9 +755,10 @@ function renderGuidance(
       `${guidance.notes.length} applicable; ${guidance.pendingNotes.length} awaiting acknowledgment.`,
       "  ",
     );
-    line(`Read separately: olympus policy notes list ${inspection.challengeId}`, "  ");
+    line(`Read them: olympus policy notes list ${inspection.challengeId}`, "  ");
   }
   renderCommand(guidance.refreshCommand, line, "Refresh:");
+  if (!full) line("Full flow and every decision: add --full.", "  ", "90");
 }
 
 function renderPolicyView(
