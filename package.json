@@ -1,7 +1,7 @@
 {
   "name": "olympus-cli-gustavos-fork",
   "version": "0.2.0-gustavo.1",
-  "description": "Olympus CLI \u2014 Gustavo's Fork, maintained in TypeScript with current check APIs",
+  "description": "Olympus CLI — Gustavo's Fork, maintained in TypeScript with current check APIs",
   "type": "module",
   "homepage": "https://shipd.ai/quests/olympus",
   "keywords": [
@@ -10,6 +10,14 @@
     "cli",
     "convex"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gustavo-ferreira03/olympus-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gustavo-ferreira03/olympus-cli/issues"
+  },
+  "author": "Gustavo Ferreira",
   "engines": {
     "node": ">=20"
   },

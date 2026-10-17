@@ -10,23 +10,24 @@ Use it to inspect and edit challenges, run prechecks and quality checks, manage 
 - [Get started](#get-started)
 - [Command overview](#command-overview)
 - [Inspect a challenge](#inspect-a-challenge)
+- [Prerequisites](#prerequisites)
 - [Live terminal dashboard](#live-terminal-dashboard)
 - [Build the version image](#build-the-version-image)
 - [Prechecks and quality checks](#prechecks-and-quality-checks)
 - [Scope Gate and later-stage reviews](#scope-gate-and-later-stage-reviews)
 - [Rollouts](#rollouts)
 - [Artifact output without external tools](#artifact-output-without-external-tools)
-- [JSON behavior for agents](#json-behavior-for-agents)
+- [JSON behavior](#json-behavior)
 - [Download a challenge locally](#download-a-challenge-locally)
 - [Create, edit, and version drafts](#create-edit-and-version-drafts)
 - [Policy](#policy)
   - [Action graph](#action-graph)
 - [Environment](#environment)
-- [Development](#development)
+- [Update](#update)
 
 ## Installation
 
-Requires Node.js 20 or newer and pnpm. This repository is installed from source; the package is marked private and self-update is disabled unless explicitly configured. `policy edit` additionally requires `flock` (util-linux), so use Linux/WSL or a Linux SSH host for that command.
+Requires Node.js 20 or newer and pnpm. The CLI is installed from source. `policy edit` also requires `flock` (util-linux), so run that command on Linux or WSL.
 
 ```bash
 git clone https://github.com/gustavo-ferreira03/olympus-cli.git
@@ -60,7 +61,7 @@ olympus problems view <challenge-id>
 olympus problems view <challenge-id> --json
 ```
 
-The JSON form is compact by default and includes safe next commands for deeper inspection.
+The JSON form is compact and includes follow-up commands for more detail.
 
 ## Command overview
 
@@ -70,22 +71,24 @@ olympus problems         Challenge metadata, artifacts, versions, and submission
 olympus checks           Prechecks, quality checks, findings, and readiness
 olympus image            Version image build, status, waiting, and cancellation
 olympus scope-gate       Scope Gate inspection and execution
+olympus delivery-verification  Delivery verification state
 olympus fp-check         False-positive check inspection and execution
 olympus verifier-audit   Verifier Completeness Audit and decisions
 olympus auto-review      Auto Review inspection and execution
 olympus contest          Quality-check contests
 olympus runs             Rollout batches, runs, artifacts, and re-evaluation
-olympus tokens           Token balance, usage history, and challenge costs
+olympus tokens           Token balance, usage history, progression, and challenge costs
+olympus prestige         Prestige ELO outlook, leaderboard, and category boosts
 olympus policy           Policy rules and optional action graph
-olympus dashboard        Read-only terminal dashboard with polling
-olympus schema           JSON command discovery from the running CLI
+olympus dependencies     What a challenge still needs before an action can run
+olympus dashboard        Live read-only terminal dashboard
+olympus bot              Chat with Shipd Bot about a challenge
+olympus schema           JSON description of every command
+olympus view <id>        Shortcut for `olympus problems view <id>`
 ```
 
-Run `olympus <command> --help` for the exact arguments accepted by a command.
-Groups without an action display their own help. `olympus schema` emits the
-declared command tree as JSON; `olympus schema runs run` selects one command.
-The manifest includes paths, metadata, argument definitions, declared defaults,
-aliases, flags and child names. Undeclared response schemas and examples are not invented.
+Run `olympus <command> --help` for the arguments a command accepts. `olympus schema`
+prints the whole command tree as JSON; `olympus schema runs run` prints one command.
 
 ## Inspect a challenge
 
@@ -117,6 +120,21 @@ Request the complete response only when necessary:
 olympus problems view <challenge-id> --json --full
 ```
 
+## Prerequisites
+
+Check what a challenge still needs before an action can run, without starting anything:
+
+```bash
+olympus dependencies catalog --json
+olympus dependencies view <challenge-id> --json
+olympus dependencies view <challenge-id> --action=checks.verifySolution --json
+olympus dependencies view <challenge-id> --action=checks.run_all --checks=verifyTests,verifyFlakiness --json
+```
+
+Commands that start work run the same check first. When something is missing they stop
+with `dependencies.blocked`, listing each unmet requirement and a command to inspect or
+fix it. Nothing is run on your behalf, and the platform can still reject a request.
+
 ## Live terminal dashboard
 
 ```bash
@@ -131,14 +149,25 @@ Without an ID, the interactive dashboard shows account metrics and a selectable
 challenge list. Archived challenges are hidden by default. Use
 `--include-archived` to show them, or combine `--status`, `--language`,
 `--difficulty` and `--category` to filter the overview. Filter values are
-case-insensitive; `all` clears a filter. The filter state remains available in
-`--json` output.
+case-insensitive; `all` clears a filter.
 
 Use Up/Down (or PgUp/PgDn) to select a challenge and Enter to open its live
 monitor. Press `b` or Escape in the monitor to return to the overview; `q` exits
 and `r` refreshes. The overview contains the Home summary, Account information
-and the selectable Challenges list. The detail monitor displays the selected
-challenge state.
+and the selectable Challenges list. The detail monitor groups the selected
+challenge's state the way the platform does: each precheck stage (GitHub Repository,
+Problem Description & Tests, Plagiarism Review, Dockerfile, Solution Patch), Build &
+Scope (image, Scope Gate), Quality Checks, Audits (Verifier Completeness
+Audit, Rollout Coach), Auto Review, FP Check & Delivery, and Rollouts. The header shows
+the submission type and precheck/rollout counts.
+
+Updates arrive live as soon as anything changes on the platform. Press `r` to reconnect
+and reload everything.
+
+In the monitor, Tab moves between sections, the arrows select a tile, Enter opens its
+details and `h` toggles rollout history. Small terminals get denser tiles; when the
+content does not fit, the view pages automatically every six seconds (keyboard input
+pauses it).
 
 Colors are emitted only in a TTY; set `NO_COLOR` to disable them.
 
@@ -148,11 +177,18 @@ The account telemetry is also available without opening the TUI:
 olympus tokens balance --json
 olympus tokens usage --json
 olympus tokens usage --json --from 2026-09-14 --to 2026-09-15
+olympus tokens progression --json
+olympus prestige outlook --exact --json
+olympus prestige leaderboard --json
+olympus prestige boosts --json
 ```
 
-`tokens balance` exposes the current tier, cap, drip, acceptance-window and
-lifetime counters, next-tier requirement, and feature flags. `tokens usage`
-provides grants, spending totals and usage bins for the selected period.
+`tokens balance` shows your tier, cap, drip, accepted counts in the current window and
+lifetime, what the next tier requires, and any comeback offer. `tokens usage` shows
+grants and spending for a period; the platform keeps only the 50 most recent entries,
+so the output warns when `--from` reaches further back than that.
+
+`prestige outlook --exact` computes your ELO precisely (slower).
 
 ## Build the version image
 
@@ -190,6 +226,7 @@ Run prechecks:
 ```bash
 olympus checks run-prechecks <challenge-id> --json
 olympus checks run-prechecks <challenge-id> --wait --json
+olympus checks run-prechecks <challenge-id> --use-general-tokens --json
 ```
 
 Inspect current state:
@@ -223,30 +260,30 @@ olympus checks run <challenge-id> --check=testQuality --wait --json
 olympus checks run <challenge-id> --check=solutionQuality --wait --json
 ```
 
-Run the production check set:
+Run all quality checks:
 
 ```bash
 olympus checks run-all <challenge-id> --wait --json
 ```
 
-Current public check keys:
+Check keys and the names the platform shows for them:
 
-```text
-verifyTests
-verifySolution
-verifyFlakiness
-testQuality
-taskQuality
-solutionQuality
-descriptionQuality
-```
+| Key                      | Platform name               |
+| ------------------------ | --------------------------- |
+| `verifyTests`            | Verify Tests                |
+| `verifySolution`         | Verify Solution             |
+| `verifyFlakiness`        | Verify Flakiness            |
+| `testQuality`            | Test Quality                |
+| `taskQuality`            | Task Quality                |
+| `solutionQuality`        | Solution Quality            |
+| `descriptionQuality`     | Task Prompt Quality         |
+| `rolloutCoach`           | Rollout Coach               |
+| `autoReview`             | Auto Review                 |
+| `verifierIncompleteness` | Verifier Completeness Audit |
 
-Later-stage checks use their dedicated commands:
-
-```text
-autoReview
-verifierIncompleteness
-```
+Use these keys in commands and policy files. `run-all` runs the first seven; Rollout
+Coach runs on its own, and Auto Review and the Verifier Completeness Audit use the
+`auto-review` and `verifier-audit` commands.
 
 ### Wait separately
 
@@ -281,13 +318,30 @@ olympus scope-gate run <challenge-id> --json
 olympus scope-gate wait <challenge-id> --json
 ```
 
+Delivery verification:
+
+```bash
+olympus delivery-verification view <challenge-id> --json
+```
+
+Shows the verification that runs after submitting: status, progress, current step and
+any failure.
+
 False-positive check:
 
 ```bash
 olympus fp-check view <challenge-id> --json
 olympus fp-check run <challenge-id> --json
 olympus fp-check wait <challenge-id> --json
+olympus fp-check contest <challenge-id> --note="<reason>" --json
+olympus fp-check keep-paths <challenge-id> --json
+olympus fp-check keep-paths <challenge-id> --set=src/,lib/ --json
+olympus fp-check keep-paths <challenge-id> --clear --json
 ```
+
+When the FP check flags a false positive, `fp-check wait` exits non-zero and reports
+`verdict: "false_positive"`. `contest` works only while the platform allows contesting
+that result. `keep-paths` protects up to 10 repository folders from the next FP check.
 
 Verifier Completeness Audit:
 
@@ -311,11 +365,14 @@ Quality-check contests:
 
 ```bash
 olympus contest view <challenge-id> --json
-olympus contest description <challenge-id> --json
+olympus contest task-prompt <challenge-id> --json
 olympus contest test-quality <challenge-id> --note="<reason>" --json
 olympus contest solution <challenge-id> --note="<reason>" --json
+olympus contest category <challenge-id> --note="<reason>" --json
 olympus contest task-as-mars <challenge-id> --json
 ```
+
+`contest category` contests a failed `category_alignment` precheck.
 
 ## Rollouts
 
@@ -403,24 +460,22 @@ Available selectors:
 
 JSON artifacts are capped at 12,000 characters by default. A truncated response reports total, returned, and omitted characters plus a command for retrieving the complete artifact.
 
-## JSON behavior for agents
+## JSON behavior
 
 Machine-readable commands follow these rules:
 
 - stdout contains exactly one JSON document;
 - polling progress is suppressed in JSON mode;
-- command exceptions preserve `status`, the text `error`, and policy `rule`/details, and add `kind`, `code`, `retryable` and `hint`;
+- errors include `error`, `kind`, `code`, `retryable` and `hint` (plus the policy `rule` when a policy blocked the command);
 - empty waits return `status: "idle"` instead of historical payloads;
 - null and empty fields are removed from compact responses;
 - large raw payloads require `--full`;
 - paginated responses include `nextCommand` when more data exists;
 - wait commands retry transient connection failures while polling.
 
-Error kinds include `usage`, `auth`, `permission`, `not_found`, `rate_limit`,
-`network`, `config`, `policy`, `budget` and `unknown`. Unknown failures use
-`retryable: null`. A transient error should be inspected before retrying a paid
-request. Existing exit codes and `--json` behavior remain stable.
-
+Error kinds are `usage`, `auth`, `permission`, `not_found`, `rate_limit`, `network`,
+`config`, `policy`, `budget` and `unknown`. Inspect a transient error before retrying a
+request that costs tokens.
 
 ## Download a challenge locally
 
@@ -437,6 +492,12 @@ The generated directory includes the canonical challenge artifacts and a Makefil
 
 ```bash
 olympus problems create --title="My draft" --json
+olympus problems create --diamond --json
+olympus problems mine --archived --json
+olympus problems archive <challenge-id> --json
+olympus problems unarchive <challenge-id> --json
+olympus problems type <challenge-id> --json
+olympus problems type <challenge-id> mars --json
 olympus problems edit <challenge-id> --description-file=task.md --json
 olympus problems version list <challenge-id> --json
 olympus problems version view <challenge-id> --version=1 --json
@@ -451,30 +512,45 @@ Submission remains explicit:
 
 ```bash
 olympus problems submit <challenge-id> --json
+olympus problems submit <challenge-id> --skip-human-review --json
+olympus problems submit <challenge-id> --type=mars --include-coauthorship --json
 ```
+
+`problems create --diamond` creates a Diamond draft. `problems type` shows which
+submission types are available to you and changes it; switching away from a type that
+already has a Task Quality result needs `--yes`. `problems mine` hides archived
+challenges unless `--archived` is passed.
+
+On submit, `--type` picks the lane (`olympus` or `mars`; Diamond always uses
+`olympus`), `--include-coauthorship` includes your coauthors, and
+`--skip-human-review` asks to skip human review when you are eligible. If the response
+says verification started, the challenge is submitted automatically once it passes.
 
 ## Policy
 
-Policies define permissions, limits and optional action-graph requirements.
-Validation occurs when the policy is loaded; decisions are evaluated when the
-corresponding command runs.
+A policy is a local file that limits what the CLI may do on your behalf: which checks
+and models it can run, token limits, and optionally the order of steps. It is checked
+every time a command runs.
 
-`policy show` displays configured rules and graph nodes. Use `--full` to expand
-predicates, arguments and notes. With a challenge ID, it also displays the
-current state relevant to those rules. Colors are TTY-only and respect
-`NO_COLOR`.
+`policy show` displays the rules; `--full` expands them. With a challenge ID it also
+shows what currently blocks or is suggested for that challenge.
 
 ```bash
 olympus policy show                        # human rules and graph, no API calls
 olympus policy show --full                 # expanded human policy definitions
 olympus policy show <challenge-id>         # current blockers and suggestions
+olympus policy guide <challenge-id> --json  # focused workflow guidance
 olympus policy show --json                 # effective configuration, no API calls
 olympus policy show <challenge-id> --json  # configuration plus state-aware decisions
 olympus policy show <challenge-id> --full --json  # also include canonical state
 ```
 
-For agent-authored policies, discover the contract instead of guessing field names
-or graph behavior:
+`policy guide` tells you the next step. It returns `guidance.status`, the expected
+action and the exact `nextCommand`. Run `nextCommand` only when the status is `ready`;
+`blocked` means there is nothing safe to run yet. After any change, run the returned
+`refreshCommand` before choosing the next step.
+
+To write a policy, start from the schema and examples:
 
 ```bash
 olympus schema policy --json                # policy schema, action catalog and examples
@@ -483,48 +559,29 @@ olympus policy init --json                  # optional human/editor starter
 olympus policy edit <key> <yaml-value> --json  # typed single-key update
 ```
 
-The `policyAuthoring` object returned by `olympus schema policy` is the source of
-truth for policy creation. It contains the JSON Schema, canonical root keys,
-all governable actions with their CLI commands and configurable arguments,
-valid predicate operators, omission/null semantics, and minimal YAML examples.
-Agents should select only actions from `actionCatalog`, write only schema-valid
-YAML, and keep `graph: null` unless they intentionally declare sequencing. The
-CLI does not infer edges, gates, defaults, or a start action from omitted fields.
+`olympus schema policy` lists every field, the actions a policy can govern with their
+commands and arguments, and YAML examples. Keep `graph: null` unless you want to
+enforce an order of steps.
 
-Contextual inspection uses the same core decision evaluator as dispatch. Check
-allowlists, request-size limits, passing-check protection and graph requirements
-appear together. `executionPreflight: required` distinguishes inspection from
-execution permission. Exact arguments, cross-version capacity, live costs, balance,
-budget reservations and platform prerequisites are checked at execution time.
-The platform's `canSubmit` fact is reported separately from policy decisions.
-
-`policy edit` validates the resulting file before saving it. For non-interactive
-edits, provide a dotted key and a YAML-typed value. Use `null` to disable an
-optional rule:
+`policy edit` validates the file before saving. Give a dotted key and a YAML value;
+`null` disables a rule:
 
 ```bash
 olympus policy edit tokens.challenge_budget 100 --json
 olympus policy edit tokens.min_remaining_balance 20 --json
 ```
 
-A rejected operation reports the policy rule and structured details. It does not
-start the operation.
+When a policy blocks a command, it reports the rule and does not start anything.
+Omitted or `null` rules are inactive; `0` is an active limit.
+`checks.allow_rerun_passing: false` stops you from rerunning a check that already
+passed for the current inputs.
 
-`checks.allow_rerun_passing: false` blocks a completed, current (`stale: false`)
-PASS check or precheck bundle before paid dispatch. Stale results remain eligible
-for rerun; unreadable or ambiguous state is rejected.
-
-`workflow` is accepted as a legacy input alias for `graph`. The canonical output
-uses `graph`. Omitted or `null` rules are inactive. Numeric zero is an active
-limit. Platform eligibility and request validation remain independent of local
-policy.
-
-`policy show --json` normalizes disabled leaves to `null` and reports `source: "missing"` when no file exists. The following is the optional `policy init` template, not runtime defaults; editor schema defaults are suggestions only:
+`olympus policy init` writes this starter file (it is not applied until you create it):
 
 ```yaml
 # yaml-language-server: $schema=./policy.schema.json
 runs:
-  max_runs: { nova: 10, vega: 0, orion: 0, castor: 0 } # Maximum current original runs per model
+  max_runs: { nova: 10, vega: 0, orion: 0, castor: 0 } # Maximum current runs per model, re-evaluated included
   allow_full_preset: false # Allow the full rollout preset
   allow_manual_batch_name: false # Allow explicit batch names
   allow_cancellations: false # Allow run cancellations
@@ -532,6 +589,7 @@ runs:
   re_evaluation:
     enabled: true # Allow re-evaluating existing solutions
     max_attempts: 1 # Maximum attempts per solution set across challenge versions
+    block_new_runs_when_available: false # Block new rollout runs while re-evaluation is available
 
 tokens:
   allow_general_tokens: false # Allow explicit use of general tokens
@@ -565,28 +623,20 @@ graph: null
 
 ### Action graph
 
-`graph` is optional. Set `graph: null` or omit it to disable sequencing. The
-available modes are `off`, `advise` and `enforce`. Requirements, transitions and
-notes are evaluated only when declared in the policy.
+`graph` is optional and defines the order of steps. Modes are `off`, `advise` (asks
+for confirmation before stepping off the graph) and `enforce`. `olympus policy show
+<challenge-id> --json` shows the state the graph is evaluated against.
 
-`olympus policy show <challenge-id> --json` includes the current state used for
-policy decisions. Platform readiness and technical prerequisites are reported
-separately.
-
-Predicates support exactly one operation: `equals`, `empty`, `greater_than`, or
-`at_least`. Paths use safe dotted property names. Missing or invalid values do
-not satisfy predicates. `start` is optional; without it, no sequence is inferred.
-`confirmation` is required in `advise` mode.
-
-Nodes can include an `arguments` mapping for recommended CLI invocations. A
-transition with `action: null` ends that branch. Cycles in active transitions are
-reported as errors.
+Each predicate uses one operator: `equals`, `empty`, `greater_than` or `at_least`; a
+missing value never matches. Nodes can include `arguments` for the suggested command,
+and a transition with `action: null` ends that branch.
 
 Example:
+
 ```yaml
 graph:
   mode: advise
-  start: checks.solutionQuality
+
   confirmation:
     method: token
     expires_after: 5m
@@ -659,13 +709,13 @@ graph:
 
 ## Environment
 
-| Variable                  | Default                             | Purpose                                                |
-| ------------------------- | ----------------------------------- | ------------------------------------------------------ |
-| `OLYMPUS_URL`             | `https://shipd.ai/quests/olympus`   | Frontend base URL for authentication and configuration |
-| `OLYMPUS_CONVEX_URL`      | fetched from `/api/cli/config`      | Convex deployment override                             |
-| `OLYMPUS_API_URL`         | `https://shipd-mars-v2.convex.site` | HTTP API override                                      |
-| `OLYMPUS_NO_UPDATE_CHECK` | unset                               | Disable the non-blocking version check                 |
-| `OLYMPUS_UPDATE_PACKAGE`  | unset                               | Optional published package used by self-update         |
+| Variable                  | Default                             | Purpose                                         |
+| ------------------------- | ----------------------------------- | ----------------------------------------------- |
+| `OLYMPUS_URL`             | `https://shipd.ai/quests/olympus`   | Platform URL used for sign-in and configuration |
+| `OLYMPUS_CONVEX_URL`      | fetched from the platform           | Backend override                                |
+| `OLYMPUS_API_URL`         | `https://shipd-mars-v2.convex.site` | HTTP API override                               |
+| `OLYMPUS_NO_UPDATE_CHECK` | unset                               | Disable the version check                       |
+| `OLYMPUS_UPDATE_PACKAGE`  | unset                               | Package used by `olympus update`                |
 
 Credentials are stored at:
 
@@ -673,14 +723,10 @@ Credentials are stored at:
 ~/.shipd/olympus/credentials.json
 ```
 
-## Development
+## Update
 
 ```bash
+git pull
 pnpm install --frozen-lockfile
-pnpm run typecheck
-pnpm run clean
 pnpm run build
-node dist/index.js --help
 ```
-
-Source files live under `src/`. Relative source imports use `.ts`; TypeScript rewrites them to `.js` in `dist/`. Generated files under `dist/` are not committed and must not be edited directly.
