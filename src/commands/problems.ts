@@ -7,8 +7,10 @@ import {
   asId,
   getClient,
   parseVersionNumber,
+  requireProblemVersion,
   resolveProblemVersion,
 } from "../platform/convex.ts";
+import { queryPrecheckStages } from "../platform/prechecks.ts";
 import { printJson, printKeyValue, printTable, statusBadge, truncate } from "../terminal/format.ts";
 import { omitEmpty } from "../terminal/output.ts";
 import {
@@ -267,6 +269,7 @@ const create = defineCommand({
     category: { type: "string", description: "Category" },
     difficulty: { type: "string", description: "Difficulty" },
     "estimated-loc": { type: "string", description: "Estimated solution LOC" },
+    diamond: { type: "boolean", description: "Create a Diamond challenge draft" },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
@@ -274,21 +277,43 @@ const create = defineCommand({
     const estimatedLOC = args["estimated-loc"]
       ? Number.parseInt(args["estimated-loc"], 10)
       : undefined;
-    const result = await client.mutation(api.problems.createDraft, {
-      title: args.title,
-      description: args.description,
-      githubRepoUrl: args.repo,
-      githubCommitHash: args.commit,
-      language: args.language,
-      category: args.category,
-      difficulty: args.difficulty,
-      estimatedLOC: Number.isFinite(estimatedLOC) ? estimatedLOC : undefined,
-    });
+    const fields = Object.fromEntries(
+      Object.entries({
+        title: args.title,
+        description: args.description,
+        githubRepoUrl: args.repo,
+        githubCommitHash: args.commit,
+        language: args.language,
+        category: args.category,
+        difficulty: args.difficulty,
+        estimatedLOC: Number.isFinite(estimatedLOC) ? estimatedLOC : undefined,
+      }).filter(([, value]) => value !== undefined),
+    );
+    // The platform creates empty drafts and fills them through updateDraft.
+    const result = await client.mutation(
+      args.diamond ? api.problems.createDiamondDraft : api.problems.createDraft,
+      {},
+    );
+    if (Object.keys(fields).length > 0) {
+      try {
+        await client.mutation(api.problems.updateDraft, { problemId: result.problemId, ...fields });
+      } catch (error) {
+        throw new CliError(
+          `Created challenge draft ${result.problemId}, but setting its fields failed: ${error instanceof Error ? error.message : String(error)}`,
+          {
+            kind: "unknown",
+            code: "draft.update_failed",
+            retryable: true,
+            hint: `Retry with: olympus problems edit ${result.problemId} --title ...`,
+          },
+        );
+      }
+    }
     if (args.json) {
       printJson(result);
       return;
     }
-    console.log(`\n  Created challenge draft ${result.problemId}`);
+    console.log(`\n  Created ${args.diamond ? "Diamond " : ""}challenge draft ${result.problemId}`);
     console.log(`  Run: olympus problems view ${result.problemId}\n`);
   },
 });
@@ -297,6 +322,7 @@ const mine = defineCommand({
   args: {
     status: { type: "string", description: "Filter by status" },
     limit: { type: "string", description: `Max results (default ${DEFAULT_LIMIT})` },
+    archived: { type: "boolean", description: "Include archived challenges" },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
@@ -304,7 +330,10 @@ const mine = defineCommand({
     const limit = clampResultLimit(args.limit, DEFAULT_LIMIT);
     const queryArgs: Record<string, unknown> = {};
     if (args.status) queryArgs.status = args.status;
-    const problems = await client.query(api.problems.listByUser, queryArgs);
+    const listed = await client.query(api.problems.listByUser, queryArgs);
+    const problems = Array.isArray(listed)
+      ? listed.filter((problem: Problem) => args.archived || !(problem as any).archived)
+      : listed;
     if (!problems || problems.length === 0) {
       if (args.json) {
         printJson([]);
@@ -450,7 +479,6 @@ const view = defineCommand({
           testPatch: Boolean(latestVersion?.testPatch),
           solutionPatch: Boolean(latestVersion?.solutionPatch),
           dockerfile: Boolean(latestVersion?.dockerfile),
-          hint: Boolean(latestVersion?.hintText),
           solutionApproach: Boolean(latestVersion?.solutionApproach),
         };
       }
@@ -480,7 +508,10 @@ const view = defineCommand({
     }
     const [stages, dynamicChecks, runs, criteria, readiness, reviews] = latestVersion
       ? await Promise.all([
-          client.query(api.stages.getByVersion, { versionId: latestVersion._id }).catch(() => []),
+          queryPrecheckStages(client, {
+            problemId: asId(args.id),
+            versionId: latestVersion._id,
+          }).catch(() => []),
           client
             .query(api.runDynamicChecks.getDynamicChecks, { versionId: latestVersion._id })
             .catch(() => null),
@@ -602,7 +633,6 @@ const download = defineCommand({
     writeTracked("Dockerfile", latestVersion.dockerfile);
     writeTracked("test.patch", latestVersion.testPatch);
     writeTracked("solution.patch", latestVersion.solutionPatch);
-    writeTracked("hint.md", latestVersion.hintText);
     writeTracked("solution-approach.md", latestVersion.solutionApproach);
     writeFileSync(
       join(outDir, "metadata.json"),
@@ -631,6 +661,30 @@ const download = defineCommand({
     console.log("");
   },
 });
+// The dashboard moved from the fetchAll action to the paginated fetchPage query.
+async function fetchDashboardRows(client: any, status: string | undefined): Promise<Problem[]> {
+  try {
+    const rows: Problem[] = [];
+    let cursor: string | null = null;
+    for (;;) {
+      const page: any = await client.query(api.problemDashboard.fetchPage, {
+        ...(status ? { statuses: [status] } : {}),
+        paginationOpts: { numItems: 100, cursor },
+      });
+      rows.push(...(page?.page ?? []));
+      if (page?.isDone !== false || !page?.continueCursor) return rows;
+      cursor = page.continueCursor;
+    }
+  } catch (pageError) {
+    let rows: Problem[];
+    try {
+      rows = await client.action(api.problemDashboard.fetchAll, {});
+    } catch {
+      throw pageError;
+    }
+    return status ? rows.filter((problem) => problem.status === status) : rows;
+  }
+}
 const dump = defineCommand({
   meta: { name: "problems dump", description: "Export many challenges as JSON" },
   args: {
@@ -641,10 +695,7 @@ const dump = defineCommand({
   run: async ({ args }) => {
     const client = await getClient();
     console.log("  Fetching submissions (this may take a moment)...");
-    let problems = await client.action(api.problemDashboard.fetchAll, {});
-    if (args.status) {
-      problems = problems.filter((problem: Problem) => problem.status === args.status);
-    }
+    const problems = await fetchDashboardRows(client, args.status);
     if (!problems || problems.length === 0) {
       console.log("  No submissions found.");
       return;
@@ -688,13 +739,13 @@ const edit = defineCommand({
       type: "string",
       description: "Read environment description from file (use - for stdin)",
     },
-    "hint-file": { type: "string", description: "Read hint text from file (use - for stdin)" },
-    "hint-justification-file": {
-      type: "string",
-      description: "Read hint justification from file (use - for stdin)",
-    },
     dockerfile: { type: "string", description: "Read Dockerfile from file (use - for stdin)" },
     "github-issue-url": { type: "string", description: "Set GitHub issue URL" },
+    "replace-rolled-out": {
+      type: "boolean",
+      description:
+        "Replace artifacts of a version that already has completed rollouts (normally open a new version)",
+    },
     json: { type: "boolean", description: "Output result as JSON" },
   },
   run: async ({ args }) => {
@@ -716,9 +767,6 @@ const edit = defineCommand({
       updates.solutionApproach = readFileArg(args["solution-approach-file"]);
     if (args["environment-description-file"] !== undefined)
       updates.environmentDescription = readFileArg(args["environment-description-file"]);
-    if (args["hint-file"] !== undefined) updates.hintText = readFileArg(args["hint-file"]);
-    if (args["hint-justification-file"] !== undefined)
-      updates.hintJustification = readFileArg(args["hint-justification-file"]);
     if (args.dockerfile !== undefined) updates.dockerfile = readFileArg(args.dockerfile);
     if (args["github-issue-url"] !== undefined) updates.githubIssueUrl = args["github-issue-url"];
     if (Object.keys(updates).length === 0) {
@@ -728,6 +776,30 @@ const edit = defineCommand({
         retryable: false,
         hint: "Run: olympus problems edit --help",
       });
+    }
+    // A version with completed rollouts keeps its rolled-out contract as history: replacing its artifacts
+    // orphans its runs. Its correction belongs in a successor derived from it.
+    const artifactFields = ["description", "testPatch", "solutionPatch", "dockerfile"];
+    if (!args["replace-rolled-out"] && artifactFields.some((field) => field in updates)) {
+      const { version } = await requireProblemVersion(client, args.id);
+      const runs = normalizeAgentRuns(
+        await client.query(api.runAgentRuns.getAgentRuns, { versionId: version._id }),
+      );
+      // Runs carry no version; one created after this version opened belongs to it.
+      const opened = Number((version as any)._creationTime ?? 0);
+      const completed = runs.filter(
+        (run) => run.status === "completed" && (run.createdAt ?? 0) >= opened,
+      );
+      if (completed.length > 0)
+        throw new CliError(
+          `Version v${version.version} already has ${completed.length} completed rollout(s); open a new version before changing its artifacts.`,
+          {
+            kind: "usage",
+            code: "version.rolled_out",
+            retryable: false,
+            hint: `Lock v${version.version} if needed (olympus problems lock ${args.id}), then olympus problems version create ${args.id} --from ${version.version}, and upload to the new version.`,
+          },
+        );
     }
     const result = await client.mutation(api.problems.updateDraft, {
       problemId: asId(args.id),
@@ -866,23 +938,147 @@ const version = defineCommand({
     }),
   },
 });
+const SUBMISSION_LANES = ["olympus", "mars"] as const;
+function parseSubmissionLane(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if ((SUBMISSION_LANES as readonly string[]).includes(value)) return value;
+  throw new CliError(`--type must be one of: ${SUBMISSION_LANES.join(", ")}`, {
+    kind: "usage",
+    code: "input.invalid_submission_type",
+    retryable: false,
+    hint: "Diamond challenges always submit through the olympus lane.",
+  });
+}
 const submit = defineCommand({
   meta: { name: "problems submit", description: "Submit a challenge for review" },
   args: {
     id: { type: "positional", description: "Challenge ID", required: true },
+    "skip-human-review": {
+      type: "boolean",
+      description: "Request skipping human review (requires backend eligibility)",
+    },
+    type: {
+      type: "string",
+      description: "Submission lane: olympus or mars (default: the challenge's current type)",
+    },
+    "include-coauthorship": {
+      type: "boolean",
+      description: "Include coauthors in the submission",
+    },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
+    const submissionType = parseSubmissionLane(args.type);
     const client = await getClient();
     const result = await client.mutation(api.problems.submitDraft, {
       problemId: asId(args.id),
+      ...(submissionType ? { submissionType } : {}),
+      ...(args["include-coauthorship"] ? { includeCoauthorship: true } : {}),
+      ...(args["skip-human-review"] ? { skipHumanReview: true } : {}),
     });
     if (args.json) {
       printJson(result);
       return;
     }
-    console.log(`\n  Submitted ${args.id} for review`);
+    if (result && typeof result === "object" && "verifying" in result) {
+      console.log(`\n  Verification started for ${args.id}; submission follows when it passes`);
+    } else {
+      console.log(
+        `\n  Submitted ${args.id}${args["skip-human-review"] ? " with human review skip requested" : " for review"}`,
+      );
+    }
     console.log(`  Run: olympus problems view ${args.id}\n`);
+  },
+});
+function archiveCommand(name: "archive" | "unarchive") {
+  const archiving = name === "archive";
+  return defineCommand({
+    meta: {
+      name: `problems ${name}`,
+      description: archiving ? "Archive a challenge draft" : "Restore an archived challenge",
+    },
+    args: {
+      id: { type: "positional", description: "Challenge ID", required: true },
+      json: { type: "boolean", description: "Output as JSON" },
+    },
+    run: async ({ args }) => {
+      const client = await getClient();
+      const result = await client.mutation(
+        archiving ? api.problems.archiveDraft : api.problems.unarchiveDraft,
+        { problemId: asId(args.id) },
+      );
+      if (args.json) return printJson(result ?? { problemId: args.id, archived: archiving });
+      console.log(`\n  ${archiving ? "Archived" : "Restored"} ${args.id}\n`);
+    },
+  });
+}
+const SUBMISSION_TYPES = ["olympus", "mars", "diamond"] as const;
+const type = defineCommand({
+  meta: {
+    name: "problems type",
+    description: "Show or change a challenge's submission type (olympus, mars, diamond)",
+  },
+  args: {
+    id: { type: "positional", description: "Challenge ID", required: true },
+    value: { type: "positional", description: "New submission type", required: false },
+    yes: {
+      type: "boolean",
+      description: "Confirm a change that invalidates an existing task-quality result",
+    },
+    json: { type: "boolean", description: "Output as JSON" },
+  },
+  run: async ({ args }) => {
+    const client = await getClient();
+    const problemId = asId(args.id);
+    const context: any = await client.query(api.problems.getSubmissionTypeContext, { problemId });
+    if (!args.value) {
+      if (args.json) return printJson(context);
+      console.log(`\n  Submission type: ${context?.submissionType ?? "unknown"}`);
+      if (context?.olympusLocked)
+        console.log(
+          `  Olympus: locked${context.unlockTierName ? ` until ${context.unlockTierName}` : ""}`,
+        );
+      if (context?.marsAllowed === false) console.log("  Mars: not enabled for this quest");
+      else if (context?.marsLocked) console.log("  Mars: not available at your tier");
+      if (context?.isEditable === false || context?.isLocked) console.log("  Type is not editable");
+      console.log("");
+      return;
+    }
+    const value = args.value;
+    const usage = (message: string, code: string) =>
+      new CliError(message, { kind: "usage", code, retryable: false });
+    if (!(SUBMISSION_TYPES as readonly string[]).includes(value))
+      throw usage(
+        `Submission type must be one of: ${SUBMISSION_TYPES.join(", ")}`,
+        "input.invalid_submission_type",
+      );
+    if (context?.isEditable === false || context?.isLocked)
+      throw usage("This challenge's submission type cannot be changed", "submission_type.locked");
+    if (value === "olympus" && context?.olympusLocked)
+      throw usage(
+        context.unlockTierName
+          ? `Olympus unlocks at the ${context.unlockTierName} tier`
+          : "Olympus is locked for your tier",
+        "submission_type.olympus_locked",
+      );
+    if (value === "mars" && context?.marsAllowed === false)
+      throw usage(
+        "Mars submissions are not enabled for this quest",
+        "submission_type.mars_disabled",
+      );
+    if (value === "mars" && context?.marsLocked)
+      throw usage("Mars submissions aren't available at your tier", "submission_type.mars_locked");
+    if (value !== context?.submissionType && context?.hasTaskQualityJob && !args.yes)
+      throw usage(
+        "Changing the submission type invalidates the existing task-quality result; rerun with --yes",
+        "submission_type.confirmation_required",
+      );
+    const result = await client.mutation(api.problems.setSubmissionType, {
+      problemId,
+      submissionType: value,
+    });
+    if (args.json) return printJson(result ?? { problemId: args.id, submissionType: value });
+    console.log(`\n  Submission type of ${args.id} set to ${value}\n`);
   },
 });
 const lock = defineCommand({
@@ -953,5 +1149,8 @@ export default defineCommand({
     unlock,
     "start-edit": startEdit,
     dump,
+    type,
+    archive: archiveCommand("archive"),
+    unarchive: archiveCommand("unarchive"),
   },
 });

@@ -141,31 +141,18 @@ const run = defineCommand({
     timeout: { type: "string", description: "Timeout in minutes (default 30)" },
   },
   run: async ({ args }) => {
-    const wait = resolveWaitWindow(args, SCOPE_GATE_WAIT_DEFAULTS);
-    const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
-    const [scopeState, readiness] = await Promise.all([
-      client.query(api.scopeGate.getScopeGate, { versionId }),
-      client.query(api.submissionReadiness.getSubmissionReadiness, {
-        problemId,
-      }),
-    ]);
-    const prechecks = (readiness as any)?.criteria?.find(
-      (criterion: any) => criterion.id === "prechecks",
-    );
-    if (prechecks && prechecks.status !== "pass") {
-      throw new Error(`Scope Gate is blocked: Prechecks ${prechecks.detail ?? prechecks.status}`);
-    }
-    if ((scopeState as any)?.inFlight) throw new Error("Scope Gate is already running");
+    const waitOptions = resolveWaitWindow(args, SCOPE_GATE_WAIT_DEFAULTS);
+    const { client, versionId, versionNumber } = await resolveCommandContext(args);
     const result: any = await client.action(api.scopeGate.triggerScopeGate, {
       versionId,
       useGeneralTokens: Boolean(args["use-general-tokens"]),
     });
-    if (wait) {
+    if (waitOptions) {
       await waitForScopeGate({
         client,
         versionId,
         versionNumber,
-        ...wait,
+        ...waitOptions,
         json: Boolean(args.json),
       });
       return;

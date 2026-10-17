@@ -1,4 +1,5 @@
 import { defineCommand } from "citty";
+import { CliError } from "../shared/errors.ts";
 import { api } from "../platform/convex.ts";
 import { resolveWaitWindow, waitWindow } from "../shared/wait.ts";
 
@@ -11,25 +12,33 @@ const FP_CHECK_WAIT_DEFAULTS = {
   timeoutMinutes: 45,
 } as const;
 
-function fpReviewStatus(state: any): "running" | "failed" | "completed" {
+type FpReviewStatus = "running" | "idle" | "stale" | "completed" | "failed" | "error";
+
+// getFpCheckForVersion reports `state` as not_run | stale | running | passed |
+// passed_with_warnings | failed. `failed` is the review verdict (a false positive was
+// found), not a job failure; a job that crashed carries `error` instead.
+function fpReviewStatus(state: any): FpReviewStatus {
   const status = String(
     state?.state ?? state?.status ?? state?.job?.status ?? state?.jobStatus ?? "",
   ).toLowerCase();
   if (state?.inFlight || ["pending", "running", "queued", "processing"].includes(status)) {
     return "running";
   }
-  if (["failed", "error", "cancelled", "canceled"].includes(status)) {
-    return "failed";
-  }
+  if (status === "not_run") return "idle";
+  if (status === "stale") return "stale";
+  if (status === "failed")
+    return state?.error && !state?.resultSummary?.length ? "error" : "failed";
+  if (["error", "cancelled", "canceled"].includes(status)) return "error";
   return "completed";
 }
 
+const FP_VERDICTS: Partial<Record<FpReviewStatus, string>> = {
+  completed: "passed",
+  failed: "false_positive",
+};
+
 function activeState(state: any): boolean {
   return fpReviewStatus(state) === "running";
-}
-
-function failedState(state: any): boolean {
-  return fpReviewStatus(state) === "failed";
 }
 
 async function queryFpStateWithRetry(
@@ -80,20 +89,24 @@ async function waitForFpCheck({
     }
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
     if (!activeState(state)) {
+      const status = fpReviewStatus(state);
       const result = {
-        status: failedState(state) ? "failed" : "completed",
+        status,
         version: versionNumber,
         elapsedSeconds,
         ...(full
           ? { state }
           : {
               jobId: currentJobId,
-              verdict: state?.verdict ?? state?.output?.verdict,
+              state: state?.state,
+              verdict: state?.verdict ?? state?.output?.verdict ?? FP_VERDICTS[status],
+              canContest: state?.canContest,
+              error: state?.error,
             }),
       };
       if (json) printJson(result);
       else printResult(result, false);
-      if (failedState(state)) process.exitCode = 1;
+      if (status === "failed" || status === "error") process.exitCode = 1;
       return result;
     }
     if (Date.now() - startedAt >= timeoutMs) {
@@ -121,10 +134,115 @@ const view = defineCommand({
   args: commonArgs,
   run: async ({ args }) => {
     const { client, versionId } = await resolveCommandContext(args);
-    const result = await client.query(api.fpReview.getFpCheckForVersion, {
+    const result: any = await client.query(api.fpReview.getFpCheckForVersion, {
       versionId,
     });
-    printResult(result, args.json);
+    printResult(result == null ? result : { status: fpReviewStatus(result), ...result }, args.json);
+  },
+});
+
+const MAX_KEEP_PATHS = 10;
+const MAX_KEEP_PATH_LENGTH = 200;
+
+/** Mirrors the web normalization: repo-relative folders with a trailing slash. */
+export function normalizeKeepPaths(raw: string[]): string[] {
+  const paths = new Set<string>();
+  for (const entry of raw) {
+    const value = entry.trim().replaceAll("\\", "/");
+    if (!value) continue;
+    if (value.startsWith("/"))
+      throw new CliError(`Keep path must be repo-relative: ${entry}`, {
+        kind: "usage",
+        code: "input.invalid_keep_path",
+        retryable: false,
+      });
+    if (value.split("/").includes(".."))
+      throw new CliError(`Keep path must not contain "..": ${entry}`, {
+        kind: "usage",
+        code: "input.invalid_keep_path",
+        retryable: false,
+      });
+    const folder = value.endsWith("/") ? value : `${value}/`;
+    if (folder.length > MAX_KEEP_PATH_LENGTH)
+      throw new CliError(`Keep path exceeds ${MAX_KEEP_PATH_LENGTH} characters: ${entry}`, {
+        kind: "usage",
+        code: "input.invalid_keep_path",
+        retryable: false,
+      });
+    paths.add(folder);
+  }
+  if (paths.size > MAX_KEEP_PATHS)
+    throw new CliError(`At most ${MAX_KEEP_PATHS} keep paths are allowed (got ${paths.size})`, {
+      kind: "usage",
+      code: "input.too_many_keep_paths",
+      retryable: false,
+    });
+  return [...paths];
+}
+
+const contest = defineCommand({
+  meta: {
+    name: "fp-check contest",
+    description: "Contest a failed FP check verdict (becomes a non-blocking reviewer note)",
+  },
+  args: {
+    ...commonArgs,
+    note: {
+      type: "string",
+      description: "Why the flagged runs are not false positives",
+      required: true,
+    },
+  },
+  run: async ({ args }) => {
+    const note = args.note.trim();
+    if (!note) throw new Error("--note must not be empty");
+    if (note.length > 2000) throw new Error("--note must be at most 2000 characters");
+    const { client, versionId } = await resolveCommandContext(args);
+    const state: any = await client.query(api.fpReview.getFpCheckForVersion, { versionId });
+    if (state && state.canContest === false)
+      throw new CliError("This FP check cannot be contested", {
+        kind: "usage",
+        code: "fp_check.not_contestable",
+        retryable: false,
+        hint: `Inspect: olympus fp-check view ${args.id} --json`,
+      });
+    const result = await client.mutation(api.fpReview.contestFpCheck, { versionId, note });
+    printResult(result ?? { contested: true }, args.json);
+  },
+});
+
+const keepPaths = defineCommand({
+  meta: {
+    name: "fp-check keep-paths",
+    description: "View or set protected source folders for the next FP check",
+  },
+  args: {
+    ...commonArgs,
+    set: {
+      type: "string",
+      description: "Comma-separated repo-relative folders (e.g. src/,lib/)",
+    },
+    clear: { type: "boolean", description: "Remove all protected folders" },
+  },
+  run: async ({ args }) => {
+    if (args.set !== undefined && args.clear)
+      throw new CliError("Use either --set or --clear", {
+        kind: "usage",
+        code: "input.conflicting_flags",
+        retryable: false,
+      });
+    const { client, versionId } = await resolveCommandContext(args);
+    if (args.set === undefined && !args.clear) {
+      const state: any = await client.query(api.fpReview.getFpCheckForVersion, { versionId });
+      printResult(
+        { fpKeepPaths: state?.fpKeepPaths ?? [], canEditKeepPaths: state?.canEditKeepPaths },
+        args.json,
+      );
+      return;
+    }
+    const paths = args.clear ? null : normalizeKeepPaths(args.set!.split(","));
+    const result = await client.mutation(api.fpReview.setFpKeepPaths, { versionId, paths });
+    printResult(result ?? { fpKeepPaths: paths ?? [] }, args.json);
   },
 });
 
@@ -183,29 +301,19 @@ const run = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const wait = resolveWaitWindow(args, FP_CHECK_WAIT_DEFAULTS);
+    const waitOptions = resolveWaitWindow(args, FP_CHECK_WAIT_DEFAULTS);
     const { client, versionId, versionNumber } = await resolveCommandContext(args);
-    const state: any = await client.query(api.fpReview.getFpCheckForVersion, {
-      versionId,
-    });
-    if (state?.canRun === false || state?.hasEligiblePasses === false) {
-      const reasons = [
-        state.hasEligiblePasses === false ? "no eligible passing runs" : null,
-        state.canRun === false ? "backend reports this check cannot run" : null,
-      ].filter(Boolean);
-      throw new Error(`FP check is blocked: ${reasons.join("; ") || "unknown reason"}`);
-    }
     const result: any = await client.action(api.fpReview.requestFpCheck, {
       versionId,
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
-    if (wait) {
+    if (waitOptions) {
       await waitForFpCheck({
         client,
         versionId,
         versionNumber,
         jobId: result?.jobId,
-        ...wait,
+        ...waitOptions,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });
@@ -222,5 +330,5 @@ const run = defineCommand({
 
 export default defineCommand({
   meta: { name: "fp-check", description: "False-positive review operations" },
-  subCommands: { view, run, wait },
+  subCommands: { view, run, wait, contest, "keep-paths": keepPaths },
 });

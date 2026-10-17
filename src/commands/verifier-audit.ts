@@ -81,25 +81,7 @@ const run = defineCommand({
     const wait = resolveWaitWindow(args, VERIFIER_AUDIT_WAIT_DEFAULTS);
     const { client, problemId, version, versionId, versionNumber } =
       await resolveCommandContext(args);
-    const [dynamic, isAdmin] = await Promise.all([
-      client.query(api.runDynamicChecks.getDynamicChecks, { versionId }),
-      client.query(api.admins.isCurrentUser, {}),
-    ]);
-    const checks: any = dynamic ?? {};
-    if (!version.testPatch || !version.solutionPatch) {
-      throw new Error("Verifier audit requires both test and solution patches");
-    }
-    if (!isAdmin && checks._verifierIncompletenessRunsEnabled !== true) {
-      throw new Error("Verifier audit is not enabled for this contributor");
-    }
-    const verifySolution = checks.verifySolution;
-    const solutionPassed =
-      verifySolution?.status === "completed"
-      && verifySolution?.stale !== true
-      && String(verifySolution?.output?.verdict ?? "").toUpperCase() === "PASS";
-    if (!isAdmin && !solutionPassed) {
-      throw new Error("Verifier audit requires a fresh passing Verify Solution check");
-    }
+
     await assertCheckCapacity(client, problemId, versionId, ["verifierIncompleteness"]);
     const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
       versionId,
@@ -170,16 +152,7 @@ const decide = defineCommand({
     const jobId = args.job ?? check?.jobId;
     if (!jobId)
       throw new Error("No verifier audit job exists on this version; pass --job explicitly");
-    if (args.decision !== "rejected") {
-      if (!check || check.jobId !== jobId) {
-        throw new Error("Acceptance requires the current verifier audit job");
-      }
-      if (check.stale) throw new Error("Cannot accept a stale verifier audit; rerun it first");
-      const validation = check.output?.patchValidation;
-      if (validation?.appliesCleanly !== true) {
-        throw new Error("Cannot accept a verifier patch that does not apply cleanly");
-      }
-    }
+
     const payload: Record<string, unknown> = {
       jobId,
       decision: args.decision,

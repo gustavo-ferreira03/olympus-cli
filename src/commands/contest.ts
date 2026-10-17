@@ -1,4 +1,5 @@
 import { defineCommand } from "citty";
+import { assertNativeDependencies } from "../core/native-dependencies.ts";
 import { assertPaidEndpoint, assertCheckCapacity, assertOperationCost } from "../core/policy.ts";
 import { api } from "../platform/convex.ts";
 import { commonArgs, printResult, resolveCommandContext } from "./command-utils.ts";
@@ -24,19 +25,21 @@ const view = defineCommand({
   },
   run: async ({ args }) => {
     const { client, problemId, versionId } = await resolveCommandContext(args);
-    const [dynamicChecks, description, taskQuality] = await Promise.all([
+    const [dynamicChecks, description, taskQuality, category] = await Promise.all([
       client.query(api.runDynamicChecks.getDynamicChecks, { versionId }),
       client.query(api.systemComments.getDescriptionQualityContestStatus, {
         problemId,
         versionId,
       }),
       client.query(api.taskQualityContest.getTaskQualityContestStatus, { problemId }),
+      client.query(api.categoryContest.getCategoryContestState, { versionId }).catch(() => null),
     ]);
     if (args.full) {
-      printResult({ dynamicChecks, description, taskQuality }, args.json);
+      printResult({ dynamicChecks, description, taskQuality, category }, args.json);
       return;
     }
     const dynamic: any = dynamicChecks ?? {};
+
     printResult(
       {
         descriptionQuality: {
@@ -44,14 +47,15 @@ const view = defineCommand({
           ...description,
         },
         testQuality: {
-          contested: Boolean(dynamic._verifyFairnessContested),
-          note: dynamic._verifyFairnessContestNote ?? undefined,
+          contested: Boolean(dynamic._testQualityContested),
+          note: dynamic._testQualityContestNote ?? undefined,
         },
         solutionQuality: {
           contested: Boolean(dynamic._solutionQualityContested),
           note: dynamic._solutionQualityContestNote ?? undefined,
         },
         taskQuality,
+        categoryAlignment: category ?? undefined,
       },
       args.json,
     );
@@ -59,7 +63,10 @@ const view = defineCommand({
 });
 
 const description = defineCommand({
-  meta: { name: "contest description", description: "Contest Description Quality" },
+  meta: {
+    name: "contest task-prompt",
+    description: "Contest Task Prompt Quality (alias: description)",
+  },
   args: commonArgs,
   run: async ({ args }) => {
     const { client, problemId, versionId } = await resolveCommandContext(args);
@@ -99,6 +106,22 @@ const solution = defineCommand({
   },
 });
 
+const category = defineCommand({
+  meta: {
+    name: "contest category",
+    description: "Contest a failed category_alignment precheck",
+  },
+  args: noteArgs("Why the chosen category fits this challenge"),
+  run: async ({ args }) => {
+    const { client, versionId } = await resolveCommandContext(args);
+    const result = await client.mutation(api.categoryContest.contestCategoryAlignment, {
+      versionId,
+      note: requireNote(args.note),
+    });
+    printResult(result ?? { contested: true }, args.json);
+  },
+});
+
 const taskAsMars = defineCommand({
   meta: {
     name: "contest task-as-mars",
@@ -120,6 +143,7 @@ const taskAsMars = defineCommand({
       useGeneralTokens: args["use-general-tokens"] || undefined,
     };
     // Preflight both operations before changing the rubric; dispatch still rechecks.
+    await assertNativeDependencies(client, problemId, "checks.taskQuality", triggerArgs);
     assertPaidEndpoint("taskQualityContest:contestTaskQualityAsMars", contestArgs);
     assertPaidEndpoint("runDynamicChecks:triggerDynamicCheck", triggerArgs);
     await assertCheckCapacity(client, problemId, versionId, ["taskQuality"]);
@@ -142,9 +166,12 @@ export default defineCommand({
   meta: { name: "contest", description: "Contest quality-check verdicts" },
   subCommands: {
     view,
+    "task-prompt": description,
+    // Kept for scripts written before the check was renamed from Description Quality.
     description,
     "test-quality": testQuality,
     solution,
+    category,
     "task-as-mars": taskAsMars,
   },
 });

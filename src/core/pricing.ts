@@ -1,4 +1,5 @@
 import { parse } from "acorn";
+import { toBackendCheckKey, toPublicCheckKey } from "./expected.ts";
 import { createHash } from "node:crypto";
 import { anyApi } from "convex/server";
 import { getBaseUrl } from "../platform/config.ts";
@@ -20,12 +21,11 @@ const amount = (v: unknown): v is number => typeof v === "number" && Number.isFi
 const fail = (detail: string): never => {
   throw new Error(`Official pricing unavailable: ${detail}`);
 };
-const key = (n: Node): string | undefined =>
-  n?.type === "Identifier"
-    ? n.name
-    : n?.type === "Literal" && typeof n.value === "string"
-      ? n.value
-      : undefined;
+const key = (n: Node): string | undefined => {
+  if (n?.type === "Identifier") return n.name;
+  if (n?.type === "Literal" && typeof n.value === "string") return n.value;
+  return undefined;
+};
 const props = (n: Node): Map<string, Node> =>
   new Map(
     n?.type === "ObjectExpression"
@@ -102,12 +102,13 @@ function parseOfficialPrices(source: string): OfficialPrices {
   };
   const mutated = new Set<Node>();
   for (const n of nodes) {
-    let target =
-      n.type === "AssignmentExpression"
-        ? n.left
-        : n.type === "UpdateExpression" || (n.type === "UnaryExpression" && n.operator === "delete")
-          ? n.argument
-          : undefined;
+    let target: Node | undefined;
+    if (n.type === "AssignmentExpression") target = n.left;
+    else if (
+      n.type === "UpdateExpression"
+      || (n.type === "UnaryExpression" && n.operator === "delete")
+    )
+      target = n.argument;
     while (target?.type === "MemberExpression") target = target.object;
     if (target?.type === "Identifier") {
       const b = binding(target);
@@ -143,7 +144,7 @@ function parseOfficialPrices(source: string): OfficialPrices {
         "verifyBuild",
         "verifyTests",
         "verifySolution",
-        "verifyFairness",
+        toBackendCheckKey("testQuality"),
         "taskQuality",
         "solutionQuality",
         "descriptionQuality",
@@ -155,7 +156,9 @@ function parseOfficialPrices(source: string): OfficialPrices {
     "base check catalog",
   );
   strictProps(base);
-  const checks = Object.fromEntries([...props(base)].map(([k, n]) => [k, value(n)]));
+  const checks = Object.fromEntries(
+    [...props(base)].map(([propertyKey, node]) => [toPublicCheckKey(propertyKey), value(node)]),
+  );
   const containsLabel = (n: Node, label: string): boolean =>
     n?.type === "Literal"
       ? n.value === label
@@ -445,6 +448,7 @@ export async function resolveCostCatalog(client: PricingReader, versionId?: stri
         "systemComments:contestDescriptionQuality",
         "taskQualityContest:contestTaskQualityAsMars",
         "fpReview:contestFpCheck",
+        "categoryContest:contestCategoryAlignment",
         "verifierIncompleteness:submitVerifierIncompletenessDecision",
         "dockerImage:cancelBuildJob",
         "runAgentRuns:cancelRun",

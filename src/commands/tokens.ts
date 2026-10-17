@@ -15,6 +15,15 @@ function number(value: unknown): number | undefined {
   return undefined;
 }
 
+// The web calls refreshBalance whenever getBalance reports needsRefresh; without it the
+// tier, cap and drip can be stale.
+async function readBalance(client: any): Promise<any> {
+  const balance = await client.query(api.contributorTokens.getBalance, {});
+  if (balance?.needsRefresh !== true) return balance;
+  await client.mutation(api.contributorTokens.refreshBalance, {});
+  return client.query(api.contributorTokens.getBalance, {});
+}
+
 function compactBalance(balance: any, revisionTokens: any[]) {
   const totalRevision = revisionTokens.reduce((sum, item) => sum + (number(item?.balance) ?? 0), 0);
   return omitEmpty({
@@ -27,10 +36,16 @@ function compactBalance(balance: any, revisionTokens: any[]) {
     tierDripAmount: balance?.tierDripAmount,
     tierAcceptanceBonusUsd: balance?.tierAcceptanceBonusUsd,
     tierFeatures: balance?.tierFeatures,
+    tierIsBeginner: balance?.tierIsBeginner,
+    tierOverride: balance?.tierOverride,
+    tierOverrideMode: balance?.tierOverrideMode,
     nextTierRequirement: balance?.nextTierRequirement,
+    comeback: balance?.comeback,
     acceptedInWindow: balance?.acceptedInWindow,
     olympusAcceptedInWindow: balance?.olympusAcceptedInWindow,
+    rejectedInWindow: balance?.rejectedInWindow,
     lifetimeAccepted: balance?.lifetimeAccepted,
+    storedBalance: balance?.storedBalance,
     pendingDrip: balance?.pendingDrip,
     dripPaused: balance?.dripPaused,
     dripUnlimited: balance?.dripUnlimited,
@@ -39,8 +54,11 @@ function compactBalance(balance: any, revisionTokens: any[]) {
     generalTokenBalance: balance?.generalTokenBalance,
     totalRevisionTokenBalance: totalRevision || undefined,
     tokenCap: balance?.tokenCap,
+    needsRefresh: balance?.needsRefresh || undefined,
   });
 }
+
+const TRANSACTION_LIMIT = 50;
 
 function transactionDate(item: any): number | undefined {
   return number(item?.createdAt ?? item?.timestamp ?? item?._creationTime);
@@ -87,12 +105,26 @@ function summarizeTransactions(transactions: any[], full = false) {
     const knownReasons: Record<string, string> = {
       agent_reeval_spent: "runs:reEvaluation",
       fp_check_spent: "reviews:fpCheck",
+      precheck_spent: "checks:precheck",
+      precheck_refund: "checks:precheckRefund",
+      stale_run_refund: "runs:staleRefund",
+      revert_compensation: "grants:revertCompensation",
+      drip_grant: "grants:drip",
+      initial_grant: "grants:initial",
+      admin_grant: "grants:admin",
+      comeback_grant: "grants:comeback",
+      submission_approved: "grants:submissionApproved",
+      demotion_cap_clamp: "adjustments:demotionCapClamp",
+      admin_clamp: "adjustments:adminClamp",
+      revision_token_grant: "revisionTokens:grant",
+      revision_token_spent: "revisionTokens:spent",
+      revision_token_refund: "revisionTokens:refund",
+      revision_token_transfer_in: "revisionTokens:transferIn",
+      revision_token_transfer_out: "revisionTokens:transferOut",
     };
-    const operation = label(item?.operation)
-      ? item.operation
-      : Object.hasOwn(knownReasons, item?.reason)
-        ? knownReasons[item.reason]
-        : undefined;
+    let operation: string | undefined;
+    if (label(item?.operation)) operation = item.operation;
+    else if (Object.hasOwn(knownReasons, item?.reason)) operation = knownReasons[item.reason];
     if (check) group(byCheck, check, spentAmount, grantedAmount);
     if (operation) group(byOperation, operation, spentAmount, grantedAmount);
     if (!check && !operation) {
@@ -152,7 +184,7 @@ const balance = defineCommand({
   run: async ({ args }) => {
     const client = await getClient();
     const [balanceData, revisionTokens] = await Promise.all([
-      client.query(api.contributorTokens.getBalance, {}),
+      readBalance(client),
       client.query(api.contributorTokens.getAllRevisionTokens, {}),
     ]);
     const result = args.full
@@ -180,6 +212,15 @@ const usage = defineCommand({
     let transactions: any[] = await client.query(api.contributorTokens.getTransactions, {});
     if (!Array.isArray(transactions))
       throw new Error("Backend transactions response is not an array; usage is unavailable");
+    // getTransactions returns only the most recent rows; older history is not reachable.
+    const dates = transactions.map(transactionDate).filter((value) => value !== undefined);
+    const oldest = dates.length > 0 ? Math.min(...dates) : undefined;
+    const ledger = {
+      rows: transactions.length,
+      limit: TRANSACTION_LIMIT,
+      truncated: transactions.length >= TRANSACTION_LIMIT,
+      oldest: oldest === undefined ? null : new Date(oldest).toISOString(),
+    };
     const from = args.from ? Date.parse(args.from) : undefined;
     const to = args.to ? Date.parse(args.to) + 86_399_999 : undefined;
     if (args.from && !Number.isFinite(from)) throw new Error("--from must be a valid ISO date");
@@ -191,12 +232,19 @@ const usage = defineCommand({
       if (args.challenge && transactionChallengeId(item) !== args.challenge) return false;
       return true;
     });
+    const warnings: string[] = [];
+    if (ledger.truncated && from !== undefined && oldest !== undefined && from < oldest)
+      warnings.push(
+        `--from predates the oldest returned transaction (${ledger.oldest}); the backend returns only the latest ${TRANSACTION_LIMIT} rows, so earlier usage is missing`,
+      );
     const result: any = {
       scope: args.challenge
         ? { challengeId: args.challenge, source: "ledger-filter" }
         : { source: "ledger" },
       ...summarizeTransactions(transactions, args.full),
       tokenUsage: summarizeTokenUsage(transactions),
+      ledger,
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
     if (args.full) (result as any).raw = transactions;
     if (args.challenge) result.localBudget = await localBudgetStatus(client, args.challenge);
@@ -224,7 +272,35 @@ const costs = defineCommand({
   },
 });
 
+const progression = defineCommand({
+  meta: {
+    name: "tokens progression",
+    description: "Show your earnings progression and the published tier stats",
+  },
+  args: {
+    json: { type: "boolean", description: "Output compact JSON" },
+  },
+  run: async ({ args }) => {
+    const client = await getClient();
+    // Contractors and unenrolled accounts are refused with a Forbidden error; report it per section.
+    const settle = async (request: Promise<unknown>) => {
+      try {
+        return await request;
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    const [overview, publishedStats] = await Promise.all([
+      settle(client.query(api.contributorTokens.getProgressionOverview, {})),
+      settle(client.query(api.progressionStats.getPublishedStats, {})),
+    ]);
+    const result = { overview, publishedStats };
+    if (args.json) return printJson(result);
+    console.log(JSON.stringify(result, null, 2));
+  },
+});
+
 export default defineCommand({
   meta: { name: "tokens", description: "View token balances, usage, and challenge costs" },
-  subCommands: { balance, usage, costs },
+  subCommands: { balance, usage, costs, progression },
 });

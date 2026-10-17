@@ -1,5 +1,5 @@
 import { type CheckInputs, type CheckInputsDiagnostic } from "./check-inputs.ts";
-import { RENDERABLE_CHECK_KEYS, toPublicCheckKey } from "./expected.ts";
+import { isRenderableCheckKey, toBackendCheckKey, toPublicCheckKey } from "./expected.ts";
 import { normalizeCoverageOutput, type CoverageOutput } from "./coverage.ts";
 
 export type SubmissionReadiness = {
@@ -88,12 +88,13 @@ const DYNAMIC_CHECK_LABELS: Record<string, string> = {
   verifySolution: "Verify Solution",
   verifyFlakiness: "Verify Flakiness",
   testQuality: "Test Quality",
-  verifyFairness: "Test Quality",
+
   taskQuality: "Task Quality",
   solutionQuality: "Solution Quality",
-  descriptionQuality: "Description Quality",
-  verifierIncompleteness: "Verifier Incompleteness",
+  descriptionQuality: "Task Prompt Quality",
+  verifierIncompleteness: "Verifier Completeness Audit",
   autoReview: "Auto Review",
+  rolloutCoach: "Rollout Coach",
 };
 /**
  * Checks whose verdict the backend can mark as contested by the author.
@@ -152,7 +153,7 @@ export function normalizeDynamicChecks(dynamicChecks: unknown): DynamicCheckReco
     Object.entries(dynamicChecks)
       .filter(([key, value]) => {
         return (
-          RENDERABLE_CHECK_KEYS.includes(key as any)
+          isRenderableCheckKey(key)
           && !key.startsWith("_")
           && !!value
           && typeof value === "object"
@@ -161,7 +162,7 @@ export function normalizeDynamicChecks(dynamicChecks: unknown): DynamicCheckReco
         );
       })
       .map(([key, value]) => [
-        key,
+        toPublicCheckKey(key),
         toPublicCheckKey(key) === "testQuality"
           ? {
               ...(value as Record<string, unknown>),
@@ -179,11 +180,11 @@ export function getDynamicCheckEntries(dynamicChecks: unknown): DynamicCheckEntr
       : {};
   const contestedFor = (key: string): boolean | undefined => {
     if (!CONTESTABLE_CHECK_KEYS.includes(toPublicCheckKey(key))) return undefined;
-    return payload[`_${key}Contested`] ? true : undefined;
+    return payload[`_${toBackendCheckKey(key)}Contested`] ? true : undefined;
   };
   const contestNoteFor = (key: string): string | undefined => {
     if (!CONTESTABLE_CHECK_KEYS.includes(toPublicCheckKey(key))) return undefined;
-    const note = payload[`_${key}ContestNote`];
+    const note = payload[`_${toBackendCheckKey(key)}ContestNote`];
     return typeof note === "string" && note.trim() ? note : undefined;
   };
   return (
@@ -209,11 +210,10 @@ export function formatDynamicCheckLabel(key: string): string {
   return DYNAMIC_CHECK_LABELS[key] ?? key;
 }
 export function normalizeAgentRuns(runs: unknown): AgentRun[] {
-  const entries: unknown[] = Array.isArray(runs)
-    ? runs
-    : runs && typeof runs === "object"
-      ? Object.values(runs)
-      : [];
+  let entries: unknown[];
+  if (Array.isArray(runs)) entries = runs;
+  else if (runs && typeof runs === "object") entries = Object.values(runs);
+  else entries = [];
   return entries
     .filter((run): run is AgentRun => {
       return !!run && typeof run === "object" && "id" in run && typeof run.id === "string";

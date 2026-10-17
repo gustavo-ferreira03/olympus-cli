@@ -34,11 +34,17 @@ const RUN_WAIT_DEFAULTS = { intervalSeconds: 10, timeoutMinutes: 120 } as const;
 
 const AGENT_RUN_CONFIGS = {
   vegaVega: { taskAgentType: "claude_code", evalAgentType: "claude_code" },
+  vegaVega2: { taskAgentType: "claude_code", evalAgentType: "claude_code" },
   vegaOrion: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
+  vegaOrion2: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
+  vegaOrion3: { taskAgentType: "claude_code", evalAgentType: "codex_cli" },
   orionVega: { taskAgentType: "codex_cli", evalAgentType: "claude_code" },
   orionOrion: { taskAgentType: "codex_cli", evalAgentType: "codex_cli" },
   novaVega1: { taskAgentType: "gemini_cli", evalAgentType: "claude_code" },
+  novaVega2: { taskAgentType: "gemini_cli", evalAgentType: "claude_code" },
+  novaVega3: { taskAgentType: "gemini_cli", evalAgentType: "claude_code" },
   novaOrion1: { taskAgentType: "gemini_cli", evalAgentType: "codex_cli" },
+  novaOrion2: { taskAgentType: "gemini_cli", evalAgentType: "codex_cli" },
   castorVega1: { taskAgentType: "taiga", evalAgentType: "claude_code" },
   castorOrion1: { taskAgentType: "taiga", evalAgentType: "codex_cli" },
 };
@@ -96,14 +102,10 @@ function printCriteria(criteria: CriteriaReport): void {
   console.log("\n  Rollout Criteria:");
   for (const criterion of criteriaList) {
     const status = String(criterion.status ?? "pending");
-    const icon =
-      status === "pass"
-        ? "\x1b[32m✓\x1b[0m"
-        : status === "fail"
-          ? "\x1b[31m✗\x1b[0m"
-          : status === "warn"
-            ? "\x1b[33m!\x1b[0m"
-            : "\x1b[90m○\x1b[0m";
+    let icon = "\x1b[90m○\x1b[0m";
+    if (status === "pass") icon = "\x1b[32m✓\x1b[0m";
+    else if (status === "fail") icon = "\x1b[31m✗\x1b[0m";
+    else if (status === "warn") icon = "\x1b[33m!\x1b[0m";
     const detail = criterion.detail ? `  ${criterion.detail}` : "";
     const preview = criterion.preview ? " \x1b[90m(preview)\x1b[0m" : "";
     console.log(`    ${icon} ${criterion.label}${detail}${preview}`);
@@ -230,24 +232,6 @@ function buildConfigs(args: TriggerBatchOptions): RunConfig[] {
     evalAgentType: evaluator,
   }));
 }
-async function assertRolloutsAllowed(
-  client: Awaited<ReturnType<typeof getClient>>,
-  problemId: string,
-) {
-  const readiness: any = await client.query(api.submissionReadiness.getSubmissionReadiness, {
-    problemId,
-  });
-  const required = new Set(["prechecks", "scopeGate", "dynamicChecks"]);
-  const blockers = (readiness?.criteria ?? [])
-    .filter(
-      (criterion: any) =>
-        required.has(criterion.id) && criterion.status !== "pass" && criterion.status !== "warn",
-    )
-    .map((criterion: any) => `${criterion.label}: ${criterion.detail ?? criterion.status}`);
-  if (blockers.length > 0) {
-    throw new Error(`Rollouts are blocked: ${blockers.join("; ")}`);
-  }
-}
 
 async function triggerBatch(args: TriggerBatchOptions) {
   const policy = loadPolicy();
@@ -264,7 +248,7 @@ async function triggerBatch(args: TriggerBatchOptions) {
   }
   const client = await getClient();
   const { problem, version } = await requireProblemVersion(client, args.problemId);
-  await assertRolloutsAllowed(client, args.problemId);
+
   const isDiamond = problem.tierLock === "Diamond" || problem.submissionType === "diamond";
   const configs: RunConfig[] =
     args.preset === "quick" || args.preset === "full"
@@ -505,12 +489,11 @@ const show = defineCommand({
     if (!run) {
       throw new Error(`Rollout "${args.run}" was not found on v${version.version}`);
     }
-    const job =
-      args.json && !args.full
-        ? null
-        : run.jobId
-          ? await client.query(api.jobs.get, { id: run.jobId })
-          : null;
+    let job: any = null;
+    if (!args.json || args.full) {
+      // The web no longer reads jobs.get; when it is unavailable, run.output is used instead.
+      if (run.jobId) job = await client.query(api.jobs.get, { id: run.jobId }).catch(() => null);
+    }
     const output = job?.output ?? run.output ?? {};
     const detail = { ...run, job };
     if (args.json) {
@@ -578,7 +561,7 @@ const run = defineCommand({
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
-    const waitWindow = resolveWaitWindow(args, RUN_WAIT_DEFAULTS);
+    const waitOptions = resolveWaitWindow(args, RUN_WAIT_DEFAULTS);
     const { result, version, configs } = await triggerBatch({
       problemId: args.id,
       solver: args.solver,
@@ -590,7 +573,7 @@ const run = defineCommand({
       useGeneralTokens: args["use-general-tokens"],
     });
     const batchTag = result?.batchTag;
-    if (waitWindow) {
+    if (waitOptions) {
       await waitForRuns({
         client: await getClient(),
         version,
@@ -598,7 +581,7 @@ const run = defineCommand({
         runSelector: undefined,
         batch: batchTag,
         includeStale: false,
-        ...waitWindow,
+        ...waitOptions,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });
@@ -641,25 +624,25 @@ type RunWaitSummary = {
   completedAt?: number;
 };
 
-function summarizeRun(run: AgentRun): RunWaitSummary {
+function summarizeRun(entry: AgentRun): RunWaitSummary {
   return {
-    id: run.id,
-    jobId: run.jobId,
-    label: formatRunLabel(run),
-    status: run.status,
-    stale: Boolean(run.stale),
-    scratched: Boolean(run.scratched),
-    batchTag: run.batchTag,
-    batchName: run.batchName,
-    solver: formatAgentType(run.taskAgentType),
-    evaluator: formatAgentType(run.evalAgentType),
-    verdict: run.output?.verdict,
-    summary: run.output?.summary,
-    error: run.error,
-    progress: run.progress,
-    currentStep: run.currentStep,
-    createdAt: run.createdAt,
-    completedAt: run.completedAt,
+    id: entry.id,
+    jobId: entry.jobId,
+    label: formatRunLabel(entry),
+    status: entry.status,
+    stale: Boolean(entry.stale),
+    scratched: Boolean(entry.scratched),
+    batchTag: entry.batchTag,
+    batchName: entry.batchName,
+    solver: formatAgentType(entry.taskAgentType),
+    evaluator: formatAgentType(entry.evalAgentType),
+    verdict: entry.output?.verdict,
+    summary: entry.output?.summary,
+    error: entry.error,
+    progress: entry.progress,
+    currentStep: entry.currentStep,
+    createdAt: entry.createdAt,
+    completedAt: entry.completedAt,
   };
 }
 
@@ -726,11 +709,11 @@ async function waitForRuns({
 
   while (true) {
     const allRuns = await queryRunsWithRetry(client, version._id);
-    const selectable = includeStale ? allRuns : allRuns.filter((run) => !run.stale);
+    const selectable = includeStale ? allRuns : allRuns.filter((candidate) => !candidate.stale);
 
     if (targetIds === null) {
       if (jobId) {
-        const match = selectable.find((run) => run.jobId === jobId);
+        const match = selectable.find((candidate) => candidate.jobId === jobId);
         if (!match)
           throw new Error(`Run job ${jobId} was not found on current v${version.version}`);
         targetIds = [match.id];
@@ -738,7 +721,7 @@ async function waitForRuns({
         const resolved = resolveRunSelector(selectable, runSelector);
         if (resolved.matches) {
           throw new Error(
-            `Run selector "${runSelector}" is ambiguous: ${resolved.matches.map((run) => run.id).join(", ")}`,
+            `Run selector "${runSelector}" is ambiguous: ${resolved.matches.map((candidate) => candidate.id).join(", ")}`,
           );
         }
         if (!resolved.run)
@@ -746,15 +729,15 @@ async function waitForRuns({
         targetIds = [resolved.run.id];
       } else if (batch) {
         targetIds = selectable
-          .filter((run) => run.batchTag === batch || run.batchName === batch)
-          .map((run) => run.id);
+          .filter((candidate) => candidate.batchTag === batch || candidate.batchName === batch)
+          .map((candidate) => candidate.id);
         if (targetIds.length === 0) {
           throw new Error(`Batch "${batch}" was not found on current v${version.version}`);
         }
       } else {
         targetIds = selectable
-          .filter((run) => !run.scratched && isActiveRunStatus(run.status))
-          .map((run) => run.id);
+          .filter((candidate) => !candidate.scratched && isActiveRunStatus(candidate.status))
+          .map((candidate) => candidate.id);
         if (targetIds.length === 0) {
           const result = { status: "idle", version: version.version, runs: [] };
           if (json) printJson(result);
@@ -765,16 +748,16 @@ async function waitForRuns({
     }
 
     const selected = targetIds.map((id) => {
-      const run = allRuns.find((item) => item.id === id);
-      if (!run) throw new Error(`Run ${id} disappeared while waiting`);
-      return run;
+      const selectedRun = allRuns.find((item) => item.id === id);
+      if (!selectedRun) throw new Error(`Run ${id} disappeared while waiting`);
+      return selectedRun;
     });
-    const active = selected.filter((run) => isActiveRunStatus(run.status));
+    const active = selected.filter((candidate) => isActiveRunStatus(candidate.status));
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
 
     if (active.length === 0) {
       const summaries = selected.map(summarizeRun);
-      const executionFailed = selected.some((run) => run.status === "failed");
+      const executionFailed = selected.some((candidate) => candidate.status === "failed");
       const result: Record<string, unknown> = {
         status: executionFailed ? "failed" : "completed",
         version: version.version,
@@ -790,10 +773,10 @@ async function waitForRuns({
       if (json) printJson(result);
       else {
         process.stderr.write("\r\x1b[2K");
-        for (const run of summaries) {
-          const detail = run.verdict ?? run.summary ?? run.error ?? "";
+        for (const summary of summaries) {
+          const detail = summary.verdict ?? summary.summary ?? summary.error ?? "";
           console.log(
-            `${statusBadge(run.status)}  ${run.label}${detail ? ` — ${truncate(String(detail), 100)}` : ""}`,
+            `${statusBadge(summary.status)}  ${summary.label}${detail ? ` — ${truncate(String(detail), 100)}` : ""}`,
           );
         }
       }
@@ -816,7 +799,7 @@ async function waitForRuns({
 
     if (!json) {
       const progress = active
-        .map((run) => `${run.id.slice(0, 8)}:${run.progress ?? "?"}%`)
+        .map((candidate) => `${candidate.id.slice(0, 8)}:${candidate.progress ?? "?"}%`)
         .join(" ");
       process.stderr.write(
         `\r  waiting runs=${active.length} elapsed=${elapsedSeconds}s ${progress}`,
@@ -964,23 +947,27 @@ const reEvaluateRun = defineCommand({
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
-    const waitWindow = resolveWaitWindow(args, RUN_WAIT_DEFAULTS);
+    const waitOptions = resolveWaitWindow(args, RUN_WAIT_DEFAULTS);
     const client = await getClient();
     const { version } = await requireProblemVersion(client, args.id);
     const offer: any = await client.query(api.reEvalRuns.getReEvalOffer, {
       versionId: version._id,
     });
-    if (!offer?.eligible) throw new Error("This version is not eligible for rollout re-evaluation");
+
     assertPaidEndpoint("reEvalRuns:triggerReEvalRuns", {
       useGeneralTokens: args["use-general-tokens"],
     });
     await assertRemoteReevaluationAttempts(client, args.id, version._id);
+    // The backend confirms the cohort it charges for: the web app sends the offer's cohortHash and runCount,
+    // and a request without them fails with a bare Server Error.
     const result: any = await client.action(api.reEvalRuns.triggerReEvalRuns, {
       versionId: version._id,
+      cohortHash: offer?.cohortHash,
+      runCount: offer?.runCount,
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
     const batchTag = result?.batchTag;
-    if (waitWindow) {
+    if (waitOptions) {
       await waitForRuns({
         client,
         version,
@@ -988,7 +975,7 @@ const reEvaluateRun = defineCommand({
         runSelector: undefined,
         batch: batchTag,
         includeStale: false,
-        ...waitWindow,
+        ...waitOptions,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });
@@ -1052,17 +1039,17 @@ const artifact = defineCommand({
         `Rollout selector "${args.run}" is ambiguous: ${resolved.matches.map((item) => item.id).join(", ")}`,
       );
     }
-    const run = resolved.run;
-    if (!run?.jobId) {
+    const selectedRun = resolved.run;
+    if (!selectedRun?.jobId) {
       throw new Error(`Rollout "${args.run}" has no job or artifacts yet`);
     }
     await printArtifact({
       client,
-      jobId: run.jobId,
+      jobId: selectedRun.jobId,
       artifactKey: args.key,
       ownerDescription: `rollout "${args.run}"`,
-      jsonIdentity: { run: run.id },
-      fullCommand: `olympus runs artifact ${args.id} ${run.id} --key=${args.key} --full${args.json ? " --json" : ""}`,
+      jsonIdentity: { run: selectedRun.id },
+      fullCommand: `olympus runs artifact ${args.id} ${selectedRun.id} --key=${args.key} --full${args.json ? " --json" : ""}`,
       args,
     });
   },

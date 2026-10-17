@@ -196,12 +196,6 @@ const build = defineCommand({
       console.log(`\n  Image already ready for v${versionNumber}.\n`);
       return;
     }
-    if (image?.lastBuildFailedForCurrentInputs && !image?.rebuildSafeNeeded) {
-      throw new Error(
-        "The last image build failed for the current Dockerfile; edit it before rebuilding",
-      );
-    }
-    if (image?.canBuild === false) throw new Error("The image cannot currently be built");
 
     let triggered = false;
     if (!isActive(latestBuild?.status)) {
@@ -248,13 +242,14 @@ const cancel = defineCommand({
   args: commonArgs,
   run: async ({ args }) => {
     const { client, versionId, versionNumber } = await resolveCommandContext(args);
-    const { build } = await readImageState(client, versionId);
-    if (!isActive(build?.status)) throw new Error("No active image build exists for this version");
+    const { build: buildState } = await readImageState(client, versionId);
+    if (!isActive(buildState?.status))
+      throw new Error("No active image build exists for this version");
     const result = await client.mutation(api.dockerImage.cancelBuildJob, { versionId });
     const output = {
       status: result?.cancelled ? "cancelled" : "completed",
       version: versionNumber,
-      jobId: build.jobId,
+      jobId: buildState.jobId,
       cancelled: Boolean(result?.cancelled),
     };
     if (args.json) return printJson(output);

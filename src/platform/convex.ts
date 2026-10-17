@@ -4,13 +4,14 @@ import {
   saveObservedInputs,
 } from "../core/check-inputs.ts";
 import { toPublicCheckKey } from "../core/expected.ts";
+import { assertNativeDependencies, nativeActionForEndpoint } from "../core/native-dependencies.ts";
 import { ConvexHttpClient } from "convex/browser";
 import { CliError, describeError } from "../shared/errors.ts";
 import { anyApi, getFunctionName } from "convex/server";
 import { dispatchWithPolicy, loadPolicy, PolicyError } from "../core/policy.ts";
 import { budgetScope, readBudget } from "../core/budget.ts";
 import { credentialsDir, requireAuth } from "./auth.ts";
-import { resolve } from "node:path";
+import { resolve as resolvePath } from "node:path";
 import { getConvexUrl } from "./config.ts";
 
 let clientSingleton: ConvexHttpClient | null = null;
@@ -57,14 +58,15 @@ export function installPolicyGuards(
   client: any,
   backend: string,
   account: string,
-  directory = resolve(credentialsDir(), "challenge-budgets"),
+  directory = resolvePath(credentialsDir(), "challenge-budgets"),
   confirmationSecret = account,
 ): void {
   budgetScopes.set(client, { backend, account, directory });
-  const inputDirectory = resolve(directory, "..", "check-inputs");
+  const inputDirectory = resolvePath(directory, "..", "check-inputs");
   const inputScope = JSON.stringify([backend, account]);
   const versions = new Map<string, string>();
   const references = new Map<string, string>();
+  const referenceVersions = new Map<string, string>();
   const valid = (value: unknown): value is string => typeof value === "string" && value.length > 0;
   const remember = (map: Map<string, string>, key: unknown, problem: unknown) => {
     if (valid(key) && valid(problem)) {
@@ -96,11 +98,15 @@ export function installPolicyGuards(
         && typeof result === "object"
         && !Array.isArray(result)
       ) {
-        for (const check of Object.values(result) as any[])
+        for (const check of Object.values(result) as any[]) {
           remember(references, check?.jobId, problem);
+          remember(referenceVersions, check?.jobId, args.versionId);
+        }
       }
-      if (name === "jobs:get")
+      if (name === "jobs:get") {
         remember(references, args.id, result?.problemId ?? versions.get(result?.versionId));
+        remember(referenceVersions, args.id, result?.versionId);
+      }
       return name === "runDynamicChecks:getDynamicChecks" && typeof args.versionId === "string"
         ? recordedCheckInputs(
             result,
@@ -124,7 +130,8 @@ export function installPolicyGuards(
     }
     problem ??= references.get(args.runId) ?? references.get(args.jobId);
     if (!problem && valid(args.jobId)) {
-      const job = await client.query(anyApi.jobs.get, { id: args.jobId });
+      // jobs.get is no longer used by the web app; an unavailable lookup falls through to the scope error.
+      const job = await client.query(anyApi.jobs.get, { id: args.jobId }).catch(() => null);
       problem = references.get(args.jobId) ?? versions.get(job?.versionId);
     }
     if (!problem)
@@ -137,9 +144,17 @@ export function installPolicyGuards(
   for (const method of ["action", "mutation"] as const) {
     const invoke = client[method].bind(client);
     Object.defineProperty(client, method, {
-      value: (reference: any, args: any = {}, ...options: any[]) => {
+      value: async (reference: any, args: any = {}, ...options: any[]) => {
         const name = getFunctionName(reference);
         const policy = loadPolicy();
+        const nativeAction = nativeActionForEndpoint(name, args);
+        if (nativeAction) {
+          const problemId = await resolveChallenge(args);
+          await assertNativeDependencies(client, problemId, nativeAction, {
+            ...args,
+            versionId: args.versionId ?? referenceVersions.get(args.jobId),
+          });
+        }
         const dispatch = async () => {
           const tracking =
             name === "runDynamicChecks:triggerDynamicCheck"
@@ -172,12 +187,10 @@ export function installPolicyGuards(
               const snapshot = await client.query(api.problems.getWithLatestVersion, { problemId });
               if (snapshot?.latestVersion?._id === args.versionId) {
                 const after = remoteArtifactHashes(snapshot.latestVersion);
-                const entries =
-                  name === "runDynamicChecks:triggerDynamicCheck"
-                    ? [{ checkKey: args.checkKey, jobId: result?.jobId }]
-                    : Array.isArray(result)
-                      ? result
-                      : [];
+                let entries: any[];
+                if (name === "runDynamicChecks:triggerDynamicCheck")
+                  entries = [{ checkKey: args.checkKey, jobId: result?.jobId }];
+                else entries = Array.isArray(result) ? result : [];
                 for (const entry of entries) {
                   if (
                     typeof entry?.jobId !== "string"

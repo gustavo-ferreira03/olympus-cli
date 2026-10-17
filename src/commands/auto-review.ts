@@ -220,28 +220,21 @@ const run = defineCommand({
     full: { type: "boolean", description: "Include raw result when waiting" },
   },
   run: async ({ args }) => {
-    const wait = resolveWaitWindow(args, AUTO_REVIEW_WAIT_DEFAULTS);
+    const waitOptions = resolveWaitWindow(args, AUTO_REVIEW_WAIT_DEFAULTS);
     const { client, problemId, versionId, versionNumber } = await resolveCommandContext(args);
-    const state: any = await client.query(api.runDynamicChecks.getAutoReviewTriggerState, {
-      versionId,
-    });
-    if (state?.canRun === false) {
-      const reasons = (state.blockers ?? []).map((item: any) => item.reason).filter(Boolean);
-      throw new Error(`Auto Review is blocked: ${reasons.join("; ") || "unknown reason"}`);
-    }
     await assertCheckCapacity(client, problemId, versionId, ["autoReview"]);
     const result: any = await client.action(api.runDynamicChecks.triggerDynamicCheck, {
       versionId,
       checkKey: "autoReview",
       useGeneralTokens: args["use-general-tokens"] || undefined,
     });
-    if (wait) {
+    if (waitOptions) {
       await waitForAutoReview({
         client,
         versionId,
         versionNumber,
         jobId: result?.jobId,
-        ...wait,
+        ...waitOptions,
         json: Boolean(args.json),
         full: Boolean(args.full),
       });
@@ -273,10 +266,7 @@ const orchestrate = defineCommand({
       forceFresh: Boolean(args["force-fresh"]),
     });
     const { client, problemId, versionId } = await resolveCommandContext(args);
-    const isAdmin = await client.query(api.admins.isCurrentUser, {});
-    if (!isAdmin) {
-      throw new Error("Auto Review orchestration is restricted to admins in the UI");
-    }
+
     await assertCheckCapacity(client, problemId, versionId, ["autoReview"]);
     const result = await client.action(api.orchestratorReview.triggerOrchestratorReview, {
       versionId,

@@ -4,7 +4,8 @@ const budgets: BudgetFeedback[] = [];
 export function reportBudget(value: BudgetFeedback): void {
   budgets.push(value);
   if (!process.argv.includes("--json")) {
-    const n = (value: number | null) => (value === null ? "unknown" : String(value));
+    const n = (numericValue: number | null) =>
+      numericValue === null ? "unknown" : String(numericValue);
     console.error(
       `Local budget (prospective quotes): cost=${n(value.cost)} spent=${n(value.spent)} reserved=${n(value.reserved)} limit=${value.limit} remaining=${n(value.remaining)} scope=local challenge=${value.challengeId ?? "unknown"} status=${value.status ?? "blocked"}`,
     );

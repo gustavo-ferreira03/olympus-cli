@@ -15,6 +15,7 @@ import {
   requireProblemVersion,
   resolveProblemVersion,
 } from "../platform/convex.ts";
+import { queryPrecheckStages } from "../platform/prechecks.ts";
 import {
   GATING_CHECK_KEYS,
   NON_GATING_CHECK_KEYS,
@@ -165,7 +166,7 @@ const view = defineCommand({
     const client = await getClient();
     const { version } = await requireProblemVersion(client, args.id);
     const [stages, rawDynamicChecks, readiness] = await Promise.all([
-      client.query(api.stages.getByVersion, { versionId: version._id }),
+      queryPrecheckStages(client, { problemId: asId(args.id), versionId: version._id }),
       client.query(api.runDynamicChecks.getDynamicChecks, {
         versionId: version._id,
       }),
@@ -496,14 +497,14 @@ const wait = defineCommand({
     if (args.check && args.checks) {
       throw new Error("Use only one of --check or --checks");
     }
-    const requestedKeys = args.check
-      ? [args.check]
-      : args.checks
-        ? args.checks
-            .split(",")
-            .map((key) => key.trim())
-            .filter(Boolean)
-        : undefined;
+    let requestedKeys: string[] | undefined;
+    if (args.check) requestedKeys = [args.check];
+    else if (args.checks) {
+      requestedKeys = args.checks
+        .split(",")
+        .map((key) => key.trim())
+        .filter(Boolean);
+    }
     // Validate the wait flags before dispatching, so a bad --interval
     // fails locally instead of after a round trip.
     const window = waitWindow(args, CHECK_WAIT_DEFAULTS);
@@ -779,6 +780,10 @@ const runPrechecks = defineCommand({
       type: "boolean",
       description: "Include raw stages and readiness when waiting",
     },
+    "use-general-tokens": {
+      type: "boolean",
+      description: "Charge general tokens instead of revision tokens",
+    },
     json: { type: "boolean", description: "Output as JSON" },
   },
   run: async ({ args }) => {
@@ -786,13 +791,14 @@ const runPrechecks = defineCommand({
     const { problem, version } = await requireProblemVersion(client, args.id);
     const window = resolveWaitWindow(args, CHECK_WAIT_DEFAULTS);
     const baseline = createPrecheckBaseline(
-      await client.query(api.stages.getByVersion, { versionId: version._id }),
+      await queryPrecheckStages(client, { problemId: asId(args.id), versionId: version._id }),
     );
     const result = await client.action(api.contributorTokens.runAllChecksWithToken, {
       problemId: asId(args.id),
       versionId: version._id,
       input: readStageInput(problem, version),
       stageIds: PRECHECK_STAGES,
+      ...(args["use-general-tokens"] ? { useGeneralTokens: true } : {}),
     });
     if (window) {
       await waitForPrechecks({
@@ -913,6 +919,9 @@ export async function waitForPrechecks({
     "pass",
     "passed",
     "warn",
+    "warning",
+    "skipped",
+    "missing_fields",
     "completed",
     "fail",
     "failed",
@@ -920,7 +929,7 @@ export async function waitForPrechecks({
     "cancelled",
     "canceled",
   ]);
-  const failed = new Set(["fail", "failed", "error", "cancelled", "canceled"]);
+  const failed = new Set(["fail", "failed", "error", "cancelled", "canceled", "missing_fields"]);
   while (true) {
     const current = await requireProblemVersion(client, problemId);
     if (current.version._id !== version._id)
@@ -928,7 +937,7 @@ export async function waitForPrechecks({
         `Current version changed from v${version.version} while waiting for prechecks`,
       );
     const [stages, readiness] = await Promise.all([
-      client.query(api.stages.getByVersion, { versionId: version._id }),
+      queryPrecheckStages(client, { problemId, versionId: version._id }),
       client.query(api.submissionReadiness.getSubmissionReadiness, {
         problemId,
       }),

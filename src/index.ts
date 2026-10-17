@@ -8,6 +8,7 @@ import problems from "./commands/problems.ts";
 import runs from "./commands/runs.ts";
 import autoReview from "./commands/auto-review.ts";
 import contest from "./commands/contest.ts";
+import prestige from "./commands/prestige.ts";
 import fpCheck from "./commands/fp-check.ts";
 import image from "./commands/image.ts";
 import scopeGate from "./commands/scope-gate.ts";
@@ -15,6 +16,10 @@ import verifierAudit from "./commands/verifier-audit.ts";
 import tokens from "./commands/tokens.ts";
 import policy from "./commands/policy.ts";
 import dashboard from "./commands/dashboard.ts";
+import deliveryVerification from "./commands/delivery-verification.ts";
+import bot from "./commands/bot.ts";
+import dependencies from "./commands/dependencies.ts";
+import { NativeDependencyError } from "./core/native-dependencies.ts";
 import { PolicyError, setPolicyInvocation } from "./core/policy.ts";
 import { BudgetError } from "./core/budget.ts";
 import { printJson } from "./terminal/format.ts";
@@ -93,8 +98,12 @@ const main = defineCommand({
     contest,
     runs,
     tokens,
+    prestige,
     policy,
+    dependencies,
     dashboard,
+    "delivery-verification": deliveryVerification,
+    bot,
     update,
     view: defineCommand({
       meta: {
@@ -130,15 +139,44 @@ function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message.trim();
   return String(error);
 }
+function inlineFlagValue(
+  current: string | undefined,
+  value: string,
+  missing: string,
+  duplicate: string,
+): string {
+  if (current !== undefined) return duplicate;
+  return value || missing;
+}
 
 const suppliedArgs = process.argv.slice(2);
 // Compatibility only: one canonical command tree, not a second subsystem.
 if (suppliedArgs[0] === "workflow" && suppliedArgs[1] === "status")
   suppliedArgs.splice(0, 2, "policy", "show");
 let confirmation: string | undefined;
+let authorization: string | undefined;
 const rawArgs: string[] = [];
 for (let index = 0; index < suppliedArgs.length; index += 1) {
   const argument = suppliedArgs[index];
+  if (argument === "--policy-authorization") {
+    const value = suppliedArgs[index + 1];
+    if (!value || value.startsWith("-")) authorization = "invalid-missing-authorization";
+    else {
+      authorization = authorization === undefined ? value : "invalid-duplicate-authorization";
+      index += 1;
+    }
+    continue;
+  }
+  if (argument.startsWith("--policy-authorization=")) {
+    const value = argument.slice(argument.indexOf("=") + 1);
+    authorization = inlineFlagValue(
+      authorization,
+      value,
+      "invalid-missing-authorization",
+      "invalid-duplicate-authorization",
+    );
+    continue;
+  }
   if (argument === "--policy-confirmation" || argument === "--workflow-confirmation") {
     const value = suppliedArgs[index + 1];
     if (!value || value.startsWith("-")) confirmation = "invalid-missing-confirmation";
@@ -153,24 +191,27 @@ for (let index = 0; index < suppliedArgs.length; index += 1) {
     || argument.startsWith("--workflow-confirmation=")
   ) {
     const value = argument.slice(argument.indexOf("=") + 1);
-    confirmation =
-      confirmation === undefined && value
-        ? value
-        : confirmation === undefined
-          ? "invalid-missing-confirmation"
-          : "invalid-duplicate-confirmation";
+    confirmation = inlineFlagValue(
+      confirmation,
+      value,
+      "invalid-missing-confirmation",
+      "invalid-duplicate-confirmation",
+    );
     continue;
   }
   rawArgs.push(argument);
 }
 setPolicyInvocation({
   confirmation,
+  authorization,
   command: ["olympus", ...rawArgs],
 });
 const confirmationInputError = confirmation?.startsWith("invalid-") ? confirmation : undefined;
+const authorizationInputError = authorization?.startsWith("invalid-") ? authorization : undefined;
 const jsonOutput = rawArgs.includes("--json") || rawArgs[0] === "schema";
 const usesBuiltinOutput =
   !confirmationInputError
+  && !authorizationInputError
   && (rawArgs.some((arg) => arg === "--help" || arg === "-h")
     || (rawArgs.length === 1 && (rawArgs[0] === "--version" || rawArgs[0] === "-v")));
 
@@ -194,6 +235,13 @@ if (usesBuiltinOutput) {
         retryable: false,
         hint: "Use the exact continuation returned by the policy decision.",
       });
+    if (authorizationInputError)
+      throw new CliError("--policy-authorization requires exactly one non-option token value", {
+        kind: "usage",
+        code: "input.invalid_policy_authorization",
+        retryable: false,
+        hint: "Use olympus policy run-next instead of invoking an internal action directly.",
+      });
     await runCommand(main, { rawArgs });
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "E_NO_COMMAND") {
@@ -216,7 +264,9 @@ if (usesBuiltinOutput) {
                   rule: sanitizeDiagnostic(error.rule),
                   ...error.details,
                 }
-              : { status: "error" }),
+              : error instanceof NativeDependencyError
+                ? error.details
+                : { status: "error" }),
             error: sanitizeDiagnostic(message),
             ...describeError(error),
           });
