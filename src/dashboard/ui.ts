@@ -1,5 +1,15 @@
-import { cellWidth, fit, graphemes, wrap } from "./text.ts";
-import { dashboardRows, dashboardSections, type OverviewSnapshot, type Row } from "./data.ts";
+import { cellWidth, fit, fitAnsi, graphemes, wrap } from "./text.ts";
+import {
+  dashboardRows,
+  dashboardSections,
+  deliveryFailure,
+  inOverviewTab,
+  OVERVIEW_TABS,
+  STATUS_LABELS,
+  visibleChallenges,
+  type OverviewSnapshot,
+  type Row,
+} from "./data.ts";
 import { type ViewState } from "./tui.ts";
 
 export { fit } from "./text.ts";
@@ -188,54 +198,38 @@ function renderTile({
   return cell(` ${marker} ${label}`, tileWidth, colors.card);
 }
 
-function overviewState(status: string): { label: string; color: string } {
+/** Status label and color for a challenge, using the platform's status names. */
+function statusStyle(status: string): { label: string; color: string } {
   const value = status.toLowerCase();
-  if (value === "accepted" || value === "approved" || value === "finalized")
-    return { label: "ACCEPTED", color: colors.green };
-  if (value.includes("review") || value === "submitted" || value === "finalizing_review")
-    return { label: "IN REVIEW", color: colors.blue };
-  if (value.includes("reject") || value.includes("fail"))
-    return { label: "ACTION", color: colors.red };
-  if (value === "archived") return { label: "ARCHIVED", color: colors.muted };
-  if (value.includes("revision") || value.includes("edit"))
-    return { label: "NEEDS EDIT", color: colors.amber };
-  if (value === "draft") return { label: "DRAFT", color: colors.muted };
-  return { label: value.toUpperCase() || "UNKNOWN", color: colors.muted };
+  const label = STATUS_LABELS[value] ?? (value.replaceAll("_", " ") || "unknown");
+  if (value === "accepted") return { label, color: colors.green };
+  if (value === "rejected") return { label, color: colors.red };
+  if (value === "revision_requested") return { label, color: colors.amber };
+  if (value === "pending_review" || value === "pending_solution" || value === "finalizing_review")
+    return { label, color: colors.blue };
+  return { label, color: colors.muted };
 }
 function relativeTime(timestamp: number | null, now: number): string {
-  if (timestamp === null) return "no activity";
+  if (timestamp === null) return "—";
   const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
   if (seconds < 60) return "just now";
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
   if (seconds < 604800) return `${Math.floor(seconds / 86400)}d ago`;
-  return new Date(timestamp).toLocaleDateString();
+  return shortDate(timestamp);
 }
-function overviewRunCount(challenge: {
-  totalRuns: number | null;
-  passedRuns: number | null;
-}): string {
-  if (challenge.totalRuns === null) return "runs —";
-  return `runs ${challenge.passedRuns ?? 0}/${challenge.totalRuns} pass`;
-}
+const shortDate = (timestamp: number | null): string =>
+  timestamp === null
+    ? "—"
+    : new Date(timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 function tokenAmount(value: number | null): string {
   return value === null ? "—" : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
-function nextTokenDrip(timestamp: number | null, now: number): string {
-  if (timestamp === null) return "not scheduled";
-  const seconds = Math.floor((timestamp - now) / 1000);
-  if (seconds <= 0) return "due";
-  if (seconds < 3600) return `in ${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `in ${Math.floor(seconds / 3600)}h`;
-  return new Date(timestamp).toLocaleDateString();
-}
-function nextRotation(timestamp: number | null, now: number): string {
-  if (timestamp === null) return "not scheduled";
-  const seconds = Math.floor((timestamp - now) / 1000);
-  if (seconds <= 0) return "due";
-  if (seconds < 3600) return `in ${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `in ${Math.floor(seconds / 3600)}h`;
-  return `in ${Math.floor(seconds / 86400)}d`;
+function countdown(timestamp: number | null, now: number): string | null {
+  if (timestamp === null) return null;
+  const minutes = Math.floor((timestamp - now) / 60_000);
+  if (minutes <= 0) return "now";
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
 }
 function tokenTier(name: string | null): { label: string; color: string } {
   const normalized = name?.trim().toLowerCase() ?? "";
@@ -244,7 +238,7 @@ function tokenTier(name: string | null): { label: string; color: string } {
   if (normalized.includes("gold")) return { label, color: colors.gold };
   if (normalized.includes("silver")) return { label, color: colors.silver };
   if (normalized.includes("bronze")) return { label, color: colors.bronze };
-  return { label: name ?? "Unknown", color: colors.muted };
+  return { label, color: colors.muted };
 }
 function tokenTone(balance: number | null, cap: number | null): string {
   if (balance === null) return colors.muted;
@@ -254,13 +248,86 @@ function tokenTone(balance: number | null, cap: number | null): string {
   if (ratio <= 0.3) return colors.amber;
   return colors.green;
 }
-function tokenUsage(balance: number | null, cap: number | null): string {
-  if (balance === null || cap === null || cap <= 0) return "usage —";
-  const ratio = Math.max(0, Math.min(1, balance / cap));
-  const width = 14;
-  const filled = Math.round(width * ratio);
-  return `${"█".repeat(filled)}${"░".repeat(width - filled)} ${Math.round(ratio * 100)}%`;
+function meter(ratio: number, width: number): string {
+  const filled = Math.round(width * Math.max(0, Math.min(1, ratio)));
+  return `${"▰".repeat(filled)}${"▱".repeat(width - filled)}`;
 }
+const join = (parts: Array<string | null | false | undefined>) =>
+  parts.filter((part): part is string => Boolean(part)).join(" · ");
+
+/** The platform's Tokens summary: balance, drip, approval rate and the next tier. */
+function tokenLines(snapshot: OverviewSnapshot, now: number): string[] {
+  const tokens = snapshot.tokens;
+  if (tokens.error) return [`${colors.red} Tokens unavailable: ${tokens.error}${reset}`];
+  const tier = tokenTier(tokens.tierName);
+  const ratio = tokens.balance !== null && tokens.cap ? tokens.balance / tokens.cap : 0;
+  const revision =
+    !tokens.revisionError && tokens.revisionTokenBalance
+      ? `${colors.purple}✦ ${tokenAmount(tokens.revisionTokenBalance)} revision${reset}  `
+      : "";
+  const balance = tokens.dripUnlimited
+    ? `${colors.amber}∞${reset}`
+    : `${tokenTone(tokens.balance, tokens.cap)}${tokenAmount(tokens.balance)}${colors.dim} / ${tokenAmount(tokens.cap)}${reset}`;
+  const lines = [
+    ` ${balance}  ${revision}${tier.color}${tier.label.toUpperCase()}${reset}  ${tokenTone(tokens.balance, tokens.cap)}${meter(ratio, 10)}${colors.dim} ${Math.round(ratio * 100)}%${reset}`,
+  ];
+  const nextDrip =
+    tokens.balance !== null && tokens.cap !== null && tokens.balance < tokens.cap
+      ? countdown(tokens.nextDripAt, now)
+      : null;
+  let drip: string | null = null;
+  if (tokens.dripPaused) drip = "drip paused";
+  else if (!tokens.dripUnlimited && tokens.tierDripAmount)
+    drip = `drip +${tokenAmount(tokens.tierDripAmount)}/hr`;
+  lines.push(
+    `${colors.dim} ${
+      join([
+        drip,
+        nextDrip && `next drip ${nextDrip}`,
+        tokens.tierAcceptanceBonusUsd
+          ? `accepted bonus +$${tokenAmount(tokens.tierAcceptanceBonusUsd)}`
+          : null,
+      ]) || "drip —"
+    }${reset}`,
+  );
+  const accepted = tokens.acceptedInWindow ?? 0;
+  const rejected = tokens.rejectedInWindow ?? 0;
+  const decided = accepted + rejected;
+  const window = tokens.tierWindowDays === null ? "" : ` · ${tokenAmount(tokens.tierWindowDays)}d`;
+  const rate = decided > 0 ? `${Math.round((accepted / decided) * 100)}%` : "--";
+  const breakdown =
+    decided > 0
+      ? `${colors.dim}  ${colors.green}${accepted} accepted${colors.dim} · ${colors.red}${rejected} rejected${colors.dim} · ${decided} total${reset}`
+      : "";
+  lines.push(` Approval rate ${colors.white}${rate}${colors.dim}${window}${reset}${breakdown}`);
+  const next = tokens.nextTierRequirement;
+  const nextTier = next?.tierName
+    ? `Next ${tokenTier(next.tierName).color}${next.tierName}${colors.dim} ${tokenAmount(tokens.acceptedInWindow)}/${tokenAmount(next.requiredAccepted)} accepted${next.discounted ? " (discounted)" : ""}`
+    : null;
+  const lifetime = `lifetime accepted ${colors.green}${tokenAmount(tokens.lifetimeAccepted)}${colors.dim}`;
+  lines.push(`${colors.dim} ${join([lifetime, nextTier])}${reset}`);
+  return lines;
+}
+
+/** Ledger reasons as the platform's "Token History" names them. */
+const TOKEN_REASON_LABELS: Record<string, string> = {
+  initial_grant: "Initial grant",
+  precheck_spent: "Ran checks",
+  submission_approved: "Submission approved",
+  drip_grant: "Hourly refill",
+  admin_grant: "Admin grant",
+  revert_compensation: "Revert compensation",
+  stale_run_refund: "Rollout refund",
+  agent_run_refund: "Agent run refunded",
+};
+const BOOST_CATEGORY_LABELS: Record<string, string> = {
+  bugfix: "Bugfix",
+  refactor: "Refactor",
+  enhancement: "Enhancement",
+  optimization: "Optimization",
+};
+const PAUSED_NOTE = "Quest paused — the window is frozen; nothing ages out until it resumes.";
+
 const SPARK_LEVELS = ["·", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
 function timelineBars(values: number[], maximum: number, slotWidth: number): string {
   return values
@@ -271,58 +338,33 @@ function timelineBars(values: number[], maximum: number, slotWidth: number): str
           : Math.max(1, Math.min(SPARK_LEVELS.length - 1, Math.round((value / maximum) * 8)));
       return SPARK_LEVELS[level].repeat(slotWidth);
     })
-    .join(" ");
+    .join("");
 }
-function acceptedWindowDelta(tokens: OverviewSnapshot["tokens"]): number | null {
-  if (tokens.lifetimeAccepted === null || tokens.acceptedInWindow === null) return null;
-  return Math.max(0, tokens.lifetimeAccepted - tokens.acceptedInWindow);
-}
-function renderTierDetails(tokens: OverviewSnapshot["tokens"]): string {
-  let drip = `+${tokenAmount(tokens.tierDripAmount)}/hr drip`;
-  if (tokens.dripPaused === true) drip = "drip paused";
-  else if (tokens.dripUnlimited === true) drip = "unlimited drip";
-  else if (tokens.tierDripAmount === null) drip = "drip rate —";
-  const cap = tokens.cap === null ? "cap —" : `${tokenAmount(tokens.cap)} cap`;
-  const bonus =
-    tokens.tierAcceptanceBonusUsd === null
-      ? "accepted bonus —"
-      : `+$${tokenAmount(tokens.tierAcceptanceBonusUsd)} accepted bonus`;
-  return `Tier ${tokens.tierName ?? "Unknown"} · ${drip} · ${cap} · ${bonus}`;
-}
-function renderAcceptedDetails(tokens: OverviewSnapshot["tokens"]): string {
-  const window = tokens.tierWindowDays === null ? "—" : `${tokenAmount(tokens.tierWindowDays)}d`;
-  const accepted = tokens.acceptedInWindow === null ? "—" : tokenAmount(tokens.acceptedInWindow);
-  const olympus =
-    tokens.olympusAcceptedInWindow === null ? "—" : tokenAmount(tokens.olympusAcceptedInWindow);
-  const lifetime = tokens.lifetimeAccepted === null ? "—" : tokenAmount(tokens.lifetimeAccepted);
-  const agedOut = acceptedWindowDelta(tokens);
-  return `Accepted · last ${window} ${accepted} · ${olympus} Olympus · ${agedOut === null ? "aged out —" : `${agedOut} aged out`} · lifetime ${lifetime}`;
-}
-function renderNextTierDetails(tokens: OverviewSnapshot["tokens"]): string | null {
-  const next = tokens.nextTierRequirement;
-  if (!next?.tierName) return null;
-  const accepted = tokens.acceptedInWindow === null ? "—" : tokenAmount(tokens.acceptedInWindow);
-  const required = next.requiredAccepted === null ? "—" : tokenAmount(next.requiredAccepted);
-  const window = tokens.tierWindowDays === null ? "—" : `${tokenAmount(tokens.tierWindowDays)}d`;
-  return `${next.tierName} requires ${accepted}/${required} accepted in ${window}`;
-}
+
+/** The platform's Elo card: current and projected Elo, rotation, distance to Prestige and boosts. */
 function renderEloDetails(elo: OverviewSnapshot["elo"], now: number): string[] {
   if (!elo.available) return [elo.note];
   const toPrestige =
     elo.seatCutElo === null || elo.value === null ? null : Math.max(0, elo.seatCutElo - elo.value);
-  const current = tokenAmount(elo.value);
-  const projected =
-    elo.projectedValue === null
-      ? "est. — at rotation"
-      : `est. ${tokenAmount(elo.projectedValue)} at rotation`;
-  const gap = toPrestige === null ? "to Prestige —" : `to Prestige ${tokenAmount(toPrestige)}`;
-  const window = elo.windowDays === null ? "window —" : `window ${tokenAmount(elo.windowDays)}d`;
-  const cutoff =
-    elo.seatCutElo === null ? "seat cutoff —" : `seat cutoff ${tokenAmount(elo.seatCutElo)}`;
-  return [
-    `ELO ${current} · ${gap} · ${projected}`,
-    `${window} · ${cutoff} · rotates ${nextRotation(elo.nextRotationAt, now)}`,
+  const rotation = countdown(elo.nextRotationAt, now);
+  const lines = [
+    join([
+      `Elo ${tokenAmount(elo.value)}`,
+      elo.projectedValue !== null && `est. ${tokenAmount(elo.projectedValue)} at rotation`,
+      rotation && `rotates in ${rotation}`,
+    ]),
+    join([
+      `To Prestige ${toPrestige === null ? "—" : tokenAmount(toPrestige)}`,
+      elo.seatCutElo !== null && `seat cut ${tokenAmount(elo.seatCutElo)}`,
+      elo.windowDays !== null && `${tokenAmount(elo.windowDays)}d window`,
+    ]),
   ];
+  if (elo.questPaused) lines.push(PAUSED_NOTE);
+  for (const boost of elo.boosts)
+    lines.push(
+      `${BOOST_CATEGORY_LABELS[boost.category] ?? boost.category} submissions from ${shortDate(boost.startsAt)} gives ${boost.multiplier}x elo score${boost.endsAt === null ? "" : ` · ends ${shortDate(boost.endsAt)}`}`,
+    );
+  return lines;
 }
 function chartLine(cells: Array<{ text: string; color: string }>, width: number): string {
   const text = cells.map((item) => item.text).join("");
@@ -390,15 +432,23 @@ function renderPrestigeUsageChart(
     color,
   });
   return [
-    { text: ` Usage · ${hours}h bins · ${elo.windowDays}d window`, color: colors.white },
-    chartRow(`usage`, usageCells, colors.amber),
+    { text: ` Token usage · ${hours}h bins · ${elo.windowDays}d window`, color: colors.white },
+    chartRow("token usage", usageCells, colors.amber),
     chartRow("cumulative usage", trendCells, colors.white),
     chartRow("accepted markers", markerCells, colors.dim),
     { text: axis, color: colors.dim },
     {
-      text: ` ${tokenAmount(elo.acceptedAtRotation)} count at rotation · ${tokenAmount(elo.agingOutByRotation)} aging out`,
+      text: ` ${colors.green}${tokenAmount(elo.acceptedAtRotation)} count at rotation${colors.dim}${elo.agingOutByRotation ? ` · ${colors.amber}${tokenAmount(elo.agingOutByRotation)} aging out${colors.dim}` : ""}${reset}`,
       color: colors.dim,
     },
+    ...(elo.agingOutByRotation
+      ? [
+          {
+            text: ` ${elo.agingOutByRotation} accepted age${elo.agingOutByRotation === 1 ? "s" : ""} out of the window before the next rotation`,
+            color: colors.amber,
+          },
+        ]
+      : []),
   ];
 }
 function renderAcceptedTimeline(
@@ -428,7 +478,7 @@ function renderAcceptedTimeline(
     } else {
       agedOut++;
     }
-    cells[position] = { text: "◆", color: counts ? colors.green : colors.muted };
+    cells[position] = { text: "◆", color: counts ? laneColor(mark.lane) : colors.muted };
   }
   const boundary = Math.max(
     0,
@@ -440,7 +490,7 @@ function renderAcceptedTimeline(
   if (cells[boundary].text === "·") cells[boundary] = { text: "┆", color: colors.dim };
   const laneSummary = [...laneCounts.entries()]
     .toSorted(([a], [b]) => a.localeCompare(b))
-    .map(([lane, count]) => `${count} ${lane}`)
+    .map(([lane, count]) => `${laneColor(lane)}■${colors.dim} ${count} ${lane}`)
     .join(" · ");
   const acceptedLabel = `${colors.green}${acceptedInWindow ?? inWindow} accepted${reset}`;
   return [
@@ -451,6 +501,7 @@ function renderAcceptedTimeline(
       text: ` ${acceptedLabel} · ${agedOut} aged out · ${timeline.windowDays}d window${laneSummary ? ` · ${laneSummary}` : ""}`,
       color: colors.dim,
     },
+    ...(timeline.paused ? [{ text: ` ${PAUSED_NOTE}`, color: colors.dim }] : []),
     ...(agedOut > 0
       ? [
           {
@@ -461,10 +512,13 @@ function renderAcceptedTimeline(
       : []),
   ];
 }
-function panelRows(title: string, content: string[], width: number): string[] {
-  const rule = "─".repeat(Math.max(0, width - title.length - 2));
-  return [`${colors.accent} ${title} ${rule}${reset}`, ...content.map((line) => ` ${line}`)];
+/** Accepted-marker colors per submission lane, as on the platform. */
+function laneColor(lane: string): string {
+  if (lane === "mars") return colors.red;
+  if (lane === "diamond") return colors.purple;
+  return colors.bronze;
 }
+
 function styleOverviewRow(row: { text: string; color: string }): string {
   return row.text.includes("\x1b[") ? row.text : `${row.color}${row.text}${reset}`;
 }
@@ -485,6 +539,114 @@ function alignedTimelineAxis(plotWidth: number): string {
   }
   return chars.join("");
 }
+
+/**
+ * Everything on the home above "My Challenges": Tokens (with the accepted timeline and
+ * Token History), Prestige (with the token usage chart) and Changes Requested.
+ * Level 2 draws the full charts, 1 one-line summaries, 0 only the figures.
+ */
+function homeSummary(snapshot: OverviewSnapshot, width: number, now: number, level: 0 | 1 | 2) {
+  const lines: string[] = [];
+  const wide = level === 2 && width >= 100;
+  const chartWidth = Math.max(1, width - 1);
+  const push = (line: string) => lines.push(fitAnsi(line, width));
+  const add = (text: unknown, color = colors.white) => lines.push(cell(text, width, color));
+  const section = (title: string, color = colors.accent) => {
+    const label = ` ${title} `;
+    add(`${label}${"─".repeat(Math.max(0, width - label.length))}`, color);
+  };
+  section("TOKENS", colors.amber);
+  tokenLines(snapshot, now).forEach(push);
+  const accepted = renderAcceptedTimeline(
+    snapshot.acceptedTimeline,
+    snapshot.tokens.acceptedInWindow,
+    wide ? chartWidth : width,
+  );
+  if (accepted.length > 0 && level > 0) {
+    if (wide) for (const row of accepted) push(` ${styleOverviewRow(row)}`);
+    else {
+      const timeline = snapshot.acceptedTimeline;
+      const agedOut = timeline
+        ? timeline.marks.filter((mark) => timeline.now - mark.at > timeline.windowDays * 86_400_000)
+            .length
+        : 0;
+      push(
+        `${colors.dim} Accepted · last ${snapshot.acceptedTimeline?.windowDays ?? "—"}d · ${colors.green}${tokenAmount(snapshot.tokens.acceptedInWindow)} accepted${colors.dim} · ${agedOut} aged out${reset}`,
+      );
+    }
+  }
+
+  // Token History needs the most room; it shows only with the full charts.
+  const history = snapshot.tokens.history;
+  if (history.length > 0 && level === 2) {
+    section("TOKEN HISTORY", colors.amber);
+    for (const entry of history.slice(0, 3)) {
+      const amount = `${entry.amount > 0 ? "+" : ""}${tokenAmount(entry.amount)}`;
+      const when = new Date(entry.at).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+      push(
+        ` ${entry.amount > 0 ? colors.green : colors.red}${fit(amount, 7)}${colors.white}${fit(TOKEN_REASON_LABELS[entry.reason] ?? entry.reason, 22)}${colors.dim}${fit(when, 18)}bal: ${tokenAmount(entry.balance)}${reset}`,
+      );
+    }
+  }
+
+  section("PRESTIGE", colors.purple);
+  if (snapshot.elo.available) {
+    for (const [index, line] of renderEloDetails(snapshot.elo, now).entries()) {
+      let color = index === 0 ? colors.white : colors.dim;
+      if (line.includes("elo score")) color = colors.red;
+      push(` ${color}${line}${reset}`);
+    }
+    const chart = renderPrestigeUsageChart(snapshot.elo, now, wide ? chartWidth : width);
+    if (chart.length > 0 && level > 0) {
+      if (wide) for (const row of chart) push(` ${styleOverviewRow(row)}`);
+      else {
+        const hours = Math.max(1, Math.round((snapshot.elo.usage.binMs ?? 21_600_000) / 3_600_000));
+        const suffix = ` · ${hours}h bins`;
+        // The most recent bins that fit, so "now" stays at the right edge.
+        const bins = snapshot.elo.usage.bins.slice(-Math.max(1, width - 16 - suffix.length));
+        push(
+          `${colors.dim} Token usage ${colors.amber}${timelineBars(bins, Math.max(0, ...bins), 1)}${colors.dim}${suffix}${reset}`,
+        );
+      }
+    }
+  } else push(`${colors.dim} ${snapshot.elo.note}${reset}`);
+
+  const requests = snapshot.revisionRequests.items;
+  if (requests.length > 0) {
+    section(`CHANGES REQUESTED · ${requests.length} pending`, colors.amber);
+    const shown = level === 0 ? 1 : 3;
+    for (const request of requests.slice(0, shown)) {
+      // The feedback gives way first, so the title and when it was reviewed stay visible.
+      const title = fit(
+        request.title,
+        Math.min(request.title.length, Math.floor(width * 0.4)),
+      ).trimEnd();
+      const suffix = ` · ${join([request.reviewerName, relativeTime(request.reviewedAt, now)])}`;
+      const room = width - title.length - suffix.length - 8;
+      const feedback =
+        request.feedback && room > 8
+          ? ` — "${request.feedback.length > room ? `${fit(request.feedback, room - 1).trimEnd()}…` : request.feedback}"`
+          : "";
+      add(` • ${title}${feedback}${suffix}`);
+    }
+    if (requests.length > shown) add(`   +${requests.length - shown} more`, colors.dim);
+  }
+
+  return lines;
+}
+
+/** Tab labels for terminals too narrow for the platform's full names. */
+const SHORT_TAB_LABELS: Record<string, string> = {
+  pending_review: "Pending",
+  revision_requested: "Revision",
+  finalizing_review: "Final",
+};
+
 function renderOverviewBody(
   state: ViewState,
   width: number,
@@ -493,197 +655,99 @@ function renderOverviewBody(
 ): string[] {
   const lines: string[] = [];
   const add = (text: unknown, color = colors.white) => lines.push(cell(text, width, color));
-  const addSection = (title: string, color = colors.accent) => {
-    const label = ` ${title.toUpperCase()} `;
+  const section = (title: string, color = colors.accent) => {
+    const label = ` ${title} `;
     add(`${label}${"─".repeat(Math.max(0, width - label.length))}`, color);
   };
   const snapshot = state.overview;
   if (!snapshot) {
-    add(
-      state.busy ? `${spinner(now)} Loading your challenges...` : "Waiting for challenges...",
-      colors.white,
-    );
-    add("q exit", colors.dim);
+    add(` ${state.busy ? `${spinner(now)} ` : ""}Loading your challenges...`);
+    if (state.error) add(` ! ${state.error}`, colors.red);
+    add(" q quit", colors.dim);
     return lines;
   }
-  const challenges = snapshot.challenges;
-  const activeStatuses = new Set([
-    "draft",
-    "submitted",
-    "pending_review",
-    "revision_requested",
-    "finalizing_review",
-  ]);
-  const active = challenges.filter((challenge) =>
-    activeStatuses.has(challenge.status.toLowerCase()),
-  ).length;
-  const accepted = challenges.filter((challenge) =>
-    ["accepted", "approved", "finalized"].includes(challenge.status.toLowerCase()),
-  ).length;
-  const attention = challenges.filter((challenge) => {
-    const value = challenge.status.toLowerCase();
-    return value.includes("reject") || value.includes("revision") || value.includes("fail");
-  }).length;
-  const tokenToneColor = snapshot.tokens.error
-    ? colors.red
-    : tokenTone(snapshot.tokens.balance, snapshot.tokens.cap);
-  const tier = tokenTier(snapshot.tokens.tierName);
-  add(
-    ` HOME · ${challenges.length} visible · updated ${relativeTime(snapshot.fetchedAt, now)}`,
-    colors.dim,
+  const connection = state.connected === false ? "reconnecting…" : "live";
+  add(` HOME · updated ${relativeTime(snapshot.fetchedAt, now)} · ${connection}`, colors.dim);
+
+  // The challenge list keeps room for at least five rows; the summary above it gets
+  // less detailed until it fits.
+  const listReserve = 10;
+  let summary = homeSummary(snapshot, width, now, 0);
+  for (const level of [2, 1] as const) {
+    const candidate = homeSummary(snapshot, width, now, level);
+    if (lines.length + candidate.length + listReserve <= height) {
+      summary = candidate;
+      break;
+    }
+  }
+  lines.push(...summary);
+
+  const tab = state.overviewTab ?? "all";
+  const all = snapshot.challenges;
+  section(
+    `MY CHALLENGES · ${all.length} total${snapshot.archivedHidden ? ` · ${snapshot.archivedHidden} archived hidden` : ""}`,
   );
-  addSection("Summary", colors.blue);
-  const visibleSummary =
-    snapshot.totalChallenges === challenges.length
-      ? `${challenges.length} challenges`
-      : `${challenges.length}/${snapshot.totalChallenges} shown`;
+  const tabs = OVERVIEW_TABS.map((item) => ({
+    id: item.id,
+    label: item.label,
+    count: all.filter((challenge) => inOverviewTab(item.id, challenge.status)).length,
+  }));
+  const fullTabs = tabs.map((item) => `${item.label} ${item.count}`).join("  ").length + 3;
   lines.push(
-    `${colors.white} ${visibleSummary}${reset}`
-      + `${accepted > 0 ? colors.green : colors.muted} · ${accepted} accepted${reset}`
-      + `${active > 0 ? colors.blue : colors.muted} · ${active} active${reset}`
-      + `${attention > 0 ? colors.amber : colors.green} · ${attention} attention${reset}`,
+    fitAnsi(
+      ` ${tabs
+        .map((item) => {
+          const label = fullTabs > width ? (SHORT_TAB_LABELS[item.id] ?? item.label) : item.label;
+          const text = `${label} ${item.count}`;
+          return item.id === tab
+            ? `${colors.accent}[${text}]${reset}`
+            : `${colors.dim}${text}${reset}`;
+        })
+        .join(fullTabs > width ? " " : "  ")}`,
+      width,
+    ),
   );
-
-  const wide = width >= 100 && height >= 32;
-  const panelContentWidth = Math.max(1, width - 1);
-  const acceptedTimeline = renderAcceptedTimeline(
-    snapshot.acceptedTimeline,
-    snapshot.tokens.acceptedInWindow,
-    wide ? panelContentWidth : width,
-  );
-  const nextTier = renderNextTierDetails(snapshot.tokens);
-  const account: string[] = [`${colors.amber}BALANCE${reset}`];
-  if (snapshot.tokens.error) {
-    account.push(`${colors.red}Tokens unavailable: ${snapshot.tokens.error}${reset}`);
-  } else {
-    account.push(
-      `${tokenToneColor}Balance  ${tokenAmount(snapshot.tokens.balance)} / ${tokenAmount(snapshot.tokens.cap)}  ${tokenUsage(snapshot.tokens.balance, snapshot.tokens.cap)} · drip ${nextTokenDrip(snapshot.tokens.nextDripAt, now)}${reset}`,
-    );
-    account.push(`${tier.color}${renderTierDetails(snapshot.tokens)}${reset}`);
-    if (nextTier) account.push(`${tier.color}Next ${nextTier}${reset}`);
-  }
-  if (
-    !snapshot.tokens.revisionError
-    && snapshot.tokens.revisionTokenBalance !== null
-    && snapshot.tokens.revisionTokenBalance > 0
-  ) {
-    account.push(
-      `${colors.purple}Revision tickets: ${tokenAmount(snapshot.tokens.revisionTokenBalance)}${reset}`,
-    );
-  }
-  account.push("", `${colors.green}ACCEPTANCE${reset}`);
-  if (acceptedTimeline.length > 0) {
-    if (wide) account.push(...acceptedTimeline.map(styleOverviewRow));
-    else
-      account.push(
-        `Accepted  last ${snapshot.acceptedTimeline?.windowDays ?? "—"}d · ${tokenAmount(snapshot.tokens.acceptedInWindow)} accepted · ${Math.max(0, (snapshot.acceptedTimeline?.marks.length ?? 0) - (snapshot.tokens.acceptedInWindow ?? 0))} aged out`,
-      );
-  } else if (!snapshot.tokens.error) {
-    account.push(renderAcceptedDetails(snapshot.tokens));
-  }
-
-  const prestige: string[] = [
-    `${colors.purple}PRESTIGE${reset}`,
-    ...(snapshot.elo.available
-      ? renderEloDetails(snapshot.elo, now).map(
-          (line, index) => `${index === 0 ? colors.white : colors.dim}${line}${reset}`,
-        )
-      : [`${colors.dim}${snapshot.elo.note}${reset}`]),
-  ];
-  const prestigeChart = renderPrestigeUsageChart(
-    snapshot.elo,
-    now,
-    wide ? panelContentWidth : width,
-  );
-  if (prestigeChart.length > 0) {
-    if (wide) prestige.push(...prestigeChart.map(styleOverviewRow));
-    else {
-      const hours = Math.max(1, Math.round((snapshot.elo.usage.binMs ?? 21_600_000) / 3_600_000));
-      prestige.push(
-        `Usage  ${timelineBars(snapshot.elo.usage.bins, Math.max(0, ...snapshot.elo.usage.bins), 1)} · ${hours}h bins`,
-      );
-    }
-  }
-
-  if (wide) {
-    lines.push(...panelRows("ACCOUNT", [...account, ...prestige], width));
-  } else {
-    addSection("Account", colors.accent);
-    add(" BALANCE", colors.amber);
-    if (snapshot.tokens.error) add(` Tokens unavailable: ${snapshot.tokens.error}`, colors.red);
-    else {
-      add(
-        ` Balance  ${tokenAmount(snapshot.tokens.balance)} / ${tokenAmount(snapshot.tokens.cap)}  ${tokenUsage(snapshot.tokens.balance, snapshot.tokens.cap)} · next drip ${nextTokenDrip(snapshot.tokens.nextDripAt, now)}`,
-        tokenToneColor,
-      );
-      add(` ${renderTierDetails(snapshot.tokens)}`, tier.color);
-      if (nextTier) add(` Next ${nextTier}`, tier.color);
-    }
-    if (
-      !snapshot.tokens.revisionError
-      && snapshot.tokens.revisionTokenBalance !== null
-      && snapshot.tokens.revisionTokenBalance > 0
-    )
-      add(` Revision tickets: ${tokenAmount(snapshot.tokens.revisionTokenBalance)}`, colors.purple);
-    add(" ACCEPTANCE", colors.green);
-    if (acceptedTimeline.length > 0) {
-      const acceptedCount = tokenAmount(snapshot.tokens.acceptedInWindow);
-      const agedOutCount = Math.max(
-        0,
-        (snapshot.acceptedTimeline?.marks.length ?? 0) - (snapshot.tokens.acceptedInWindow ?? 0),
-      );
-      lines.push(
-        ` ${colors.dim}Accepted · last ${snapshot.acceptedTimeline?.windowDays ?? "—"}d · ${colors.green}${acceptedCount} accepted${reset} · ${colors.dim}${agedOutCount} aged out${reset}`,
-      );
-    } else if (!snapshot.tokens.error)
-      add(` ${renderAcceptedDetails(snapshot.tokens)}`, colors.white);
-
-    add(" PRESTIGE", colors.purple);
-    for (const line of prestige) if (!line.includes("PRESTIGE")) lines.push(` ${line}`);
-  }
-
-  addSection("Challenges");
-  add(` ${state.busy ? `${spinner(now)} ` : ""}Select a challenge to monitor`, colors.white);
-  if (state.error) add(`! ${state.error}`, colors.red);
+  if (state.error) add(` ! ${state.error}`, colors.red);
+  const challenges = visibleChallenges(snapshot, tab);
   if (challenges.length === 0) {
-    add("No challenges found for this account.", colors.dim);
-    add("q exit  r refresh", colors.accent);
+    add(all.length === 0 ? " No challenges yet." : " No matching challenges.", colors.dim);
+    add(" ←→ status  r reload  q quit", colors.accent);
     return lines;
   }
-  const selectedIndex = Math.max(0, Math.min(state.overviewSelected, challenges.length - 1));
-  const footerLines = 1;
-  const detailLines = 3;
-  const listRoom = Math.max(1, height - lines.length - footerLines - detailLines);
-  const maxStart = Math.max(0, challenges.length - listRoom);
-  const start = Math.max(0, Math.min(selectedIndex - Math.floor(listRoom / 2), maxStart));
-  if (start > 0) add(`  ↑ ${start} more above`, colors.dim);
-  const titleWidth = Math.max(14, Math.min(42, Math.floor(width * 0.42)));
-  const statusWidth = Math.min(12, Math.max(8, Math.floor(width * 0.18)));
-  const runWidth = Math.max(12, width - titleWidth - statusWidth - 10);
-  for (const [offset, challenge] of challenges.slice(start, start + listRoom).entries()) {
-    const index = start + offset;
-    const selected = index === selectedIndex;
-    const status = overviewState(challenge.status);
-    const meta = `${overviewRunCount(challenge)} · ${relativeTime(challenge.lastActivityAt, now)}`;
-    add(
-      ` ${selected ? "▸" : " "} ${fit(challenge.title, titleWidth)} ${cell(status.label, statusWidth, status.color)} ${fit(meta, runWidth)}`,
-      selected ? colors.card : colors.white,
-    );
-  }
-  if (start + listRoom < challenges.length)
-    add(`  ↓ ${challenges.length - start - listRoom} more below`, colors.dim);
-  const selected = challenges[selectedIndex];
-  const selectedStatus = overviewState(selected.status);
-  add(` SELECTED · ${selected.title}`, colors.accent);
-  add(
-    ` ID ${selected.id} · ${selectedStatus.label} · ${selected.language ?? "language unknown"} · ${selected.difficulty ?? "difficulty unknown"}`,
-    colors.white,
+  // Narrow terminals drop the Language column before the title gets too short.
+  const statusWidth = 18,
+    createdWidth = 7,
+    difficultyWidth = 10,
+    languageWidth = width >= 90 ? 12 : 0;
+  const columnGap = languageWidth ? 1 : 0;
+  const titleWidth = Math.max(
+    12,
+    width - statusWidth - createdWidth - languageWidth - columnGap - difficultyWidth - 7,
   );
+  const languageColumn = (text: string) => (languageWidth ? `${fit(text, languageWidth)} ` : "");
   add(
-    ` Enter monitor this challenge · olympus dashboard ${selected.id} · updated ${relativeTime(snapshot.fetchedAt, now)}`,
+    `   ${fit("Title", titleWidth)} ${languageColumn("Language")}${fit("Difficulty", difficultyWidth)} ${fit("Status", statusWidth)} Created`,
     colors.dim,
   );
-  add(" ↑↓ select   Enter monitor   r refresh   q exit", colors.accent);
+  const selectedIndex = Math.max(0, Math.min(state.overviewSelected, challenges.length - 1));
+  const room = Math.max(1, height - lines.length - 3);
+  const start = Math.max(
+    0,
+    Math.min(selectedIndex - Math.floor(room / 2), challenges.length - room),
+  );
+  for (const [offset, challenge] of challenges.slice(start, start + room).entries()) {
+    const selected = start + offset === selectedIndex;
+    const status = statusStyle(challenge.status);
+    lines.push(
+      `${selected ? colors.accent : colors.white} ${selected ? "▸" : " "} ${fit(challenge.title, titleWidth)} ${languageColumn(challenge.language ?? "—")}${fit(challenge.difficulty ?? "—", difficultyWidth)}${reset} ${cell(status.label, statusWidth, status.color)} ${cell(shortDate(challenge.createdAt), createdWidth, colors.dim)}`,
+    );
+  }
+  const below = challenges.length - start - room;
+  add(
+    ` ${join([start > 0 && `↑ ${start} more`, below > 0 && `↓ ${below} more`]) || " "}`,
+    colors.dim,
+  );
+  add(" ↑↓ select  ←→ status  Enter open  r reload  q quit", colors.accent);
   return lines;
 }
 
@@ -706,19 +770,21 @@ export function renderDashboard(
     lines.push(...renderOverviewBody(state, width, height, now));
   } else if (snapshot) {
     if (height >= 18) put(` ${snapshot.title}`, colors.white);
-    if (height >= 16)
+    if (height >= 16) {
+      const status = statusStyle(snapshot.status);
+      const statusWidth = Math.min(width, status.label.length + 2);
+      const connection = state.connected === false ? "reconnecting…" : "live";
       lines.push(
-        cell(
-          ` ${snapshot.status.toUpperCase()} `,
-          Math.min(width, 22, snapshot.status.length + 2),
-          snapshot.status === "accepted" ? colors.green : colors.blue,
-        )
+        cell(` ${status.label} `, statusWidth, status.color)
           + cell(
-            `   v${snapshot.version ?? "—"}${snapshot.submissionType ? `  ·  ${snapshot.submissionType.toUpperCase()}` : ""}  ·  read only  ·  updated ${new Date(snapshot.fetchedAt).toLocaleTimeString()}`,
-            width - Math.min(width, 22, snapshot.status.length + 2),
+            `   v${snapshot.version ?? "—"}${snapshot.submissionType ? `  ·  ${snapshot.submissionType.toUpperCase()}` : ""}  ·  read only  ·  ${connection}  ·  updated ${new Date(snapshot.fetchedAt).toLocaleTimeString()}`,
+            width - statusWidth,
             colors.dim,
           ),
       );
+    }
+    const delivery = deliveryFailure(snapshot);
+    if (delivery) put(` ✗ Delivery verification failed: ${delivery}`, colors.red);
     if (state.rowCache?.snapshot !== snapshot)
       state.rowCache = { snapshot, rows: dashboardRows(snapshot) };
     const data = state.rowCache.rows;

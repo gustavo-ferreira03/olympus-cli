@@ -55,6 +55,7 @@ export class LiveDashboard {
   private sources: Record<string, Source> = {};
   private failure: string | undefined;
   private cached: Snapshot | undefined;
+  private cachedOverview: OverviewSnapshot | undefined;
   private lastBalanceRefresh = 0;
 
   constructor(
@@ -87,21 +88,25 @@ export class LiveDashboard {
           (value) => {
             if (name === "balance") this.maybeRefreshBalance(value);
             this.overviewRaw[name] = overviewValue(name, value);
+            this.cachedOverview = undefined;
             if (name === "problems") this.failure = undefined;
             this.onChange();
           },
           (error) => {
             if (name === "problems") this.failure = errorMessage(error);
             else this.overviewRaw[name] = { error: errorMessage(error) };
+            this.cachedOverview = undefined;
             this.onChange();
           },
         ),
       );
   }
 
+  /** Current overview; the same object until an update arrives. */
   overview(filters: DashboardOverviewFilters): OverviewSnapshot | undefined {
     if (!Array.isArray(this.overviewRaw.problems)) return undefined;
-    return buildOverview(this.overviewRaw, filters);
+    this.cachedOverview ??= buildOverview(this.overviewRaw, filters);
+    return this.cachedOverview;
   }
 
   showChallenge(id: string): void {
@@ -231,6 +236,7 @@ export class LiveDashboard {
     this.sourceSubscriptions = [];
     this.view = view;
     this.overviewRaw = {};
+    this.cachedOverview = undefined;
     this.head = undefined;
     this.sources = {};
     this.failure = undefined;

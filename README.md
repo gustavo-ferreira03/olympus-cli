@@ -145,21 +145,31 @@ olympus dashboard <challenge-id> --json
 olympus dashboard --json               # one overview snapshot
 ```
 
-Without an ID, the interactive dashboard shows account metrics and a selectable
-challenge list. Archived challenges are hidden by default. Use
-`--include-archived` to show them, or combine `--status`, `--language`,
-`--difficulty` and `--category` to filter the overview. Filter values are
-case-insensitive; `all` clears a filter.
+Without an ID, the dashboard opens the home view, laid out like the platform's home:
 
-Use Up/Down (or PgUp/PgDn) to select a challenge and Enter to open its live
-monitor. Press `b` or Escape in the monitor to return to the overview; `q` exits
-and `r` refreshes. The overview contains the Home summary, Account information
-and the selectable Challenges list. The detail monitor groups the selected
-challenge's state the way the platform does: each precheck stage (GitHub Repository,
-Problem Description & Tests, Plagiarism Review, Dockerfile, Solution Patch), Build &
-Scope (image, Scope Gate), Quality Checks, Audits (Verifier Completeness
-Audit, Rollout Coach), Auto Review, FP Check & Delivery, and Rollouts. The header shows
-the submission type and precheck/rollout counts.
+- **Tokens**: balance and cap, revision tickets, tier, drip rate and next drip, accepted
+  bonus, approval rate for the current window (accepted, rejected, total), lifetime
+  accepted and the next tier, followed by the accepted timeline (markers per lane, what
+  aged out) and, on tall terminals, the latest Token History entries.
+- **Prestige**: Elo, the estimate at rotation and when it rotates, distance to Prestige
+  and the seat cut, active Elo boosts, and the token usage chart (6h bins, cumulative
+  usage and accepted markers).
+- **Changes Requested**: challenges a reviewer sent back, with the feedback.
+- **My Challenges**: your challenges with the platform's status tabs (All, Draft, Pending
+  Review, Revision Needed, Finalizing Review, Accepted, Rejected) and its columns.
+
+The charts shrink to one-line summaries, then to just the figures, when the terminal is
+too short to show them along with at least five challenges. Use Left/Right to switch the status tab, Up/Down (or PgUp/PgDn) to select a challenge
+and Enter to open its live monitor. Press `b` or Escape in the monitor to return home;
+`q` exits. Archived challenges are hidden unless you pass `--include-archived`;
+`--status`, `--language`, `--difficulty` and `--category` filter the list
+(case-insensitive; `all` clears a filter).
+
+The monitor groups the challenge the way the platform does: each precheck stage
+(GitHub Repository, Problem Description & Tests, Plagiarism Review, Dockerfile, Solution
+Patch), Build & Scope (image, Scope Gate), Quality Checks, Audits (Verifier Completeness Audit,
+Rollout Coach), Auto Review, FP Check, and Rollouts. The header shows the status, version, submission
+type and precheck/rollout counts, plus a warning when delivery verification failed.
 
 Updates arrive live as soon as anything changes on the platform. Press `r` to reconnect
 and reload everything.

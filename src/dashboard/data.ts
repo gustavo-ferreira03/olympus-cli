@@ -31,6 +31,7 @@ export type OverviewChallenge = {
   difficulty: string | null;
   category: string | null;
   lastActivityAt: number | null;
+  createdAt: number | null;
   totalRuns: number | null;
   passedRuns: number | null;
   finalized: boolean | null;
@@ -81,6 +82,8 @@ export type OverviewSnapshot = {
     revisionTokenBalance: number | null;
     revisionError: string | null;
     usage: TokenUsageSnapshot;
+    /** Most recent ledger entries, as in the platform's "Token History". */
+    history: Array<{ reason: string; amount: number; balance: number | null; at: number }>;
     error: string | null;
   };
   elo: {
@@ -105,13 +108,33 @@ export type OverviewSnapshot = {
       countsAtRotation: boolean;
       inWindow: boolean;
     }>;
+    /** Category ELO multipliers active now. */
+    boosts: Array<{
+      category: string;
+      multiplier: number;
+      startsAt: number;
+      endsAt: number | null;
+    }>;
+    questPaused: boolean;
     available: boolean;
     note: string;
+  };
+  /** Challenges a reviewer sent back, as on the platform home ("Changes Requested"). */
+  revisionRequests: {
+    items: Array<{
+      id: string;
+      title: string;
+      feedback: string | null;
+      reviewerName: string | null;
+      reviewedAt: number | null;
+    }>;
+    error: string | null;
   };
   acceptedTimeline: {
     windowDays: number;
     bufferDays: number;
     now: number;
+    paused: boolean;
     marks: Array<{
       at: number;
       lane: string;
@@ -187,6 +210,7 @@ export const OVERVIEW_QUERIES: SourceQuery[] = [
   { name: "prestige", reference: api.tierRotation.getMyPrestigeOutlook, args: {} },
   { name: "transactions", reference: api.contributorTokens.getTransactions, args: {} },
   { name: "tierTimeline", reference: api.contributorTokens.getTierWindowTimeline, args: {} },
+  { name: "revisionRequests", reference: api.dashboard.getRevisionRequests, args: {} },
 ];
 
 /** Raw overview inputs by query name; a failed account read is carried as `{ error }`. */
@@ -264,10 +288,15 @@ export function buildOverview(
   raw: OverviewRaw,
   requested: DashboardOverviewFilters = {},
 ): OverviewSnapshot {
-  const { problems, balance, revisionTokens, prestige, transactions, tierTimeline } = raw as Record<
-    string,
-    any
-  >;
+  const {
+    problems,
+    balance,
+    revisionTokens,
+    prestige,
+    transactions,
+    tierTimeline,
+    revisionRequests,
+  } = raw as Record<string, any>;
   if (!Array.isArray(problems)) throw new Error("Invalid challenge list response");
   const allChallenges = problems
     .filter((problem: any) => problem && typeof problem === "object" && problem._id != null)
@@ -286,6 +315,7 @@ export function buildOverview(
         difficulty: clean(latest?.difficulty ?? problem.difficulty) || null,
         category: clean(latest?.category ?? problem.category) || null,
         lastActivityAt: latestActivity(problem),
+        createdAt: numberValue(problem._creationTime),
         totalRuns: summary.totalRuns,
         passedRuns: summary.passedRuns,
         finalized: typeof problem.finalized === "boolean" ? problem.finalized : null,
@@ -390,6 +420,7 @@ export function buildOverview(
           windowDays: tierTimelineRecord.windowDays,
           bufferDays: tierTimelineRecord.bufferDays,
           now: tierTimelineRecord.now,
+          paused: tierTimelineRecord.paused === true,
           marks: tierTimelineRecord.marks
             .filter((mark: any) => numberValue(mark?.at) !== null)
             .map((mark: any) => ({
@@ -448,6 +479,15 @@ export function buildOverview(
       revisionTokenBalance: numberValue(balanceRecord.revisionTokenBalance) ?? revisionTotal,
       revisionError,
       usage,
+      history: (Array.isArray(transactions) ? transactions : [])
+        .filter((item: any) => numberValue(item?.amount) !== null)
+        .slice(0, 5)
+        .map((item: any) => ({
+          reason: clean(item.reason) || "unknown",
+          amount: numberValue(item.amount)!,
+          balance: numberValue(item.balance),
+          at: numberValue(item.createdAt) ?? numberValue(item._creationTime) ?? 0,
+        })),
       error: balanceError,
     },
     elo: {
@@ -468,8 +508,36 @@ export function buildOverview(
         bins: usageBins,
       },
       marks,
+      boosts: (Array.isArray(prestigeRecord.boosts) ? prestigeRecord.boosts : [])
+        .filter(
+          (boost: any) =>
+            numberValue(boost?.startsAt) !== null
+            && boost.startsAt <= fetchedAt
+            && (boost.endsAt == null || boost.endsAt > fetchedAt),
+        )
+        .map((boost: any) => ({
+          category: clean(boost.category),
+          multiplier: numberValue(boost.multiplier) ?? 1,
+          startsAt: boost.startsAt,
+          endsAt: numberValue(boost.endsAt),
+        })),
+      questPaused: prestigeRecord.questPaused === true,
       available: eloValue !== null,
       note: prestigeNote,
+    },
+    revisionRequests: {
+      items: Array.isArray(revisionRequests)
+        ? revisionRequests
+            .filter((item: any) => item?._id != null)
+            .map((item: any) => ({
+              id: String(item._id),
+              title: clean(item.title) || "Untitled",
+              feedback: clean(item.feedback) || null,
+              reviewerName: clean(item.reviewerName) || null,
+              reviewedAt: numberValue(item.reviewedAt),
+            }))
+        : [],
+      error: typeof revisionRequests?.error === "string" ? revisionRequests.error : null,
     },
     acceptedTimeline,
   };
@@ -732,10 +800,15 @@ export async function readDashboard(client: any, id: string): Promise<Snapshot> 
   return buildSnapshot(id, head, sources);
 }
 
+const IN_FLIGHT_STATUS = /^(running|pending|queued|processing|building)$/i;
+
 function row(key: string, label: unknown, item: any): Row {
   const output = item?.output ?? {};
   const verdict =
     output.verdict ?? output.evaluation?.verdict ?? item?.latestVerdict ?? item?.verdict;
+  const status = clean(item?.inFlight ? "running" : (item?.status ?? item?.state ?? "not_run"));
+  // Work in flight is for the current inputs; the stale result it replaces must not hide it.
+  const freshness = IN_FLIGHT_STATUS.test(status) && !item?.scratched ? "current" : fresh(item);
   return {
     key,
     label: clean(label),
@@ -746,9 +819,9 @@ function row(key: string, label: unknown, item: any): Row {
       && item.progress <= 100
         ? item.progress
         : undefined,
-    status: clean(item?.inFlight ? "running" : (item?.status ?? item?.state ?? "not_run")),
+    status,
     verdict: clean(verdict),
-    freshness: fresh(item),
+    freshness,
     detail: clean(
       item?.error
         ?? output.message
@@ -806,7 +879,7 @@ function precheckRows(source: SourceReader): Row[] {
     return [
       row("stage:summary", "Prechecks", {
         ...criterion,
-        status: criterion?.status ?? "not_run",
+        status: criterion ? requirementStatus(criterion) : "not_run",
         detail: criterion?.detail ?? "No precheck stage has reported for this version.",
       }),
     ];
@@ -828,25 +901,40 @@ function precheckRows(source: SourceReader): Row[] {
 /** Scope Gate row, merging the in-flight flag over the last recorded verdict. */
 function scopeRow(source: SourceReader): Row {
   const scope = source("scope");
+  const verdict = scope?.current?.output?.verdict ?? scope?.latestVerdict;
   return row("scope", "Scope Gate", {
     ...scope,
     ...scope?.current,
     stale: typeof scope?.fresh === "boolean" ? !scope.fresh : undefined,
     status: scope?.inFlight ? "running" : (scope?.current?.status ?? scope?.latestVerdict),
+    // "drop" is the gate's rejection verdict.
+    output: { ...scope?.current?.output, verdict: verdict === "drop" ? "FAIL" : verdict },
   });
 }
 
-/** Image/build row, combining the build job with image availability. */
+/** Image/build row: an active build, a failed one, or whether a current image exists. */
 function imageRow(source: SourceReader): Row {
   const image = source("image");
   const build = source("build");
+  const buildStatus = String(build?.status ?? "").toLowerCase();
+  let status = image?.hasImage ? "pass" : "not_run";
+  if (buildStatus === "pending" || buildStatus === "running") status = buildStatus;
+  else if (buildStatus === "failed" || image?.lastBuildFailedForCurrentInputs) status = "failed";
+  const building = status === "pending" || status === "running";
   return row("image", "Image / Build", {
-    ...build,
+    progress: build?.progress,
     stale: image?.stale,
-    status: build?.status ?? (image?.hasImage ? "available" : "not_run"),
-    detail: image?.harborStatus,
+    status,
+    error: status === "failed" ? build?.error : undefined,
+    detail: join([
+      image?.harborStatus && `harbor ${image.harborStatus}`,
+      building ? build?.currentStep : null,
+    ]),
   });
 }
+
+const join = (parts: Array<string | null | false | undefined>) =>
+  parts.filter((part): part is string => Boolean(part)).join(" · ");
 
 /** Quality checks in the platform's order, then the later-stage audits. */
 const CHECK_UI_ORDER = [
@@ -874,7 +962,6 @@ function checkRank(item: Row): number {
   if (item.key === "scope") return -8;
   if (item.key.startsWith("review:")) return 100;
   if (item.key === "fp") return 101;
-  if (item.key === "delivery") return 102;
   const index = CHECK_UI_ORDER.indexOf(item.key.replace("check:", ""));
   return index >= 0 ? index : CHECK_UI_ORDER.length;
 }
@@ -985,16 +1072,28 @@ function runRows(source: SourceReader): Row[] {
   return runs;
 }
 
-/** Delivery verification row; present only once a submission started verification. */
-function deliveryRow(source: SourceReader): Row | undefined {
-  const delivery = source("delivery");
-  if (!delivery?.status) return undefined;
-  const status = String(delivery.status).toLowerCase();
-  return row("delivery", "Delivery Verification", {
-    status: status === "verifying" ? "running" : status,
-    progress: delivery.progress,
-    detail: delivery.failureSummary ?? delivery.progressStep,
-  });
+/**
+ * Status of a readiness requirement. There `pending` means
+ * "not met yet", not in progress; like the platform, only a detail that says the work
+ * is running shows it as running.
+ */
+function requirementStatus(criterion: any): string {
+  const status = String(criterion?.status ?? "").toLowerCase();
+  if (status === "pass" || status === "fail" || status === "warn") return status;
+  if (status === "pending" && /\brunning\b/i.test(String(criterion?.detail ?? "")))
+    return "running";
+  return "not_run";
+}
+
+/**
+ * A failed delivery verification, the only state worth showing: it is not a check,
+ * it decides whether a submission goes through.
+ */
+export function deliveryFailure(snapshot: Snapshot): string | null {
+  const delivery = snapshot.sources.delivery?.data;
+  const status = String(delivery?.status ?? "").toLowerCase();
+  if (status !== "failed" && status !== "errored") return null;
+  return clean(delivery.failureSummary) || `verification ${status}`;
 }
 
 /**
@@ -1028,12 +1127,13 @@ export function dashboardRows(snapshot: Snapshot): {
     if (prior) prior.key = "review:autoReview";
   }
   checks.push(fpRow(source));
-  const delivery = deliveryRow(source);
-  if (delivery) checks.push(delivery);
   checks.sort((a, b) => checkRank(a) - checkRank(b));
 
   const readiness = (source("readiness")?.criteria ?? []).map((criterion: any) =>
-    row(`ready:${criterion.id}`, criterion.label, criterion),
+    row(`ready:${criterion.id}`, criterion.label, {
+      ...criterion,
+      status: requirementStatus(criterion),
+    }),
   );
   return { checks, runs: runRows(source), readiness };
 }
@@ -1060,8 +1160,8 @@ export function dashboardSections(
     { title: "Audits", items: group((item) => AUDIT_CHECK_KEYS.has(item.key)), section: 0 },
     { title: "Auto Review", items: group((item) => item.key.startsWith("review:")), section: 0 },
     {
-      title: "FP Check & Delivery",
-      items: group((item) => item.key === "fp" || item.key === "delivery"),
+      title: "FP Check",
+      items: group((item) => item.key === "fp"),
       section: 0,
     },
     {
@@ -1101,4 +1201,43 @@ export function observedChanges(
       changes.push(`${item.label}: ${item.status} ${item.verdict} (${item.freshness})`);
   }
   return changes;
+}
+
+/** Challenge status names as the platform shows them. */
+export const STATUS_LABELS: Record<string, string> = {
+  draft: "Draft",
+  pending_solution: "Awaiting Solution",
+  pending_review: "Pending Review",
+  revision_requested: "Revision Requested",
+  finalizing_review: "Finalizing Review",
+  accepted: "Accepted",
+  rejected: "Rejected",
+  archived: "Archived",
+};
+
+/** The status tabs of the platform's "My Challenges" list, in its order. */
+export const OVERVIEW_TABS = [
+  { id: "all", label: "All" },
+  { id: "draft", label: "Draft" },
+  { id: "pending_review", label: "Pending Review" },
+  { id: "revision_requested", label: "Revision Needed" },
+  { id: "finalizing_review", label: "Finalizing Review" },
+  { id: "accepted", label: "Accepted" },
+  { id: "rejected", label: "Rejected" },
+] as const;
+
+/** Whether a challenge belongs to a tab; Pending Review also holds challenges awaiting a solution. */
+export function inOverviewTab(tab: string, status: string): boolean {
+  const value = status.toLowerCase();
+  if (tab === "all") return true;
+  if (tab === "pending_review") return value === "pending_review" || value === "pending_solution";
+  return value === tab;
+}
+
+/** The challenges listed under the selected tab. */
+export function visibleChallenges(
+  overview: OverviewSnapshot | undefined,
+  tab = "all",
+): OverviewChallenge[] {
+  return (overview?.challenges ?? []).filter((challenge) => inOverviewTab(tab, challenge.status));
 }

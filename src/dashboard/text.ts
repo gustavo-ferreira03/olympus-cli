@@ -54,3 +54,25 @@ export function wrap(value: unknown, width: number): string[] {
   lines.push(line);
   return lines;
 }
+/**
+ * Like {@link fit}, for text that already carries SGR color sequences: the
+ * sequences are kept and only visible cells count toward the width.
+ */
+export function fitAnsi(value: string, width: number): string {
+  let result = "",
+    cells = 0;
+  // eslint-disable-next-line no-control-regex -- SGR sequences are matched on purpose.
+  for (const part of value.split(/(\x1b\[[0-9;]*m)/)) {
+    if (part.startsWith("\x1b[")) {
+      result += part;
+      continue;
+    }
+    for (const { segment } of graphemes.segment(part)) {
+      const size = cellWidth(segment);
+      if (cells + size > width) return `${result}\x1b[0m`;
+      result += segment;
+      cells += size;
+    }
+  }
+  return result + " ".repeat(Math.max(0, width - cells));
+}

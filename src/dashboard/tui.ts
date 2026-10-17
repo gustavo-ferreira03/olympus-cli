@@ -1,7 +1,14 @@
 import { createLogUpdate } from "log-update";
 import { emitKeypressEvents } from "node:readline";
 import { renderDashboard } from "./ui.ts";
-import { dashboardRows, observedChanges, type OverviewSnapshot, type Snapshot } from "./data.ts";
+import {
+  dashboardRows,
+  observedChanges,
+  OVERVIEW_TABS,
+  visibleChallenges,
+  type OverviewSnapshot,
+  type Snapshot,
+} from "./data.ts";
 
 /** Live data behind the dashboard; see LiveDashboard. */
 export type DashboardFeed = {
@@ -24,6 +31,8 @@ export type ViewState = {
   mode: "overview" | "challenge";
   overview?: OverviewSnapshot;
   overviewSelected: number;
+  /** Selected "My Challenges" status tab; see OVERVIEW_TABS. */
+  overviewTab?: string;
   selectedChallengeId?: string;
   snapshot?: Snapshot;
   rowCache?: { snapshot: Snapshot; rows: ReturnType<typeof dashboardRows> };
@@ -125,7 +134,10 @@ export async function runDashboard(feed: DashboardFeed, intervalMs: number): Pro
         state.overview = overview;
         state.overviewSelected = Math.max(
           0,
-          Math.min(state.overviewSelected, overview.challenges.length - 1),
+          Math.min(
+            state.overviewSelected,
+            visibleChallenges(overview, state.overviewTab).length - 1,
+          ),
         );
       }
       state.busy = !state.overview;
@@ -159,7 +171,7 @@ export async function runDashboard(feed: DashboardFeed, intervalMs: number): Pro
     state.detailOffset = 0;
   };
   const switchToChallenge = () => {
-    const selected = state.overview?.challenges[state.overviewSelected];
+    const selected = visibleChallenges(state.overview, state.overviewTab)[state.overviewSelected];
     if (!selected) return;
     state.mode = "challenge";
     state.selectedChallengeId = selected.id;
@@ -183,7 +195,14 @@ export async function runDashboard(feed: DashboardFeed, intervalMs: number): Pro
       return;
     }
     if (state.mode === "overview") {
-      const size = state.overview?.challenges.length ?? 0;
+      if (key?.name === "left" || key?.name === "right") {
+        const index = OVERVIEW_TABS.findIndex((tab) => tab.id === (state.overviewTab ?? "all"));
+        const step = key.name === "right" ? 1 : -1;
+        state.overviewTab =
+          OVERVIEW_TABS[(index + step + OVERVIEW_TABS.length) % OVERVIEW_TABS.length].id;
+        state.overviewSelected = 0;
+      }
+      const size = visibleChallenges(state.overview, state.overviewTab).length;
       const delta = keyDelta(key?.name);
       if (delta !== 0 && size > 0)
         state.overviewSelected = Math.max(0, Math.min(size - 1, state.overviewSelected + delta));
