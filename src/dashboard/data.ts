@@ -1,5 +1,5 @@
 import { api, localBudgetStatus } from "../platform/convex.ts";
-import { queryPrecheckStages, validationResultsToStages } from "../platform/prechecks.ts";
+import { validationResultsToStages } from "../platform/prechecks.ts";
 import { getDynamicCheckEntries, formatDynamicCheckLabel } from "../core/model.ts";
 import { PRECHECK_STAGE_IDS } from "../core/expected.ts";
 import { sanitizeDiagnostic } from "../shared/errors.ts";
@@ -195,7 +195,13 @@ async function readFreshBalance(client: any): Promise<any> {
   return client.query(api.contributorTokens.getBalance, {});
 }
 
-export type SourceQuery = { name: string; reference: any; args: Record<string, unknown> };
+export type SourceQuery = {
+  name: string;
+  reference: any;
+  args: Record<string, unknown>;
+  transform?: (raw: unknown) => unknown;
+  fallback?: { reference: any; args: Record<string, unknown> };
+};
 
 export const OVERVIEW_QUERIES: SourceQuery[] = [
   { name: "problems", reference: api.problems.listByUser, args: {} },
@@ -713,7 +719,13 @@ export function challengeQueries(id: string, versionId: string | null): SourceQu
   const scoped = (name: string, reference: any) => ({ name, reference, args: { versionId } });
   return [
     ...queries,
-    scoped("prechecks", api.stages.getByVersion),
+    {
+      name: "prechecks",
+      reference: api.stages.getValidationResults,
+      args: { itemId: id, versionId },
+      transform: validationResultsToStages,
+      fallback: { reference: api.stages.getByVersion, args: { versionId } },
+    },
     scoped("review", api.orchestratorReview.getOrchestratorReview),
     scoped("checks", api.runDynamicChecks.getDynamicChecks),
     scoped("runs", api.runAgentRuns.getAgentRuns),
@@ -723,16 +735,6 @@ export function challengeQueries(id: string, versionId: string | null): SourceQu
     scoped("fp", api.fpReview.getFpCheckForVersion),
   ];
 }
-
-export const PRECHECK_FALLBACK: {
-  reference: any;
-  args: (id: string, versionId: string) => Record<string, unknown>;
-  transform: (raw: unknown) => any[];
-} = {
-  reference: api.stages.getValidationResults,
-  args: (id: string, versionId: string) => ({ itemId: id, versionId }),
-  transform: validationResultsToStages,
-};
 
 export function sourceFromResult(name: string, result: any): Source {
   if (result?.error && name === "budget") throw new Error(result.error);
@@ -760,13 +762,17 @@ export async function readDashboard(client: any, id: string): Promise<Snapshot> 
   const reads: Record<string, () => Promise<any>> = {
     budget: () => localBudgetStatus(client, id),
   };
-  for (const { name, reference, args } of challengeQueries(id, head.versionId))
-    reads[name] = () => client.query(reference, args);
+  for (const { name, reference, args, transform, fallback } of challengeQueries(id, head.versionId))
+    reads[name] = async () => {
+      try {
+        const value = await client.query(reference, args);
+        return transform ? transform(value) : value;
+      } catch (error) {
+        if (!fallback) throw error;
+        return client.query(fallback.reference, fallback.args);
+      }
+    };
   reads.balance = () => readFreshBalance(client);
-  if (head.versionId) {
-    const versionId = head.versionId;
-    reads.prechecks = () => queryPrecheckStages(client, { problemId: id, versionId });
-  }
   const sources: Record<string, Source> = {};
   await Promise.all(
     Object.entries(reads).map(async ([name, read]) => {

@@ -786,7 +786,9 @@ export function renderDashboard(
     const stages = data.checks.filter(
       (item) => item.key.startsWith("stage:") && item.key !== "stage:summary",
     );
-    const stagesPassing = stages.filter((item) => /pass|warn/i.test(item.status)).length;
+    const stagesPassing = stages.filter(
+      (item) => item.freshness !== "stale" && /pass|warn/i.test(item.status),
+    ).length;
     const cards = [
       tokens,
       stages.length > 0 ? `PRECHECKS ${stagesPassing}/${stages.length}` : "PRECHECKS —",

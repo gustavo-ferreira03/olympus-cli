@@ -8,7 +8,6 @@ import {
   headFromProblem,
   overviewValue,
   OVERVIEW_QUERIES,
-  PRECHECK_FALLBACK,
   sourceFromResult,
   type DashboardOverviewFilters,
   type OverviewRaw,
@@ -168,36 +167,28 @@ export class LiveDashboard {
     for (const unsubscribe of this.sourceSubscriptions.splice(0)) unsubscribe();
     const budget = this.sources.budget;
     this.sources = budget ? { budget } : {};
-    for (const query of challengeQueries(id, versionId)) this.subscribeSource(id, versionId, query);
+    for (const query of challengeQueries(id, versionId)) this.subscribeSource(query);
   }
 
-  private subscribeSource(id: string, versionId: string | null, query: SourceQuery): void {
-    const { name, reference, args } = query;
-    let unsubscribe = this.client.onUpdate(
-      reference,
-      args,
-      (value) => {
-        if (name === "balance") this.maybeRefreshBalance(value);
-        try {
-          this.setSource(name, sourceFromResult(name, value));
-        } catch (error) {
-          this.setSource(name, failedSource(error, this.sources[name]));
-        }
-      },
-      (error) => {
-        if (name === "prechecks" && versionId) {
-          unsubscribe();
-          unsubscribe = this.client.onUpdate(
-            PRECHECK_FALLBACK.reference,
-            PRECHECK_FALLBACK.args(id, versionId),
-            (value) =>
-              this.setSource(name, sourceFromResult(name, PRECHECK_FALLBACK.transform(value))),
-            (fallbackError) =>
-              this.setSource(name, failedSource(fallbackError, this.sources[name])),
-          );
-          return;
-        }
+  private subscribeSource(query: SourceQuery): void {
+    const { name, transform, fallback } = query;
+    const deliver = (value: unknown) => {
+      if (name === "balance") this.maybeRefreshBalance(value);
+      try {
+        this.setSource(name, sourceFromResult(name, value));
+      } catch (error) {
         this.setSource(name, failedSource(error, this.sources[name]));
+      }
+    };
+    const fail = (error: Error) => this.setSource(name, failedSource(error, this.sources[name]));
+    let unsubscribe = this.client.onUpdate(
+      query.reference,
+      query.args,
+      (value) => deliver(transform ? transform(value) : value),
+      (error) => {
+        if (!fallback) return fail(error);
+        unsubscribe();
+        unsubscribe = this.client.onUpdate(fallback.reference, fallback.args, deliver, fail);
       },
     );
     this.sourceSubscriptions.push(() => unsubscribe());

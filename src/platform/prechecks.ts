@@ -32,7 +32,7 @@ export function validationResultsToStages(raw: unknown): any[] {
       _id: `validation:${stageId}`,
       _creationTime: 0,
       stageId,
-      status: result?.stale ? "stale" : normalizeStatus(result?.status),
+      status: normalizeStatus(result?.status),
       stale: Boolean(result?.stale),
       checks: Array.isArray(result?.checks) ? result.checks.map(normalizeCheck) : [],
       source: "getValidationResults",

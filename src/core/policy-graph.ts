@@ -88,7 +88,7 @@ export function summarizePrecheckHistory(raw: unknown): {
   }
   const stages = [...latest.values()];
   const terminal = new Set(["pass", "warning", "fail", "error", "missing_fields", "skipped"]);
-  if (stages.some((stage) => !terminal.has(stage.status)))
+  if (stages.some((stage) => stage.stale === true || !terminal.has(stage.status)))
     return { neverRun: false, lastRunFailed: null };
   return {
     neverRun: false,
