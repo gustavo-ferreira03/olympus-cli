@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { INFRA_COOLDOWN_MS, infrastructureCooldown, reEvaluatedSince } from "./reeval-offer.ts";
+import { nativeGuidanceInspector, resolveNativeGuidance } from "./policy-native.ts";
+import { pendingPolicyNotes } from "./policy-notes.ts";
 import { anyApi } from "convex/server";
 import { readFileSync } from "node:fs";
 import { assertFileWithinLimit, MAX_LOCAL_STATE_BYTES } from "../shared/limits.ts";
@@ -19,8 +22,9 @@ import {
 } from "./budget.ts";
 import { reportBudget } from "../terminal/output.ts";
 import { parseAgentTypeInput } from "./model.ts";
+import { actionCliArguments } from "./action-catalog.ts";
 import { resolveCostCatalog, resolveRunPrices, resolveVersionOffer } from "./pricing.ts";
-import { TRIGGERABLE_CHECK_KEYS, toPublicCheckKey, toBackendCheckKey } from "./expected.ts";
+import { TRIGGERABLE_CHECK_KEYS, toPublicCheckKey } from "./expected.ts";
 import {
   POLICY_ACTIONS,
   type Predicate,
@@ -28,12 +32,21 @@ import {
   type PolicyGraph,
   type PolicyDecision,
   type PolicyState,
+  type PolicyMode,
   evaluatePolicyGraph,
+  matchingPolicyNotes,
   policyActionForEndpoint,
-  policyGovernsAction,
   policyInvocation,
   policyFingerprint,
-  policyRecommendedAction,
+  policyInFlightActions,
+  policyRecommendedActions,
+  policyTerminalActions,
+  policyUnmetContinuations,
+  policyActionsIndependent,
+  auditPolicyGraph,
+  createPolicyAuthorization,
+  policyStepId,
+  consumePolicyAuthorization,
   policyDecisionFeedback,
   readStablePolicyState,
   localPolicySecret,
@@ -51,7 +64,11 @@ export type Policy = {
     allow_manual_batch_name: boolean | null;
     allow_cancellations: boolean | null;
     allow_contests: boolean | null;
-    re_evaluation: { enabled: boolean | null; max_attempts: number | null };
+    re_evaluation: {
+      enabled: boolean | null;
+      max_attempts: number | null;
+      block_new_runs_when_available: boolean | null;
+    };
   };
   tokens: {
     allow_general_tokens: boolean | null;
@@ -72,7 +89,7 @@ export type Policy = {
 
 export const defaultPolicyYaml = `# yaml-language-server: $schema=./policy.schema.json
 runs:
-  max_runs: {nova: 10, vega: 0, orion: 0, castor: 0} # Maximum current original runs per model
+  max_runs: {nova: 10, vega: 0, orion: 0, castor: 0} # Maximum current runs per model, re-evaluated included
   allow_full_preset: false # Allow the full rollout preset
   allow_manual_batch_name: false # Allow explicit batch names
   allow_cancellations: false # Allow run cancellations
@@ -80,6 +97,7 @@ runs:
   re_evaluation:
     enabled: true # Allow re-evaluating existing solutions
     max_attempts: 1 # Maximum attempts per solution set across challenge versions
+    block_new_runs_when_available: false # Block new rollout runs while re-evaluation is available
 
 tokens:
   allow_general_tokens: false # Allow explicit use of general tokens
@@ -120,13 +138,14 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
     raw,
     [
       "mode",
-      "start",
+
       "confirmation",
       "gates",
       "result_profiles",
       "actions",
       "notes",
       "repair_first",
+      "rules",
     ],
     "graph",
   );
@@ -135,6 +154,7 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
   const graph: Record<string, any> = {
     ...source,
     gates: Object.hasOwn(source, "gates") ? source.gates : source.result_profiles,
+    rules: source.rules,
   };
   if (!new Set(["off", "advise", "enforce"]).has(graph.mode))
     throw new Error("graph.mode must be off, advise, or enforce");
@@ -146,6 +166,14 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
       ))
   )
     throw new Error("graph.repair_first must contain public dynamic check keys");
+  if (
+    graph.rules !== undefined
+    && (!Array.isArray(graph.rules)
+      || graph.rules.some(
+        (rule: unknown) => typeof rule !== "string" || !/^[a-z][a-z0-9_]*$/.test(rule),
+      ))
+  )
+    throw new Error("graph.rules must contain snake_case rule IDs");
   const action = (value: unknown, path: string): PolicyAction => {
     if (typeof value !== "string" || !POLICY_ACTIONS.includes(value as PolicyAction))
       throw new Error(`${path} must be one of: ${POLICY_ACTIONS.join(", ")}`);
@@ -157,7 +185,7 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
       const name = `${path}[${index}]`;
       const predicate = object(
         rawPredicate,
-        ["path", "equals", "empty", "greater_than", "at_least"],
+        ["path", "equals", "empty", "exists", "greater_than", "at_least", "less_than"],
         name,
       );
       if (
@@ -165,16 +193,23 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
         || !/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(predicate.path)
       )
         throw new Error(`${name}.path must be a safe dotted property path`);
-      const operators = ["equals", "empty", "greater_than", "at_least"].filter((key) =>
-        Object.hasOwn(predicate, key),
-      );
+      const operators = [
+        "equals",
+        "empty",
+        "exists",
+        "greater_than",
+        "at_least",
+        "less_than",
+      ].filter((key) => Object.hasOwn(predicate, key));
       if (operators.length !== 1)
         throw new Error(
-          `${name} must define exactly one of equals, empty, greater_than, or at_least`,
+          `${name} must define exactly one of equals, empty, exists, greater_than, at_least, or less_than`,
         );
       if (operators[0] === "empty" && typeof predicate.empty !== "boolean")
         throw new Error(`${name}.empty must be a boolean`);
-      for (const operator of ["greater_than", "at_least"]) {
+      if (operators[0] === "exists" && typeof predicate.exists !== "boolean")
+        throw new Error(`${name}.exists must be a boolean`);
+      for (const operator of ["greater_than", "at_least", "less_than"]) {
         if (
           operators[0] === operator
           && (typeof predicate[operator] !== "number" || !Number.isFinite(predicate[operator]))
@@ -246,6 +281,7 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
     }
     if (node.enforce !== undefined && typeof node.enforce !== "boolean")
       throw new Error(`graph.actions.${name}.enforce must be boolean`);
+
     if (
       node.unless !== undefined
       && (!Array.isArray(node.unless)
@@ -316,7 +352,11 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
   const notesRaw = graph.notes ?? [];
   if (!Array.isArray(notesRaw)) throw new Error("graph.notes must be an array");
   const notes = notesRaw.map((rawNote: unknown, index: number) => {
-    const note = object(rawNote, ["id", "when", "severity", "message"], `graph.notes[${index}]`);
+    const note = object(
+      rawNote,
+      ["id", "when", "severity", "message", "requires_ack"],
+      `graph.notes[${index}]`,
+    );
     const when = object(note.when, ["check", "all"], `graph.notes[${index}].when`);
     if (typeof note.id !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(note.id))
       throw new Error(`graph.notes[${index}].id is invalid`);
@@ -324,6 +364,8 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
       throw new Error(`graph.notes[${index}].severity is invalid`);
     if (typeof note.message !== "string" || !note.message.trim())
       throw new Error(`graph.notes[${index}].message must be non-empty`);
+    if (note.requires_ack !== undefined && typeof note.requires_ack !== "boolean")
+      throw new Error(`graph.notes[${index}].requires_ack must be boolean`);
     if (
       when.check !== undefined
       && when.check !== null
@@ -340,21 +382,18 @@ function parsePolicyGraph(raw: unknown): PolicyGraph {
       },
       severity: note.severity,
       message: note.message,
+      requires_ack: note.requires_ack ?? false,
     };
   });
   if (new Set(notes.map((note) => note.id)).size !== notes.length)
     throw new Error("graph note IDs must be unique");
-  const start =
-    graph.start === undefined || graph.start === null ? null : action(graph.start, "graph.start");
-  if (start && !Object.hasOwn(actions, start))
-    throw new Error("graph.start must identify a configured graph action");
   return {
     mode: graph.mode,
-    start,
     confirmation,
     gates,
     actions,
     notes,
+    ...(graph.rules === undefined ? {} : { rules: [...new Set(graph.rules)] as string[] }),
     ...(graph.repair_first === undefined
       ? {}
       : { repair_first: [...new Set(graph.repair_first)] as string[] }),
@@ -398,10 +437,10 @@ export function parsePolicy(text: string): Policy {
     const review = group("auto_review", ["allow_force_refresh"]);
     const reeval = object(
       runs.re_evaluation ?? {},
-      ["enabled", "max_attempts"],
+      ["enabled", "max_attempts", "block_new_runs_when_available"],
       "runs.re_evaluation",
     );
-    const value = (group: Record<string, any>, key: string) => group[key] ?? null;
+    const value = (section: Record<string, any>, key: string) => section[key] ?? null;
     const result: Policy = {
       runs: {
         max_runs: runs.max_runs ?? {},
@@ -412,6 +451,7 @@ export function parsePolicy(text: string): Policy {
         re_evaluation: {
           enabled: value(reeval, "enabled"),
           max_attempts: value(reeval, "max_attempts"),
+          block_new_runs_when_available: value(reeval, "block_new_runs_when_available"),
         },
       },
       tokens: {
@@ -476,6 +516,8 @@ export function parsePolicy(text: string): Policy {
       "checks.require_explicit_selection": result.checks.require_explicit_selection,
       "auto_review.allow_force_refresh": result.auto_review.allow_force_refresh,
       "runs.re_evaluation.enabled": result.runs.re_evaluation.enabled,
+      "runs.re_evaluation.block_new_runs_when_available":
+        result.runs.re_evaluation.block_new_runs_when_available,
       "checks.allow_contests": result.checks.allow_contests,
       "checks.allow_rerun_passing": result.checks.allow_rerun_passing,
       "runs.allow_contests": result.runs.allow_contests,
@@ -511,16 +553,23 @@ export function policySchema(): Record<string, unknown> {
       },
       equals: { type: ["string", "number", "boolean", "null"] },
       empty: { type: "boolean" },
+      exists: { type: "boolean" },
       greater_than: { type: "number" },
       at_least: {
         type: "number",
         description:
           "Inclusive numeric minimum; actual must be a finite number greater than or equal to this value.",
       },
+      less_than: {
+        type: "number",
+        description: "Exclusive numeric maximum; actual must be a finite number below this value.",
+      },
     },
-    oneOf: ["equals", "empty", "greater_than", "at_least"].map((operator) => ({
-      required: [operator],
-    })),
+    oneOf: ["equals", "empty", "exists", "greater_than", "at_least", "less_than"].map(
+      (operator) => ({
+        required: [operator],
+      }),
+    ),
   };
   const actionEnum = [...POLICY_ACTIONS];
   const graphSchema = {
@@ -536,7 +585,13 @@ export function policySchema(): Record<string, unknown> {
         description:
           "When a named check is stale with a last FAIL result, only those checks may execute first. Repairs bypass graph ordering, not technical guards or budgets.",
       },
-      start: { type: ["string", "null"], enum: [...actionEnum, null] },
+      rules: {
+        type: "array",
+        uniqueItems: true,
+        items: { type: "string", pattern: "^[a-z][a-z0-9_]*$" },
+        description: "Executable policy rule IDs reported by policy inspection.",
+      },
+
       confirmation: {
         type: ["object", "null"],
         additionalProperties: false,
@@ -580,6 +635,7 @@ export function policySchema(): Record<string, unknown> {
                   type: "boolean",
                   description: "Disallow advise confirmation for this action.",
                 },
+
                 unless: {
                   type: "array",
                   items: { type: "array", minItems: 1, items: predicateSchema },
@@ -631,6 +687,10 @@ export function policySchema(): Record<string, unknown> {
             id: { type: "string" },
             severity: { enum: ["info", "warning", "error"] },
             message: { type: "string", minLength: 1 },
+            requires_ack: {
+              type: "boolean",
+              description: "Require a separate read and acknowledgment before dispatch.",
+            },
             when: {
               type: "object",
               additionalProperties: false,
@@ -680,7 +740,7 @@ export function policySchema(): Record<string, unknown> {
                 ...integer,
                 default: cap,
                 description:
-                  "Maximum current original runs; zero blocks this model, null or omission disables its limit.",
+                  "Maximum current runs, re-evaluated included; zero blocks this model, null or omission disables its limit.",
               },
             ]),
           ),
@@ -796,7 +856,7 @@ export function assertRunRequest(
   assertRunCapacity([], configs, policy);
 }
 
-/** Only strict stale:false originals consume the current input quota. */
+/** Every strict stale:false run, original or re-evaluated, consumes the current input quota. */
 export function assertRunCapacity(
   records: unknown,
   requested: RunConfig[],
@@ -840,7 +900,7 @@ export function assertRunCapacity(
       continue;
     }
     seen.set(run.id, identity);
-    if (!tagged) counts.set(model, (counts.get(model) ?? 0) + 1);
+    counts.set(model, (counts.get(model) ?? 0) + 1);
   }
   for (const [model, count] of requests) {
     const limit = runLimit(model, policy),
@@ -855,7 +915,9 @@ export function assertRunCapacity(
 }
 
 const contestEndpoints = new Set([
+  "categoryContest:contestCategoryAlignment",
   "fairnessContest:contestVerifyFairness",
+  "fpReview:contestFpCheck",
   "solutionQualityContest:contestSolutionQuality",
   "systemComments:contestDescriptionQuality",
   "taskQualityContest:contestTaskQualityAsMars",
@@ -1156,20 +1218,19 @@ async function quoteCost(
   let identities: Array<{ operation: string; checkKey?: string }>;
   if (isRun) {
     const runs = await resolveRunPrices(client);
-    const solvers =
-      name === "runAgentRuns:triggerAgentRun"
-        ? [
-            Object.hasOwn(quickSolvers, args.agentRunKey)
-              ? quickSolvers[args.agentRunKey]
-              : undefined,
-          ]
-        : Array.isArray(args.configs) && args.configs.length > 0
-          ? args.configs.map((item: any) =>
-              typeof item?.taskAgentType === "string"
-                ? (parseAgentTypeInput(item.taskAgentType) ?? item.taskAgentType)
-                : undefined,
-            )
-          : [undefined];
+    let solvers: Array<string | undefined>;
+    if (name === "runAgentRuns:triggerAgentRun") {
+      const quickSolver = Object.hasOwn(quickSolvers, args.agentRunKey)
+        ? quickSolvers[args.agentRunKey]
+        : undefined;
+      solvers = [quickSolver];
+    } else if (Array.isArray(args.configs) && args.configs.length > 0) {
+      solvers = args.configs.map((item: any) =>
+        typeof item?.taskAgentType === "string"
+          ? (parseAgentTypeInput(item.taskAgentType) ?? item.taskAgentType)
+          : undefined,
+      );
+    } else solvers = [undefined];
     prices = solvers.map((solver) =>
       solver && Object.hasOwn(runs, solver) ? runs[solver].tokens : undefined,
     );
@@ -1183,21 +1244,15 @@ async function quoteCost(
     };
     if (Object.hasOwn(special, name)) {
       const cost = special[name as keyof typeof special].tokens;
-      const operation =
-        name === "scopeGate:triggerScopeGate"
-          ? "scope:scopeGate"
-          : name === "dockerImage:buildVersionImage"
-            ? "builds:build"
-            : "checks:bundledPrechecks";
+      let operation = "checks:bundledPrechecks";
+      if (name === "scopeGate:triggerScopeGate") operation = "scope:scopeGate";
+      else if (name === "dockerImage:buildVersionImage") operation = "builds:build";
       return cost === null ? undefined : { cost, parts: [{ operation, amount: cost }] };
     }
     const keys = checkKeysForEndpoint(name, args);
     if (keys.length === 0) return undefined;
     prices = keys.map((key) => {
-      const backendKey = toBackendCheckKey(key);
-      return Object.hasOwn(catalog.checks, backendKey)
-        ? catalog.checks[backendKey].tokens
-        : undefined;
+      return Object.hasOwn(catalog.checks, key) ? catalog.checks[key].tokens : undefined;
     });
     identities = keys.map((key) => ({
       operation: `checks:${toPublicCheckKey(key)}`,
@@ -1260,11 +1315,9 @@ function estimateTokenDrip(
   now = Date.now(),
   tier?: Record<string, any>,
 ): DripEstimate {
-  const rate = amount(snapshot.tierDripAmount)
-    ? snapshot.tierDripAmount
-    : tier?.name === snapshot.tierName && amount(tier?.dripAmount)
-      ? tier.dripAmount
-      : null;
+  let rate: number | null = null;
+  if (amount(snapshot.tierDripAmount)) rate = snapshot.tierDripAmount;
+  else if (tier?.name === snapshot.tierName && amount(tier?.dripAmount)) rate = tier.dripAmount;
   const cap = amount(snapshot.cap) ? snapshot.cap : null;
   const next =
     typeof snapshot.nextDripAt === "number"
@@ -1426,6 +1479,28 @@ export function assertChallengeBudget(state: BudgetFeedback): void {
     );
 }
 
+function allowBatchMemberWhenOnlyOrderingDiffers(decision: PolicyDecision): PolicyDecision {
+  const onlyBatchOrderingDiffers =
+    (decision.status === "blocked" || decision.status === "confirmation_required")
+    && decision.unmetRequirements.length > 0
+    && decision.unmetRequirements.every(
+      (requirement) =>
+        requirement.profile === "graph"
+        && requirement.path === "action"
+        && requirement.reason === "action_not_recommended",
+    );
+  if (!onlyBatchOrderingDiffers) return decision;
+  return {
+    ...decision,
+    status: "allowed",
+    recommendedAction: decision.action,
+    recommendedCommand: null,
+    recommendationError: undefined,
+    confirmation: undefined,
+    unmetRequirements: [],
+  };
+}
+
 /** One policy decision from declared rules, graph and canonical facts. */
 export function evaluatePolicy(
   input: Omit<
@@ -1434,16 +1509,11 @@ export function evaluatePolicy(
   > & { policy: Policy },
 ): PolicyDecision {
   const { policy, state, action, args } = input;
-  const keys =
-    action === "checks.run_all"
-      ? Array.isArray(args.checkKeys)
-        ? args.checkKeys.map(String).map(toPublicCheckKey)
-        : []
-      : action.startsWith("checks.")
-        ? [action.slice("checks.".length)]
-        : action === "auto_review.orchestrate"
-          ? ["autoReview"]
-          : [];
+  let keys: string[] = [];
+  if (action === "checks.run_all") {
+    if (Array.isArray(args.checkKeys)) keys = args.checkKeys.map(String).map(toPublicCheckKey);
+  } else if (action.startsWith("checks.")) keys = [action.slice("checks.".length)];
+  else if (action === "auto_review.orchestrate") keys = ["autoReview"];
   let failure: PolicyError | undefined;
   try {
     assertTokenPolicy(args, policy);
@@ -1491,6 +1561,39 @@ export function evaluatePolicy(
         "auto_review.allow_force_refresh",
         "Forced fresh Auto Review is disabled by policy",
       );
+    if (action === "rollouts.run") {
+      const reEvaluationAvailable =
+        state.reEvaluation !== null
+        && typeof state.reEvaluation === "object"
+        && !Array.isArray(state.reEvaluation)
+        && (state.reEvaluation as { eligible?: unknown }).eligible === true;
+      if (policy.runs.re_evaluation.block_new_runs_when_available === true && reEvaluationAvailable)
+        throw new PolicyError(
+          "runs.re_evaluation.block_new_runs_when_available",
+          `New rollout runs are blocked while re-evaluation is available. Run: olympus runs re-evaluate run ${state.challengeId} --json`,
+          { eligible: true },
+        );
+      const seenAt = state.reEvaluationOfferSeenAt;
+      if (
+        policy.runs.re_evaluation.block_new_runs_when_available === true
+        && typeof seenAt === "number"
+        && !reEvaluatedSince(state.runs, seenAt)
+      )
+        throw new PolicyError(
+          "runs.re_evaluation.block_new_runs_when_available",
+          "New rollout runs stay blocked: this version had a re-evaluation offer and no re-evaluation of it has completed with verdicts. An offer lost to failed attempts does not unlock fresh runs.",
+          { eligible: false, offerSeenAt: new Date(seenAt).toISOString() },
+        );
+    }
+    if (action === "rollouts.run" || action === "re_evaluation.run") {
+      const cooldown = infrastructureCooldown(state.runs);
+      if (cooldown)
+        throw new PolicyError(
+          "runs.infrastructure_cooldown",
+          `The latest batch (${cooldown.batchTag}) failed entirely on infrastructure. New batches are blocked until ${cooldown.until} (${INFRA_COOLDOWN_MS / 60000} minutes after it finished) unless the platform recovers sooner; wait instead of retrying.`,
+          cooldown,
+        );
+    }
     if (action === "rollouts.run" && Array.isArray(args.configs))
       assertRunCapacity(state.runs, args.configs, policy);
   } catch (error) {
@@ -1500,12 +1603,14 @@ export function evaluatePolicy(
   const batchDecisions =
     action === "checks.run_all"
       ? keys.map((key) =>
-          evaluatePolicy({
-            ...input,
-            action: `checks.${key}` as PolicyAction,
-            preview: true,
-            confirmation: undefined,
-          }),
+          allowBatchMemberWhenOnlyOrderingDiffers(
+            evaluatePolicy({
+              ...input,
+              action: `checks.${key}` as PolicyAction,
+              preview: true,
+              confirmation: undefined,
+            }),
+          ),
         )
       : [];
   const decision = evaluatePolicyGraph({
@@ -1518,16 +1623,17 @@ export function evaluatePolicy(
   });
   if (!failure) return decision;
   const details = failure.details;
-  const expected = Object.hasOwn(details, "limit")
-    ? { at_most: details.limit }
-    : details.allowed
-      ? { one_of: details.allowed }
-      : {
-          equals:
-            failure.rule === "checks.allow_rerun_passing"
-              ? "not already passed"
-              : "permitted by policy",
-        };
+  let expected: Record<string, unknown>;
+  if (Object.hasOwn(details, "limit")) expected = { at_most: details.limit };
+  else if (details.allowed) expected = { one_of: details.allowed };
+  else {
+    expected = {
+      equals:
+        failure.rule === "checks.allow_rerun_passing"
+          ? "not already passed"
+          : "permitted by policy",
+    };
+  }
   return {
     ...decision,
     status: "blocked",
@@ -1551,18 +1657,558 @@ export function evaluatePolicy(
   };
 }
 
-/** Read-only inspection. It never confirms, reserves tokens or dispatches. */
-export async function inspectPolicy(
-  client: Reader,
+export type PolicyGuidanceStatus =
+  | "ready"
+  | "blocked"
+  | "waiting"
+  | "terminal"
+  | "stuck"
+  | "confirmation_required"
+  | "needs_arguments"
+  | "complete"
+  | "unguided";
+
+export type PolicyGuidanceStep = {
+  order: number;
+  action: PolicyAction;
+  role: "expected" | "prerequisite";
+  status: PolicyDecision["status"];
+  command: string[] | null;
+  unmetRequirements: PolicyDecision["unmetRequirements"];
+  notes: PolicyDecision["notes"];
+  recommendationError?: string;
+};
+
+export type PolicyGuidanceOption = {
+  action: PolicyAction;
+  status: "ready" | "confirmation_required" | "needs_arguments";
+  command: string[] | null;
+  notes: PolicyDecision["notes"];
+  recommendationError?: string;
+};
+
+export type PolicyGuidance = {
+  status: PolicyGuidanceStatus;
+  mode: PolicyMode;
+  expectedAction: PolicyAction | null;
+  expectedActions: PolicyAction[];
+  nativeDependencies?: Array<{
+    action: PolicyAction;
+    requirement: string;
+    dependency: PolicyAction;
+  }>;
+  nextAction: PolicyAction | null;
+  nextActions: PolicyAction[];
+  nextCommand: string[] | null;
+  nextCommands: string[][];
+  proposedCommand: string[] | null;
+  proposedCommands: string[][];
+  options: PolicyGuidanceOption[];
+  refreshCommand: string[];
+  steps: PolicyGuidanceStep[];
+  notes: PolicyDecision["notes"];
+  pendingNotes: string[];
+  explanation: string;
+  stepId: string | null;
+  _authorizations?: Array<{
+    action: PolicyAction;
+    token: string;
+    expiresAt: string;
+    command: string[];
+  }>;
+
+  parallelExecution: Array<{
+    actions: [PolicyAction, PolicyAction];
+    reason: string;
+  }>;
+  orderingConstraints: Array<{
+    before: PolicyAction;
+    after: PolicyAction;
+    reason: string;
+  }>;
+  runCommand: string[] | null;
+};
+
+export type PolicyWorkflowState = {
+  status: "active" | "waiting" | "complete" | "terminal" | "revise" | "stuck" | "unguided";
+  reason: string;
+  actions: PolicyAction[];
+};
+
+function guidanceCommand(
+  policy: Policy,
+  action: PolicyAction,
   challengeId: string,
-  policy = loadPolicy(),
-  full = false,
-) {
-  const state = await readStablePolicyState(client, challengeId);
-  const recommended =
+): { command: string[] | null; error?: string } {
+  try {
+    return {
+      command: [
+        "olympus",
+        ...actionCliArguments({
+          action,
+          challengeId,
+          arguments: policy.graph?.actions[action]?.arguments ?? {},
+        }),
+      ],
+    };
+  } catch (error) {
+    return { command: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function guidanceTerminal(
+  mode: PolicyMode,
+  status: "complete" | "unguided",
+  refreshCommand: string[],
+  explanation: string,
+): PolicyGuidance {
+  return {
+    status,
+    mode,
+    expectedAction: null,
+    expectedActions: [],
+    nextAction: null,
+    nextActions: [],
+    nextCommand: null,
+    nextCommands: [],
+    proposedCommand: null,
+    proposedCommands: [],
+    options: [],
+    refreshCommand,
+    steps: [],
+    notes: [],
+    pendingNotes: [],
+    explanation,
+    stepId: null,
+
+    parallelExecution: [],
+    orderingConstraints: [],
+    runCommand: null,
+  };
+}
+
+function guidanceCheckKeys(policy: Policy, action: PolicyAction): Set<string> {
+  const keys = new Set<string>();
+  if (action.startsWith("checks.") && action !== "checks.run_all")
+    keys.add(action.slice("checks.".length));
+  if (action === "checks.run_all") {
+    const configured = policy.graph?.actions[action]?.arguments?.checks;
+    if (Array.isArray(configured))
+      for (const key of configured) if (typeof key === "string") keys.add(key);
+  }
+  if (action === "auto_review.orchestrate") keys.add("autoReview");
+  if (action === "verifier_audit.decide") keys.add("verifierIncompleteness");
+  return keys;
+}
+
+function filterGuidanceNotes(
+  policy: Policy,
+  action: PolicyAction,
+  notes: PolicyDecision["notes"],
+): PolicyDecision["notes"] {
+  const keys = guidanceCheckKeys(policy, action);
+  return notes.filter((note) => {
+    const definition = policy.graph?.notes.find((candidate) => candidate.id === note.id);
+    return !definition || definition.when.check === null || keys.has(definition.when.check);
+  });
+}
+
+function collectGuidanceSteps(
+  policy: Policy,
+  challengeId: string,
+  decisions: PolicyDecision[],
+  decision: PolicyDecision,
+): PolicyGuidanceStep[] {
+  const byAction = new Map(decisions.map((item) => [item.action, item]));
+  const steps: PolicyGuidanceStep[] = [];
+  const visited = new Set<PolicyAction>();
+  let action = decision.action;
+  while (steps.length < POLICY_ACTIONS.length) {
+    if (visited.has(action)) return steps;
+    visited.add(action);
+    const candidate = byAction.get(action);
+    if (!candidate) return steps;
+    const generated = guidanceCommand(policy, action, challengeId);
+    const recommendationError = candidate.recommendationError ?? generated.error;
+    const step: PolicyGuidanceStep = {
+      order: steps.length + 1,
+      action,
+      role: steps.length === 0 ? "expected" : "prerequisite",
+      status: candidate.status,
+      command: generated.command,
+      unmetRequirements: candidate.unmetRequirements,
+      notes: filterGuidanceNotes(policy, action, candidate.notes),
+    };
+    if (recommendationError) step.recommendationError = recommendationError;
+    steps.push(step);
+    if (candidate.status === "allowed" || candidate.status === "off") return steps;
+    const next = candidate.recommendedAction;
+    if (!next || next === action) return steps;
+    action = next;
+  }
+  return steps;
+}
+
+function guidanceStatus(step: PolicyGuidanceStep | undefined): PolicyGuidanceStatus {
+  if (!step) return "blocked";
+  if (step.status === "confirmation_required") return "confirmation_required";
+  if (step.status !== "allowed") return "blocked";
+  if (step.command === null) return "needs_arguments";
+  return "ready";
+}
+
+function guidanceExplanation(status: PolicyGuidanceStatus): string {
+  switch (status) {
+    case "ready":
+      return "Run nextCommand, then refresh.";
+    case "confirmation_required":
+      return "Confirmation required.";
+    case "needs_arguments":
+      return "Missing policy arguments.";
+    default:
+      return "Resolve blockers before continuing.";
+  }
+}
+
+function guidanceOption(step: PolicyGuidanceStep): PolicyGuidanceOption | null {
+  const status = guidanceStatus(step);
+  if (status !== "ready" && status !== "confirmation_required" && status !== "needs_arguments")
+    return null;
+  const option: PolicyGuidanceOption = {
+    action: step.action,
+    status,
+    command: step.command,
+    notes: step.notes,
+  };
+  if (step.recommendationError) option.recommendationError = step.recommendationError;
+  return option;
+}
+
+// oxlint-disable-next-line max-lines-per-function complexity
+function buildActivePolicyGuidance(
+  policy: Policy,
+  challengeId: string,
+  decisions: PolicyDecision[],
+  decision: PolicyDecision,
+  context: {
+    mode: PolicyMode;
+    refreshCommand: string[];
+    expectedActions: PolicyAction[];
+  },
+): PolicyGuidance {
+  const { mode, refreshCommand, expectedActions } = context;
+  const steps = collectGuidanceSteps(policy, challengeId, decisions, decision);
+  const nextStep =
+    steps.find((step) => step.status === "allowed" || step.status === "confirmation_required")
+    ?? steps.at(-1);
+  const optionsByAction = new Map<PolicyAction, PolicyGuidanceOption>();
+  if (nextStep) {
+    const option = guidanceOption(nextStep);
+    if (option) optionsByAction.set(option.action, option);
+  }
+  const byAction = new Map(decisions.map((item) => [item.action, item]));
+  for (const action of expectedActions) {
+    if (optionsByAction.has(action)) continue;
+    const candidate = byAction.get(action);
+    if (!candidate || !["allowed", "confirmation_required"].includes(candidate.status)) continue;
+    const generated = guidanceCommand(policy, action, challengeId);
+    const step: PolicyGuidanceStep = {
+      order: 0,
+      action,
+      role: "expected",
+      status: candidate.status,
+      command: generated.command,
+      unmetRequirements: candidate.unmetRequirements,
+      notes: filterGuidanceNotes(policy, action, candidate.notes),
+    };
+    const recommendationError = candidate.recommendationError ?? generated.error;
+    if (recommendationError) step.recommendationError = recommendationError;
+    const option = guidanceOption(step);
+    if (option) optionsByAction.set(action, option);
+  }
+  const options = [...optionsByAction.values()];
+  const nextCommands = options.flatMap((option) =>
+    option.status === "ready" && option.command ? [option.command] : [],
+  );
+  const proposedCommands = options.flatMap((option) =>
+    option.status === "confirmation_required" && option.command ? [option.command] : [],
+  );
+  let status: PolicyGuidanceStatus;
+  if (nextCommands.length > 0) status = "ready";
+  else if (proposedCommands.length > 0) status = "confirmation_required";
+  else if (options.some((option) => option.status === "needs_arguments"))
+    status = "needs_arguments";
+  else status = guidanceStatus(nextStep);
+  const selectedOption = options.find((option) => option.status === status) ?? options[0];
+  const explanation =
+    status === "ready" && nextCommands.length > 1
+      ? "Start all nextCommands in parallel, then refresh once after they complete."
+      : guidanceExplanation(status);
+  const parallelExecution = options.flatMap((left, index) =>
+    options.slice(index + 1).map((right) => ({
+      actions: [left.action, right.action] as [PolicyAction, PolicyAction],
+      reason: "The CLI determined that these actions do not interfere with each other.",
+    })),
+  );
+  const orderingConstraints = Object.entries(policy.graph?.actions ?? {}).flatMap(
+    ([before, node]) =>
+      (node?.next ?? []).flatMap((transition) => {
+        if (!transition.action) return [];
+        return policy.graph
+          && !policyActionsIndependent(policy.graph, before as PolicyAction, transition.action)
+          ? [
+              {
+                before: before as PolicyAction,
+                after: transition.action,
+                reason:
+                  "The later action depends on state that may be changed by the earlier action.",
+              },
+            ]
+          : [];
+      }),
+  );
+  return {
+    status,
+    mode,
+    expectedAction: decision.action,
+    expectedActions,
+    nextAction: selectedOption?.action ?? nextStep?.action ?? null,
+    nextActions: options.map((option) => option.action),
+    nextCommand: nextCommands[0] ?? null,
+    nextCommands,
+    proposedCommand: proposedCommands[0] ?? null,
+    proposedCommands,
+    options,
+    refreshCommand,
+    steps,
+    notes: [],
+    pendingNotes: [],
+    explanation,
+    stepId: null,
+
+    parallelExecution,
+    orderingConstraints,
+    runCommand: null,
+  };
+}
+
+function buildPolicyGuidance(
+  policy: Policy,
+  challengeId: string,
+  decisions: PolicyDecision[],
+  decision: PolicyDecision | null,
+  expectedActions: PolicyAction[],
+): PolicyGuidance {
+  const graph = policy.graph;
+  const refreshCommand = ["olympus", "policy", "guide", challengeId, "--json"];
+  const mode = graph?.mode ?? "off";
+  if (!graph || graph.mode === "off")
+    return guidanceTerminal(
+      mode,
+      "unguided",
+      refreshCommand,
+      "No active action graph is configured. Do not infer an execution order from omitted policy edges.",
+    );
+  if (!decision)
+    return guidanceTerminal(
+      mode,
+      "complete",
+      refreshCommand,
+      "The active graph has no state-selected next action. Re-read platform readiness before submitting or stopping.",
+    );
+  return buildActivePolicyGuidance(policy, challengeId, decisions, decision, {
+    mode,
+    refreshCommand,
+    expectedActions,
+  });
+}
+
+export type PolicyAuthorizationStep = {
+  actions: PolicyAction[];
+  commands: string[][];
+  fingerprint: string;
+  stepId: string;
+  options: Array<PolicyGuidanceOption & { command: string[] }>;
+};
+
+export function policyAuthorizationStep(
+  state: PolicyState,
+  guidance: Pick<PolicyGuidance, "status" | "nextCommands" | "options">,
+): PolicyAuthorizationStep | null {
+  if (guidance.status !== "ready" || guidance.nextCommands.length === 0) return null;
+  const options = guidance.options.filter(
+    (option): option is PolicyGuidanceOption & { command: string[] } =>
+      option.status === "ready" && option.command !== null,
+  );
+  if (options.length === 0) return null;
+  const actions = options.map((option) => option.action);
+  const commands = options.map((option) => option.command);
+  const fingerprint = policyFingerprint(state);
+  const stepId = policyStepId({
+    challengeId: state.challengeId,
+    versionId: state.versionId,
+    fingerprint,
+    actions,
+    commands,
+  });
+  return { actions, commands, fingerprint, stepId, options };
+}
+
+function attachNextStepAuthorizations(
+  policy: Policy,
+  state: PolicyState,
+  guidance: PolicyGuidance,
+): PolicyGuidance {
+  const step = policyAuthorizationStep(state, guidance);
+  if (!step) return guidance;
+  const policyHash = policyFingerprint(policy);
+  const secret = localPolicySecret(credentialsDir());
+  const authorizations = step.options.map((option) => {
+    const authorization = createPolicyAuthorization({
+      challengeId: state.challengeId,
+      versionId: state.versionId,
+      action: option.action,
+      policyHash,
+      fingerprint: step.fingerprint,
+      stepId: step.stepId,
+      nextActions: step.actions,
+      command: option.command,
+      secret,
+    });
+    return {
+      action: option.action,
+      token: authorization.token,
+      expiresAt: authorization.expiresAt,
+      command: [...option.command, `--policy-authorization=${authorization.token}`],
+    };
+  });
+  const runCommand = ["olympus", "policy", "run-next", state.challengeId, "--json"];
+  const result: PolicyGuidance = {
+    ...guidance,
+    stepId: step.stepId,
+    options: guidance.options.map((option) => ({ ...option, command: null })),
+    nextCommand: runCommand,
+    nextCommands: [runCommand],
+    runCommand,
+  };
+  Object.defineProperty(result, "_authorizations", {
+    value: authorizations,
+    enumerable: false,
+    writable: false,
+  });
+  return result;
+}
+
+function classifyPolicyWorkflowState(
+  policy: Policy,
+  state: PolicyState,
+  guidance: PolicyGuidance,
+  inFlightActions: PolicyAction[],
+): PolicyWorkflowState {
+  if (!policy.graph || policy.graph.mode === "off")
+    return { status: "unguided", reason: "No active policy graph.", actions: [] };
+  const scopeGate = record(state.scopeGate) ? (state.scopeGate as Record<string, unknown>) : {};
+  if (scopeGate.latestVerdict === "fail" && scopeGate.inFlight !== true)
+    return { status: "terminal", reason: "Scope Gate latest verdict is FAIL.", actions: [] };
+  const rolloutInFlight =
+    Array.isArray(state.runs)
+    && state.runs.some((run) => {
+      const status = String(
+        record(run) ? ((run as Record<string, unknown>).status ?? "") : "",
+      ).toLowerCase();
+      return ["pending", "queued", "running", "in_progress"].includes(status);
+    });
+  if (rolloutInFlight)
+    return {
+      status: "waiting",
+      reason: "One or more rollout runs are in flight.",
+      actions: ["rollouts.run"],
+    };
+  if (inFlightActions.length > 0) {
+    // Work in flight blocks only the actions that depend on it; independent ones start now.
+    const graph = policy.graph;
+    const runnable = guidance.nextActions.filter(
+      (action) =>
+        !inFlightActions.includes(action)
+        && inFlightActions.every((running) => policyActionsIndependent(graph, running, action)),
+    );
+    if (runnable.length === 0)
+      return {
+        status: "waiting",
+        reason: "One or more graph actions are in flight.",
+        actions: inFlightActions,
+      };
+    return {
+      status: "active",
+      reason: "Other graph actions are in flight; these independent actions can start now.",
+      actions: runnable,
+    };
+  }
+  if (guidance.status !== "complete")
+    return {
+      status: "active",
+      reason: "The graph has a selected action or unresolved blocker.",
+      actions: guidance.nextActions.length > 0 ? guidance.nextActions : guidance.expectedActions,
+    };
+  // Green readiness is the finish line, even when the graph also ends on a terminal transition.
+  const readiness = record(state.readiness) ? (state.readiness as Record<string, unknown>) : {};
+  if (readiness.canSubmit === true)
+    return {
+      status: "complete",
+      reason: "No graph action remains and platform readiness passes.",
+      actions: [],
+    };
+  const terminalActions = policyTerminalActions(state, policy.graph);
+  if (terminalActions.length > 0)
+    return {
+      status: "terminal",
+      reason: "The graph matched an explicit terminal transition.",
+      actions: terminalActions,
+    };
+  const revisions = policyUnmetContinuations(state, policy.graph);
+  if (revisions.length > 0)
+    return {
+      status: "revise",
+      reason: `${revisions
+        .map(
+          ({ action, unmet }) =>
+            `${action} completed, but its result does not meet the policy: ${unmet.join("; ")}`,
+        )
+        .join(
+          ". ",
+        )}. Revise the artifacts, validate them, and upload a new version (artifacts.update is allowed); the checks then rerun on the new version.`,
+      actions: revisions.map(({ action }) => action),
+    };
+  return {
+    status: "stuck",
+    reason: "No graph action remains, but platform readiness is not complete.",
+    actions: [],
+  };
+}
+
+function applicableGuidanceNotes(
+  policy: Policy,
+  state: PolicyState,
+  actions: PolicyAction[],
+): PolicyDecision["notes"] {
+  if (!policy.graph || policy.graph.mode === "off") return [];
+  const checkKeys = new Set(actions.flatMap((action) => [...guidanceCheckKeys(policy, action)]));
+  return matchingPolicyNotes(state, policy.graph).filter((note) => {
+    const check = policy.graph?.notes.find((definition) => definition.id === note.id)?.when.check;
+    return check === null || (check !== undefined && checkKeys.has(check));
+  });
+}
+
+function policyGuidanceForState(policy: Policy, challengeId: string, state: PolicyState) {
+  const graphActions =
     policy.graph && policy.graph.mode !== "off"
-      ? policyRecommendedAction(state, policy.graph)
-      : null;
+      ? policyRecommendedActions(state, policy.graph)
+      : [];
+  const allInFlightActions =
+    policy.graph && policy.graph.mode !== "off" ? policyInFlightActions(state, policy.graph) : [];
+  const inFlightActions = graphActions.length === 0 ? allInFlightActions : [];
+  const recommendedActions = graphActions.length > 0 ? graphActions : inFlightActions;
+  const recommended = recommendedActions[0] ?? null;
   const decisions = POLICY_ACTIONS.map((action) => {
     const configured = policy.graph?.actions[action]?.arguments ?? {};
     const args: Record<string, unknown> = {
@@ -1582,14 +2228,174 @@ export async function inspectPolicy(
     });
   });
   const decision = decisions.find((item) => item.action === recommended) ?? null;
+  const rawGuidance = buildPolicyGuidance(
+    policy,
+    challengeId,
+    decisions,
+    decision,
+    recommendedActions,
+  );
+  const workflowState = classifyPolicyWorkflowState(policy, state, rawGuidance, allInFlightActions);
+  const lastStepAction = rawGuidance.steps.at(-1)?.action;
+  let noteActions = workflowState.actions;
+  if (workflowState.status === "active") {
+    if (rawGuidance.options.length > 0)
+      noteActions = rawGuidance.options.map((option) => option.action);
+    else if (lastStepAction) noteActions = [lastStepAction];
+  }
+  const notes = applicableGuidanceNotes(policy, state, noteActions);
+  const pendingNotes =
+    policy.graph && policy.graph.mode !== "off"
+      ? pendingPolicyNotes(
+          state,
+          policy.graph,
+          notes.map((note) => note.id),
+        )
+      : [];
+  const guidance: PolicyGuidance =
+    workflowState.status === "waiting"
+    || workflowState.status === "terminal"
+    || workflowState.status === "revise"
+    || workflowState.status === "stuck"
+      ? {
+          ...rawGuidance,
+          status: workflowState.status === "revise" ? "blocked" : workflowState.status,
+          explanation: workflowState.reason,
+          expectedAction: null,
+          expectedActions: [],
+          nextAction: null,
+          nextActions: [],
+          nextCommand: null,
+          nextCommands: [],
+          proposedCommand: null,
+          proposedCommands: [],
+          options: [],
+          steps: [],
+          notes,
+          pendingNotes,
+          stepId: null,
+          parallelExecution: [],
+          orderingConstraints: [],
+          runCommand: null,
+        }
+      : { ...rawGuidance, notes, pendingNotes };
+  return { decisions, decision, guidance, workflowState };
+}
+
+async function policyGuidanceWithDependencies(
+  client: Reader,
+  policy: Policy,
+  challengeId: string,
+  state: PolicyState,
+) {
+  const snapshot = policyGuidanceForState(policy, challengeId, state);
+  const argumentsFor = (action: PolicyAction) => {
+    const configured = policy.graph?.actions[action]?.arguments ?? {};
+    return {
+      ...configured,
+      ...(Array.isArray(configured.checks) ? { checkKeys: configured.checks } : {}),
+      useGeneralTokens: configured["use-general-tokens"],
+      forceFresh: configured["force-fresh"],
+    };
+  };
+  const guidance = await resolveNativeGuidance({
+    guidance: snapshot.guidance,
+    inspect: nativeGuidanceInspector(client, challengeId, state.versionId, argumentsFor),
+    decide: (action, nativePrerequisite) => {
+      const decision = evaluatePolicy({
+        policy,
+        state,
+        action,
+        args: argumentsFor(action),
+        nativePrerequisite,
+        secret: "",
+        replayDirectory: "",
+        preview: true,
+      });
+      return { ...decision, notes: filterGuidanceNotes(policy, action, decision.notes) };
+    },
+    command: (action) => guidanceCommand(policy, action, challengeId),
+    independent: (left, right) =>
+      !!policy.graph && policyActionsIndependent(policy.graph, left, right),
+  });
+  if (guidance !== snapshot.guidance) {
+    const confirmation = await readStablePolicyState(client, challengeId);
+    if (policyFingerprint(confirmation) !== policyFingerprint(state))
+      throw new PolicyError(
+        "policy.state_changed",
+        "State changed during native prerequisite resolution; refresh before dispatch.",
+      );
+  }
+  const reviewed =
+    guidance.status === "ready" && policy.graph && policy.graph.mode !== "off"
+      ? pendingPolicyNotes(state, policy.graph, [
+          ...new Set(
+            [...guidance.notes, ...guidance.options.flatMap((option) => option.notes)].map(
+              (note) => note.id,
+            ),
+          ),
+        ])
+      : guidance.pendingNotes;
+  const nextGuidance: PolicyGuidance =
+    reviewed.length > 0 && guidance.status === "ready"
+      ? {
+          ...guidance,
+          status: "blocked",
+          pendingNotes: reviewed,
+          explanation: `Read and acknowledge required notes: olympus policy notes list ${challengeId}`,
+          nextCommand: null,
+          nextCommands: [],
+          proposedCommand: null,
+          proposedCommands: [],
+          options: [],
+          stepId: null,
+          runCommand: null,
+        }
+      : { ...guidance, pendingNotes: reviewed };
+  return {
+    ...snapshot,
+    guidance: nextGuidance,
+    workflowState:
+      snapshot.workflowState.status === "active"
+        ? {
+            ...snapshot.workflowState,
+            actions:
+              guidance.nextActions.length > 0 ? guidance.nextActions : guidance.expectedActions,
+          }
+        : snapshot.workflowState,
+  };
+}
+
+/** Read-only inspection. It never confirms, reserves tokens or dispatches. */
+export async function inspectPolicy(
+  client: Reader,
+  challengeId: string,
+  policy = loadPolicy(),
+  full = false,
+) {
+  const state = await readStablePolicyState(client, challengeId);
+  const snapshot = await policyGuidanceWithDependencies(client, policy, challengeId, state);
   const readiness = record(state.readiness) ? state.readiness : {};
+  const guidance = attachNextStepAuthorizations(policy, state, snapshot.guidance);
+  const audit =
+    policy.graph && policy.graph.mode !== "off"
+      ? auditPolicyGraph(policy.graph, state)
+      : {
+          issues: [],
+          rules: [],
+          topology: { reachable: [], detached: [] },
+          confluence: { pass: true, exhaustive: false, permutations: 0, counterexample: null },
+        };
   return {
     status: "inspected",
     challengeId,
     versionId: state.versionId,
     actionCatalog: POLICY_ACTIONS,
-    decision,
-    decisions,
+    decision: snapshot.decision,
+    decisions: snapshot.decisions,
+    guidance,
+    workflowState: snapshot.workflowState,
+    audit,
     // Policy permission is not platform readiness or a paid-dispatch preflight.
     executionPreflight: "required",
     platform: { canSubmit: typeof readiness.canSubmit === "boolean" ? readiness.canSubmit : null },
@@ -1605,26 +2411,22 @@ async function authorizePolicy(
 ): Promise<void> {
   const { client, name, args, scope, policy, confirmationSecret } = input;
   const action = policyActionForEndpoint(name, args);
-  const batchActions =
-    name === "runDynamicChecks:triggerAllDynamicChecks"
-      ? checkKeysForEndpoint(name, args).map((key) => `checks.${key}` as PolicyAction)
-      : [];
-  if (
-    !action
-    || !policy.graph
-    || policy.graph.mode === "off"
-    || ![action, ...batchActions].some((candidate) => policyGovernsAction(policy.graph!, candidate))
-  )
-    return;
+
+  if (!action || !policy.graph || policy.graph.mode === "off") return;
   let state: PolicyState;
   let decision: PolicyDecision;
+  let snapshot: Awaited<ReturnType<typeof policyGuidanceWithDependencies>>;
   try {
     const challengeId = await scope.resolveChallenge(args);
     state = await readStablePolicyState(client, challengeId);
     if (args.versionId !== undefined && args.versionId !== state.versionId)
       throw new Error("Requested version is not the current policy state; refresh before dispatch");
+    snapshot = await policyGuidanceWithDependencies(client, policy, challengeId, state);
     const current = policyInvocation();
     decision = evaluatePolicy({
+      nativePrerequisite:
+        snapshot.guidance.options.some((o) => o.action === action)
+        && snapshot.guidance.nativeDependencies?.some((edge) => edge.dependency === action),
       policy,
       state,
       action,
@@ -1647,6 +2449,50 @@ async function authorizePolicy(
       decision,
       feedback,
     });
+  }
+  if (decision.status === "allowed" && decision.mode === "enforce" && policy.graph) {
+    const graphNextActions = policyRecommendedActions(state, policy.graph);
+    if (graphNextActions.includes(action) || snapshot.guidance.nextActions.includes(action)) {
+      const step = policyAuthorizationStep(state, snapshot.guidance);
+      const nextActions = step?.actions ?? [];
+      if (!step || !nextActions.includes(action))
+        throw new PolicyError(
+          "policy.authorization_required",
+          "This action is not in the current ready policy step",
+          { action, nextActions },
+        );
+      const current = policyInvocation();
+      if (!current.authorization || !current.command)
+        throw new PolicyError(
+          "policy.authorization_required",
+          "This action must be started through the current policy step",
+          { action, nextActions },
+        );
+      try {
+        consumePolicyAuthorization({
+          token: current.authorization,
+          challengeId: state.challengeId,
+          versionId: state.versionId,
+          action,
+          policyHash: policyFingerprint(policy),
+          fingerprint: step.fingerprint,
+          stepId: step.stepId,
+          command: current.command,
+          secret: localPolicySecret(credentialsDir()),
+          replayDirectory: resolve(credentialsDir(), "policy-authorizations"),
+          projected: {
+            nextActions: step.actions,
+            inFlight: policyInFlightActions(state, policy.graph),
+          },
+        });
+      } catch (error) {
+        throw new PolicyError(
+          "policy.authorization_invalid",
+          error instanceof Error ? error.message : String(error),
+          { action, stepId: step.stepId },
+        );
+      }
+    }
   }
 }
 
@@ -2058,9 +2904,9 @@ async function readHistory(client: any, problemId: string, versionId: string): P
     )
       throw unavailable("Cannot enumerate challenge versions");
     const records: any[] = [];
-    for (const id of new Set(versions.map((v) => v._id))) {
+    for (const versionKey of new Set(versions.map((v) => v._id))) {
       const rows = await client.query(api.runAgentRuns.getAgentRuns, {
-        versionId: id,
+        versionId: versionKey,
       });
       if (!Array.isArray(rows)) throw unavailable("Cannot enumerate version run history");
       records.push(...rows);

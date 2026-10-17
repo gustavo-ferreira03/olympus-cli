@@ -35,6 +35,7 @@ function policyAuthoringContract(): Record<string, unknown> {
     predicateOperators: {
       equals: "Exact scalar equality; no coercion",
       empty: "Empty string or empty array/object",
+      exists: "Whether the dotted path exists",
       greater_than: "Strict numeric comparison (>)",
       at_least: "Inclusive numeric comparison (>=)",
     },
@@ -52,6 +53,8 @@ function policyAuthoringContract(): Record<string, unknown> {
       "Read this contract and choose only catalog actions.",
       "Write YAML using the returned JSON Schema; use graph: null unless sequencing is intentional.",
       "Use policy show --json for current configuration, then policy show <challenge-id> --json for state-aware decisions.",
+      "Before a mutating action, call policy guide <challenge-id> --json; when guidance.status is ready, execute guidance.runCommand to start the complete next step and verify it by readback.",
+
       "Keep requirements in gates/actions and guidance in notes; never encode a hidden default order.",
       "Re-read the effective policy after saving; inspection is not execution permission.",
     ],
@@ -67,7 +70,7 @@ function policyAuthoringContract(): Record<string, unknown> {
       oneGate: [
         "graph:",
         "  mode: enforce",
-        "  start: checks.verifySolution",
+
         "  gates:",
         "    solution_ready:",
         "      check: solutionQuality",

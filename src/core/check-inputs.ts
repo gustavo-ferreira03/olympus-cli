@@ -9,7 +9,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { resolve } from "node:path";
-import { toPublicCheckKey } from "./expected.ts";
+import { toPublicCheckField, toPublicCheckKey } from "./expected.ts";
 import { normalizeCoverageOutput } from "./coverage.ts";
 
 export const CHECK_INPUT_ARTIFACTS = ["description", "tests", "solution", "dockerfile"] as const;
@@ -95,7 +95,7 @@ export function saveObservedInputs({
   observedAt: number;
 }): void {
   const hashes = Object.fromEntries(
-    Object.entries(before).filter(([artifact, hash]) => after[artifact] === hash),
+    Object.entries(before).filter(([artifact, beforeHash]) => after[artifact] === beforeHash),
   );
   if (Object.keys(hashes).length === 0) return;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -140,11 +140,12 @@ export function recordedCheckInputs(
 ): unknown {
   return Object.fromEntries(
     Object.entries(record(raw)).map(([check, value]) => {
+      const publicField = toPublicCheckField(check);
       const jobId = own(value, "jobId");
-      if (typeof jobId !== "string") return [check, value];
+      if (typeof jobId !== "string") return [publicField, value];
       try {
         const path = resolve(directory, inputRecordKey(scope, check));
-        if (statSync(path).size > 4096) return [check, value];
+        if (statSync(path).size > 4096) return [publicField, value];
         const saved = JSON.parse(readFileSync(path, "utf8"));
         if (
           saved.v !== 1
@@ -153,7 +154,7 @@ export function recordedCheckInputs(
           || saved.check !== toPublicCheckKey(check)
           || saved.source !== "cli_observed"
         )
-          return [check, value];
+          return [publicField, value];
         const inputs = Object.fromEntries(
           CHECK_INPUT_ARTIFACTS.flatMap((artifact) =>
             typeof saved.hashes?.[artifact] === "string"
@@ -163,11 +164,11 @@ export function recordedCheckInputs(
           ),
         );
         return [
-          check,
+          publicField,
           { ...record(value), checkInputs: inputs, checkInputsSource: "cli_observed" },
         ];
       } catch {
-        return [check, value];
+        return [publicField, value];
       }
     }),
   );
@@ -232,9 +233,9 @@ export function enrichCheckResults(
         || typeof value !== "object"
         || Array.isArray(value)
       )
-        return [key, value];
+        return [toPublicCheckField(key), value];
       return [
-        key,
+        toPublicCheckKey(key),
         {
           ...record(value),
           ...normalizeCheckInputs(key, value, currentVersion),

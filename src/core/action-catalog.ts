@@ -33,6 +33,7 @@ const actionCommands: Record<PolicyAction, string[]> = {
   "checks.taskQuality": ["checks", "run"],
   "checks.solutionQuality": ["checks", "run"],
   "checks.descriptionQuality": ["checks", "run"],
+  "checks.rolloutCoach": ["checks", "run"],
   "checks.verifierIncompleteness": ["verifier-audit", "run"],
   "checks.autoReview": ["auto-review", "run"],
   "rollouts.run": ["runs", "run"],
@@ -56,8 +57,6 @@ const actionOptions: Record<PolicyAction, Set<string>> = {
     "solution-patch",
     "solution-approach-file",
     "environment-description-file",
-    "hint-file",
-    "hint-justification-file",
     "dockerfile",
     "github-issue-url",
   ]),
@@ -85,6 +84,7 @@ const actionOptions: Record<PolicyAction, Set<string>> = {
     "timeout",
     "full",
   ]),
+  "checks.rolloutCoach": new Set(["use-general-tokens", "wait", "interval", "timeout", "full"]),
   "checks.verifierIncompleteness": new Set([
     "version",
     "use-general-tokens",
@@ -118,7 +118,7 @@ const actionOptions: Record<PolicyAction, Set<string>> = {
   "fp_check.run": new Set(["version", "use-general-tokens", "wait", "interval", "timeout", "full"]),
   "verifier_audit.decide": new Set(["version", "job", "decision", "patch-file", "comment"]),
   "auto_review.orchestrate": new Set(["version", "force-fresh"]),
-  "submission.submit": new Set(),
+  "submission.submit": new Set(["skip-human-review"]),
 };
 
 const actionDescriptions: Record<PolicyAction, string> = {
@@ -133,8 +133,9 @@ const actionDescriptions: Record<PolicyAction, string> = {
   "checks.testQuality": "Run Test Quality",
   "checks.taskQuality": "Run Task Quality",
   "checks.solutionQuality": "Run Solution Quality",
-  "checks.descriptionQuality": "Run Description Quality",
-  "checks.verifierIncompleteness": "Run Verifier Incompleteness",
+  "checks.descriptionQuality": "Run Task Prompt Quality",
+  "checks.rolloutCoach": "Run Rollout Coach",
+  "checks.verifierIncompleteness": "Run Verifier Completeness Audit",
   "checks.autoReview": "Run Auto Review",
   "rollouts.run": "Start rollout runs",
   "re_evaluation.run": "Start re-evaluation runs",

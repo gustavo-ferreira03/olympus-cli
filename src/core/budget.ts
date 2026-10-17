@@ -40,7 +40,7 @@ export function sumBudgetAmounts(values: number[]): number {
     return [BigInt(whole + fraction), Number(exponent) - fraction.length];
   };
   const parts = values.map(decimal);
-  const exponent = Math.min(0, ...parts.map(([, exponent]) => exponent));
+  const exponent = Math.min(0, ...parts.map(([, power]) => power));
   const exact = parts.reduce(
     (total, [digits, power]) => total + digits * 10n ** BigInt(power - exponent),
     0n,
@@ -171,7 +171,10 @@ function breakdown(ledger: Ledger): NonNullable<Ledger["breakdown"]> {
     ledger.breakdown ?? {
       spent: ledger.spent ? [{ amount: ledger.spent }] : [],
       reservations: Object.fromEntries(
-        Object.entries(ledger.reservations).map(([key, amount]) => [key, [{ amount }]]),
+        Object.entries(ledger.reservations).map(([key, reservationAmount]) => [
+          key,
+          [{ amount: reservationAmount }],
+        ]),
       ),
     }
   );
@@ -186,10 +189,10 @@ function breakdownFeedback(ledger: Ledger | null) {
     map: Map<string, Amounts>,
     key: string,
     state: "spent" | "reserved",
-    amount: number,
+    partAmount: number,
   ) => {
     const entry = map.get(key) ?? { spent: [], reserved: [] };
-    entry[state].push(amount);
+    entry[state].push(partAmount);
     map.set(key, entry);
   };
   const detail = ledger ? breakdown(ledger) : { spent: [], reservations: {} };

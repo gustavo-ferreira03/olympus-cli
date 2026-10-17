@@ -9,10 +9,11 @@ import {
   lstatSync,
   openSync,
   closeSync,
+  copyFileSync,
   constants,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { parseDocument } from "yaml";
 import { dirname, resolve } from "node:path";
 import {
@@ -25,13 +26,26 @@ import {
   policySchema,
 } from "../core/policy.ts";
 import { getClient } from "../platform/convex.ts";
+import { readPolicyNote, acknowledgePolicyNote } from "../core/policy-notes.ts";
 import { formatDynamicCheckLabel } from "../core/model.ts";
-import { type Predicate, type PolicyNode } from "../core/policy-graph.ts";
+import { toPublicCheckKey } from "../core/expected.ts";
+import {
+  evaluatePredicate,
+  type Predicate,
+  type PolicyAction,
+  type PolicyNode,
+} from "../core/policy-graph.ts";
 import { printJson } from "../terminal/format.ts";
+import {
+  policyFlowLines,
+  type PolicyFlowState,
+  runStructuredPolicyEditor,
+} from "../core/policy-editor.ts";
 
 type Policy = ReturnType<typeof loadPolicy>;
 type Inspection = Awaited<ReturnType<typeof inspectPolicy>>;
 type Graph = NonNullable<Policy["graph"]>;
+type Guidance = Inspection["guidance"];
 type PolicyLine = (text?: string, prefix?: string, color?: string) => void;
 
 function policyPrinter(): PolicyLine {
@@ -78,13 +92,34 @@ function humanName(value: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-function actionLabel(action: string): string {
+function configuredCheckKeys(
+  arguments_: Record<string, unknown> | undefined,
+  command: string[] | null | undefined,
+): string[] {
+  const flag = command?.find((argument) => argument.startsWith("--checks="));
+  const commandKeys = flag?.slice("--checks=".length).split(",").filter(Boolean) ?? [];
+  const argumentKeys = Array.isArray(arguments_?.checks)
+    ? arguments_.checks.filter((key): key is string => typeof key === "string")
+    : [];
+  return [...new Set(commandKeys.length > 0 ? commandKeys : argumentKeys)];
+}
+
+function actionLabel(
+  action: string,
+  arguments_?: Record<string, unknown>,
+  command?: string[] | null,
+): string {
+  if (action === "checks.run_all") {
+    const checks = configuredCheckKeys(arguments_, command);
+    return checks.length > 0
+      ? checks.map(formatDynamicCheckLabel).join(" + ")
+      : "Checks (names unavailable)";
+  }
   const labels: Record<string, string> = {
     "artifacts.update": "Update artifacts",
     "image.build": "Build image",
     "prechecks.run": "Prechecks",
     "scope_gate.run": "Scope Gate",
-    "checks.run_all": "Selected checks",
     "rollouts.run": "Rollouts",
     "re_evaluation.run": "Re-evaluation",
     "fp_check.run": "FP Check",
@@ -126,6 +161,10 @@ function renderRules(policy: Policy, line: PolicyLine): void {
         ["Cancellations", permission(policy.runs.allow_cancellations)],
         ["Contests", permission(policy.runs.allow_contests)],
         ["Re-evaluation", permission(policy.runs.re_evaluation.enabled)],
+        [
+          "Block new runs when available",
+          permission(policy.runs.re_evaluation.block_new_runs_when_available),
+        ],
         ["Re-evaluation attempts", localLimit(policy.runs.re_evaluation.max_attempts)],
       ],
     ],
@@ -172,11 +211,13 @@ function predicateLabel(predicate: Predicate): string {
     return `${predicate.path} = ${humanValue(predicate.equals)}`;
   if (Object.hasOwn(predicate, "empty"))
     return `${predicate.path} ${predicate.empty ? "is empty" : "is not empty"}`;
+  if (Object.hasOwn(predicate, "exists"))
+    return `${predicate.path} ${predicate.exists ? "exists" : "does not exist"}`;
   if (Object.hasOwn(predicate, "at_least")) return `${predicate.path} ≥ ${predicate.at_least}`;
   return `${predicate.path} > ${predicate.greater_than}`;
 }
 
-function nodeLines(node: PolicyNode, full: boolean): string[] {
+function nodeLines(node: PolicyNode, graph: Graph, full: boolean): string[] {
   const rows: string[] = [];
   if (node.requires.length > 0) rows.push(`Requires: ${node.requires.map(humanName).join(" + ")}`);
   if (node.requires_when?.length)
@@ -185,13 +226,18 @@ function nodeLines(node: PolicyNode, full: boolean): string[] {
     rows.push(
       `Except when: ${node.unless.map((group) => `(${group.map(predicateLabel).join(" AND ")})`).join(" OR ")}`,
     );
-  if (node.on_unmet) rows.push(`If unmet → ${actionLabel(node.on_unmet)}`);
+  if (node.on_unmet)
+    rows.push(`If unmet → ${actionLabel(node.on_unmet, graph.actions[node.on_unmet]?.arguments)}`);
   for (const transition of node.next) {
-    const target = transition.action === null ? "End" : actionLabel(transition.action);
+    const target =
+      transition.action === null
+        ? "End"
+        : actionLabel(transition.action, graph.actions[transition.action]?.arguments);
     rows.push(
       `Then → ${target} when ${transition.all.map(predicateLabel).join(" AND ") || "always"}`,
     );
   }
+
   if (full && node.arguments && Object.keys(node.arguments).length > 0)
     rows.push(`Arguments: ${humanValue(node.arguments)}`);
   return rows;
@@ -213,27 +259,21 @@ function renderGraph(graph: Graph | null, line: PolicyLine, full: boolean): void
     );
   if (graph.mode === "off")
     line("The configuration below is inactive; it imposes no graph restrictions.");
-  line(
-    graph.start
-      ? `Start → ${actionLabel(graph.start)}`
-      : "No start configured: requirements only, no inferred sequence.",
-  );
+
   if (graph.repair_first?.length)
     line(
       `Repair priority for stale FAIL/error: ${graph.repair_first.map(formatDynamicCheckLabel).join(", ")}`,
     );
-  line(
-    "Branches are configured actions, not an execution order. Requires lists named gates.",
-    "  ",
-    "90",
-  );
+  if (graph.rules?.length) line(`Rules: ${graph.rules.join(", ")}`);
+  line("Eligible paths are inferred from transition conditions and requirements.", "  ", "90");
   nodes.forEach(([action, node], index) => {
     const last = index === nodes.length - 1;
     let mode = modes[graph.mode].toLowerCase();
     if (graph.mode !== "off" && node.enforce) mode = "enforced";
-    const title = full ? `${actionLabel(action)} (${action})` : actionLabel(action);
+    const label = actionLabel(action, node.arguments);
+    const title = full ? `${label} (${action})` : label;
     line(`${title} [${mode}]`, last ? "  └─ " : "  ├─ ", "1");
-    for (const row of nodeLines(node, full)) line(row, last ? "     " : "  │  ");
+    for (const row of nodeLines(node, graph, full)) line(row, last ? "     " : "  │  ");
   });
   if (full) renderGraphDetails(graph, line);
   else
@@ -270,10 +310,19 @@ function renderGraphDetails(graph: Graph, line: PolicyLine): void {
 
 function renderBlockers(
   decision: Inspection["decisions"][number],
+  policy: Policy,
   line: PolicyLine,
   full: boolean,
 ): void {
-  line(actionLabel(decision.action), "    · ", "1");
+  line(
+    actionLabel(
+      decision.action,
+      policy.graph?.actions[decision.action]?.arguments,
+      decision.recommendedCommand,
+    ),
+    "    · ",
+    "1",
+  );
   if (decision.rule === "checks.allow_rerun_passing" && !full) {
     line("Already PASS and current; reruns are disabled by policy.", "      ");
     if (decision.unmetRequirements.length > 1)
@@ -298,14 +347,26 @@ function renderBlockers(
       );
   }
   if (decision.recommendedAction)
-    line(`Suggested → ${actionLabel(decision.recommendedAction)}`, "      ");
+    line(
+      `Suggested → ${actionLabel(
+        decision.recommendedAction,
+        policy.graph?.actions[decision.recommendedAction]?.arguments,
+        decision.recommendedCommand,
+      )}`,
+      "      ",
+    );
   if (decision.recommendationError)
     line(`Arguments needed: ${decision.recommendationError}`, "      ");
 }
 
-function renderCommand(arguments_: string[], line: PolicyLine): void {
+function renderCommand(
+  arguments_: string[],
+  line: PolicyLine,
+  label = "Command (copy as one line):",
+  prefix = "",
+): void {
   if (arguments_.some((argument) => /[\p{Cc}\p{Cf}]/u.test(argument))) {
-    line("Command contains control characters; use --json for the exact arguments.");
+    line("Command contains control characters; use --json for the exact arguments.", prefix);
     return;
   }
   const command = arguments_
@@ -315,11 +376,16 @@ function renderCommand(arguments_: string[], line: PolicyLine): void {
       return `'${quoted}'`;
     })
     .join(" ");
-  line("Command (copy as one line):");
-  console.log(`    ${command}`);
+  line(label, prefix);
+  console.log(`${prefix}    ${command}`);
 }
 
-function renderInspection(inspection: Inspection, line: PolicyLine, full: boolean): void {
+function renderInspection(
+  inspection: Inspection,
+  policy: Policy,
+  line: PolicyLine,
+  full: boolean,
+): void {
   line(`Challenge ${inspection.challengeId}`);
   line(`Version   ${inspection.versionId}`);
   line();
@@ -335,14 +401,28 @@ function renderInspection(inspection: Inspection, line: PolicyLine, full: boolea
     if (decisions.length === 0) continue;
     line(`${label} (${decisions.length})`, "  ", color);
     if (status === "blocked" || status === "confirmation_required") {
-      for (const decision of decisions) renderBlockers(decision, line, full);
-    } else line(decisions.map((item) => actionLabel(item.action)).join(", "), "    ");
+      for (const decision of decisions) renderBlockers(decision, policy, line, full);
+    } else
+      line(
+        decisions
+          .map((item) => actionLabel(item.action, policy.graph?.actions[item.action]?.arguments))
+          .join(", "),
+        "    ",
+      );
   }
   line();
   const next = inspection.decision?.recommendedCommand;
   if (next?.length) {
     if (inspection.decision?.recommendedAction)
-      line(`Suggested action: ${actionLabel(inspection.decision.recommendedAction)}`, "  ", "1");
+      line(
+        `Suggested action: ${actionLabel(
+          inspection.decision.recommendedAction,
+          policy.graph?.actions[inspection.decision.recommendedAction]?.arguments,
+          next,
+        )}`,
+        "  ",
+        "1",
+      );
     renderCommand(next, line);
   } else line("No executable next command is configured; no action is inferred.");
   if (inspection.decision?.recommendationError)
@@ -362,6 +442,294 @@ function renderInspection(inspection: Inspection, line: PolicyLine, full: boolea
   );
 }
 
+function guidanceStatusLabel(status: Guidance["status"]): string {
+  const labels: Record<Guidance["status"], string> = {
+    ready: "READY",
+    blocked: "BLOCKED",
+    waiting: "WAITING",
+    terminal: "TERMINAL",
+    stuck: "STUCK",
+    confirmation_required: "CONFIRMATION REQUIRED",
+    needs_arguments: "ARGUMENTS REQUIRED",
+    complete: "NO ACTIVE NEXT ACTION",
+    unguided: "NO ACTIVE GRAPH",
+  };
+  return labels[status];
+}
+
+function guidanceStatusColor(status: Guidance["status"]): string {
+  if (status === "ready") return "1;32";
+  if (status === "blocked" || status === "terminal" || status === "stuck") return "1;31";
+  return "1;33";
+}
+
+function renderGuidanceStep(
+  step: Guidance["steps"][number],
+  policy: Policy,
+  line: PolicyLine,
+): void {
+  const role = step.role === "expected" ? "expected" : "prerequisite";
+  const label = actionLabel(
+    step.action,
+    policy.graph?.actions[step.action]?.arguments,
+    step.command,
+  );
+  line(`${step.order}. ${label} · ${role} · ${step.status}`, "  ");
+  if (step.recommendationError) line(`Arguments: ${step.recommendationError}`, "    ");
+}
+
+function renderGuidanceBlockers(steps: Guidance["steps"], line: PolicyLine, full: boolean): void {
+  const blockers = [
+    ...new Map(
+      steps
+        .flatMap((step) => step.unmetRequirements)
+        .map((failure) => [
+          JSON.stringify([failure.profile, failure.path, failure.expected, failure.actual]),
+          failure,
+        ]),
+    ).values(),
+  ];
+  if (blockers.length === 0) return;
+  line("BLOCKERS", "", "1;36");
+  const shown = full ? blockers : blockers.slice(0, 3);
+  for (const failure of shown)
+    line(
+      `${humanName(failure.profile)} / ${failure.path || "action"}: expected ${humanValue(failure.expected)}, actual ${humanValue(failure.actual)}`,
+      "  ",
+    );
+  if (blockers.length > shown.length)
+    line(`${blockers.length - shown.length} more; use --full.`, "  ");
+}
+
+function checkMeetsAcceptanceGate(
+  check: Record<string, unknown>,
+  key: string,
+  policy: Policy,
+): boolean {
+  const gate = Object.values(policy.graph?.gates ?? {}).find(
+    (candidate) =>
+      typeof candidate?.check === "string"
+      && toPublicCheckKey(candidate.check) === toPublicCheckKey(key),
+  );
+  if (!gate) return true;
+  return gate.all.every((predicate) => {
+    const result = evaluatePredicate(check, predicate);
+    if (result.pass) return true;
+    return (
+      result.reason === "missing_field"
+      && predicate.equals === false
+      && /^checkInputs\.(description|tests|solution|dockerfile)\.changedSinceCheck$/.test(
+        predicate.path,
+      )
+    );
+  });
+}
+
+function challengeFlowState(inspection: Inspection, policy: Policy): PolicyFlowState {
+  const state = inspection.state as any;
+  const details: Record<string, string> = {};
+  const statuses: NonNullable<PolicyFlowState["statuses"]> = {};
+  const activeActions: string[] = [];
+  const checks = state?.checks && typeof state.checks === "object" ? state.checks : {};
+  const configuredActions = policy.graph?.actions ?? {};
+  const checkActions: Record<string, string> = {};
+  for (const [action, node] of Object.entries(configuredActions)) {
+    if (action === "checks.run_all") {
+      const selected = Array.isArray(node?.arguments?.checks) ? node.arguments.checks : [];
+      if (selected.length === 1) checkActions[action] = String(selected[0]);
+    } else if (action.startsWith("checks.")) checkActions[action] = action.slice("checks.".length);
+  }
+  for (const [action, key] of Object.entries(checkActions)) {
+    const check = checks[key];
+    if (!check || typeof check !== "object") {
+      statuses[action] = "pending";
+      continue;
+    }
+    const checkStatus = String(check.status).toLowerCase();
+    const verdict = String(check.output?.verdict ?? "").toUpperCase();
+    const accepted = checkMeetsAcceptanceGate(check, key, policy);
+    if (check.stale === true) statuses[action] = "stale";
+    else if (["pending", "queued", "running", "in_progress"].includes(checkStatus))
+      statuses[action] = "running";
+    else if (verdict === "PASS" || checkStatus === "pass")
+      statuses[action] = accepted ? "pass" : "fail";
+    else if (verdict === "FAIL" || ["fail", "failed", "error"].includes(checkStatus))
+      statuses[action] = "fail";
+    else statuses[action] = "pending";
+    if (
+      ["pending", "queued", "running", "in_progress"].includes(String(check.status).toLowerCase())
+    )
+      activeActions.push(action);
+  }
+
+  const criteria = Array.isArray(state?.readiness?.criteria) ? state.readiness.criteria : [];
+  const prechecks = criteria.find((criterion: any) => criterion?.id === "prechecks");
+  const latestPrechecks = new Map<string, any>();
+  if (prechecks) {
+    const parts: string[] = [];
+    if (prechecks.detail) parts.push(String(prechecks.detail));
+    const latest = latestPrechecks;
+    for (const stage of Array.isArray(state?.prechecks) ? state.prechecks : []) {
+      const key = String(stage?.stageId ?? stage?.id ?? "");
+      const timestamp = stage?.completedAt ?? stage?.createdAt ?? stage?._creationTime ?? 0;
+      const previous = latest.get(key);
+      const previousTimestamp =
+        previous?.completedAt ?? previous?.createdAt ?? previous?._creationTime ?? -1;
+      if (key && timestamp >= previousTimestamp) latest.set(key, stage);
+    }
+    const failed = [...latest.values()]
+      .filter((stage) => ["fail", "failed", "error"].includes(String(stage?.status).toLowerCase()))
+      .map((stage) => String(stage.stageName ?? stage.name ?? stage.stageId));
+    if (failed.length > 0) parts.push(`${failed.join(", ")} failed`);
+    if (parts.length > 0) details["prechecks.run"] = parts.join(" · ");
+    const precheckStatus = String(prechecks.status).toLowerCase();
+    if (prechecks.stale === true) statuses["prechecks.run"] = "stale";
+    else if (precheckStatus === "pass") statuses["prechecks.run"] = "pass";
+    else if (["fail", "failed", "error"].includes(precheckStatus))
+      statuses["prechecks.run"] = "fail";
+    else if (["pending", "queued", "running", "in_progress"].includes(precheckStatus))
+      statuses["prechecks.run"] = "running";
+    else statuses["prechecks.run"] = "pending";
+  }
+  if (
+    [...latestPrechecks.values()].some((stage: any) =>
+      ["pending", "queued", "running", "in_progress"].includes(String(stage?.status).toLowerCase()),
+    )
+  )
+    activeActions.push("prechecks.run");
+
+  const scopeGate = state?.scopeGate;
+  if (scopeGate) {
+    if (scopeGate.inFlight === true) {
+      statuses["scope_gate.run"] = "running";
+      activeActions.push("scope_gate.run");
+    } else if (scopeGate.latestVerdict) {
+      if (scopeGate.fresh)
+        statuses["scope_gate.run"] =
+          String(scopeGate.latestVerdict).toLowerCase() === "pass" ? "pass" : "fail";
+      else statuses["scope_gate.run"] = "stale";
+    } else {
+      statuses["scope_gate.run"] = "pending";
+    }
+  }
+
+  const runs = (Array.isArray(state?.runs) ? state.runs : []).filter(
+    (run: any) => run?.stale !== true,
+  );
+  if (runs.length === 0) {
+    statuses["rollouts.run"] = "pending";
+  } else {
+    const running = runs.filter((run: any) =>
+      ["pending", "queued", "running", "in_progress"].includes(String(run?.status).toLowerCase()),
+    ).length;
+    details["rollouts.run"] =
+      running > 0 ? `${running} running · ${runs.length} total` : `${runs.length} total`;
+    statuses["rollouts.run"] = running > 0 ? "running" : "pass";
+    if (running > 0) activeActions.push("rollouts.run");
+  }
+
+  return {
+    currentActions: inspection.guidance.nextActions,
+    activeActions: [...new Set(activeActions)],
+    status: inspection.guidance.status,
+    details,
+    statuses,
+  };
+}
+
+function renderGuidance(
+  inspection: Inspection,
+  policy: Policy,
+  line: PolicyLine,
+  full: boolean,
+): void {
+  const guidance = inspection.guidance;
+  line(`Challenge ${inspection.challengeId}`);
+  line(`Version   ${inspection.versionId}`);
+  line(
+    `Status: ${guidanceStatusLabel(guidance.status)} · ${guidance.mode}`,
+    "",
+    guidanceStatusColor(guidance.status),
+  );
+  line(
+    `Workflow state: ${inspection.workflowState.status.toUpperCase()} · ${inspection.workflowState.reason}`,
+    "  ",
+    "90",
+  );
+  if (guidance.expectedAction && guidance.expectedAction !== guidance.nextAction)
+    line(
+      `Target: ${actionLabel(
+        guidance.expectedAction,
+        policy.graph?.actions[guidance.expectedAction]?.arguments,
+        guidance.steps.find((step) => step.action === guidance.expectedAction)?.command,
+      )}`,
+      "  ",
+      "90",
+    );
+  if (guidance.options.length > 1) {
+    line("Next step:", "  ", "1");
+    line("These actions can start together:", "    ", "90");
+    guidance.options.forEach((option, index) => {
+      let status = "arguments required";
+      if (option.status === "ready") status = "ready";
+      else if (option.status === "confirmation_required") status = "confirmation required";
+      line(
+        `${index + 1}. ${actionLabel(
+          option.action,
+          policy.graph?.actions[option.action]?.arguments,
+          option.command,
+        )} · ${status}`,
+        "    ",
+        "1",
+      );
+      if (option.recommendationError) {
+        line(`Arguments: ${option.recommendationError}`, "      ");
+      }
+    });
+  } else {
+    if (guidance.nextAction) {
+      const label = guidance.status === "ready" ? "Next step" : "Blocked at";
+      line(
+        `${label}: ${actionLabel(
+          guidance.nextAction,
+          policy.graph?.actions[guidance.nextAction]?.arguments,
+          guidance.nextCommand ?? guidance.proposedCommand,
+        )}`,
+        "  ",
+        "1",
+      );
+    }
+    if (!guidance.nextCommand && guidance.proposedCommand)
+      renderCommand(guidance.proposedCommand, line, "Proposed:");
+  }
+  if (guidance.nextCommand) renderCommand(guidance.nextCommand, line, "Run:");
+  const showPath =
+    guidance.steps.length > 1
+    || guidance.steps.some((step) => step.unmetRequirements.length > 0 || step.recommendationError);
+  if (showPath) {
+    line("PATH", "", "1;36");
+    for (const step of guidance.steps) renderGuidanceStep(step, policy, line);
+    renderGuidanceBlockers(guidance.steps, line, full);
+  }
+  if (policy.graph && policy.graph.mode !== "off") {
+    line("FLOW", "", "1;36");
+    const flowColors = Boolean(
+      process.stdout.isTTY && !("NO_COLOR" in process.env) && process.env.TERM !== "dumb",
+    );
+    for (const row of policyFlowLines(policy, flowColors, challengeFlowState(inspection, policy)))
+      console.log(row);
+  }
+  if (guidance.notes.length > 0) {
+    line("NOTES", "", "1;36");
+    line(
+      `${guidance.notes.length} applicable; ${guidance.pendingNotes.length} awaiting acknowledgment.`,
+      "  ",
+    );
+    line(`Read separately: olympus policy notes list ${inspection.challengeId}`, "  ");
+  }
+  renderCommand(guidance.refreshCommand, line, "Refresh:");
+}
+
 function renderPolicyView(
   result: { path: string; source: string; policy: Policy },
   inspection: Inspection | undefined,
@@ -371,7 +739,7 @@ function renderPolicyView(
   line("OLYMPUS POLICY", "", "1;36");
   line(result.path, "  ", "90");
   if (result.source === "missing") line("No policy file. Local policy is inactive.");
-  if (inspection) renderInspection(inspection, line, full);
+  if (inspection) renderInspection(inspection, result.policy, line, full);
   if (!inspection || full) {
     line();
     renderRules(result.policy, line);
@@ -386,6 +754,129 @@ function renderPolicyView(
     );
   else line("Inspect current decisions: olympus policy show <challenge-id>", "  ", "90");
 }
+
+const notesAcknowledge = defineCommand({
+  meta: {
+    name: "policy notes acknowledge",
+    description: "Acknowledge a separately read current note",
+  },
+  args: {
+    id: { type: "positional", description: "Challenge ID", required: true },
+    note: { type: "string", description: "Note ID", required: true },
+    token: { type: "string", description: "Token returned by policy notes list", required: true },
+    json: { type: "boolean", description: "Output as JSON" },
+  },
+  run: async ({ args }) => {
+    const policy = loadPolicy();
+    const inspection = await inspectPolicy(await getClient(), args.id, policy, true);
+    if (
+      !policy.graph
+      || !inspection.state
+      || !inspection.guidance.notes.some((n) => n.id === args.note)
+    )
+      throw new Error(`Note ${args.note} is not visible in the current policy guidance`);
+    const result = acknowledgePolicyNote(inspection.state, policy.graph, args.note, args.token);
+    if (args.json) return printJson(result);
+    console.log(`Acknowledged ${result.id}; refresh policy guidance.`);
+  },
+});
+
+const notesList = defineCommand({
+  meta: {
+    name: "policy notes list",
+    description: "Show applicable notes and acknowledgment status",
+  },
+  args: {
+    id: { type: "positional", description: "Challenge ID", required: true },
+    json: { type: "boolean", description: "Output as JSON" },
+  },
+  run: async ({ args }) => {
+    const policy = loadPolicy();
+    const inspection = await inspectPolicy(await getClient(), args.id, policy, true);
+    const graph = policy.graph;
+    const state = inspection.state;
+    if (!graph || !state) throw new Error("No current policy state");
+    const result = inspection.guidance.notes.map((note) => {
+      const pending = inspection.guidance.pendingNotes.includes(note.id);
+      return pending
+        ? readPolicyNote(state, graph, note.id)
+        : {
+            id: note.id,
+            severity: note.severity,
+            message: note.message,
+            requiresAck: false,
+            token: null,
+          };
+    });
+    if (args.json) return printJson({ challengeId: args.id, notes: result });
+    if (result.length === 0) return console.log("No applicable notes.");
+    for (const note of result) {
+      console.log(`${note.id} [${note.severity}]\n${note.message}`);
+      if (note.requiresAck)
+        console.log(
+          `Acknowledge: olympus policy notes acknowledge ${args.id} --note=${note.id} --token=${note.token}`,
+        );
+      console.log();
+    }
+  },
+});
+
+const notes = defineCommand({
+  meta: { name: "policy notes", description: "Review and acknowledge policy notes" },
+  subCommands: { list: notesList, acknowledge: notesAcknowledge },
+});
+
+const guide = defineCommand({
+  meta: {
+    name: "guide",
+    alias: "next",
+    description: "Show the state-aware action guidance and prerequisites",
+  },
+  args: {
+    id: {
+      type: "positional",
+      description: "Challenge ID",
+      required: true,
+    },
+    full: {
+      type: "boolean",
+      description: "Include all evaluated action decisions",
+    },
+    json: { type: "boolean", description: "Output compact JSON" },
+  },
+  run: async ({ args }) => {
+    const policy = loadPolicy();
+    const includeState = Boolean(args.full || !args.json);
+    const inspection = await inspectPolicy(await getClient(), args.id, policy, includeState);
+    const result: Record<string, unknown> = {
+      status: "guided",
+      challengeId: inspection.challengeId,
+      versionId: inspection.versionId,
+      guidance: {
+        ...inspection.guidance,
+        notes: inspection.guidance.notes.map((note) => ({
+          id: note.id,
+          severity: note.severity,
+          requiresAcknowledgment: inspection.guidance.pendingNotes.includes(note.id),
+        })),
+        steps: inspection.guidance.steps.map(({ notes: _notes, ...step }) => step),
+        options: inspection.guidance.options.map(({ notes: _notes, ...option }) => option),
+      },
+      workflowState: inspection.workflowState,
+      audit: inspection.audit,
+      platform: inspection.platform,
+      executionPreflight: inspection.executionPreflight,
+    };
+    if (args.full) {
+      result.decisions = inspection.decisions;
+      if (inspection.state !== undefined) result.state = inspection.state;
+    }
+    if (args.json) return printJson(result);
+    const line = policyPrinter();
+    line("OLYMPUS POLICY GUIDE", "", "1;36");
+    renderGuidance(inspection, policy, line, args.full ?? false);
+  },
+});
 
 const show = defineCommand({
   meta: {
@@ -450,8 +941,24 @@ const init = defineCommand({
   },
 });
 
+function editorAvailable(editor: string): boolean {
+  const command = editor.trim().split(/\s+/, 1)[0];
+  if (!command) return false;
+  return (
+    spawnSync("/bin/sh", ["-c", 'command -v -- "$1" >/dev/null 2>&1', "editor-check", command])
+      .status === 0
+  );
+}
+
+function resolvePolicyEditor(explicit?: string): string {
+  const configured = explicit?.trim() || process.env.VISUAL?.trim() || process.env.EDITOR?.trim();
+  if (configured) return configured;
+  for (const candidate of ["micro", "nano", "vi"]) if (editorAvailable(candidate)) return candidate;
+  throw new Error("No text editor found; install micro/nano or pass --editor=<command>");
+}
+
 const edit = defineCommand({
-  meta: { name: "policy edit", description: "Edit policy in your editor" },
+  meta: { name: "edit", description: "Edit policy in a structured terminal interface" },
   args: {
     key: {
       type: "positional",
@@ -467,20 +974,23 @@ const edit = defineCommand({
       type: "boolean",
       description: "Output JSON; requires key and value (no interactive editor)",
     },
+    raw: {
+      type: "boolean",
+      description: "Open the complete YAML in a text editor instead of the structured editor",
+    },
+    editor: {
+      type: "string",
+      description: "Text editor command for --raw or the TUI raw-editor shortcut",
+    },
   },
-  run: ({ args }) => {
+  run: async ({ args }) => {
     const direct = args.key !== undefined;
     if (direct !== (args.value !== undefined))
       throw new Error("Provide both a policy key and a YAML value, or neither to open the editor");
     if (direct && !args.value!.trim())
       throw new Error("Provide an explicit YAML value; use null to disable an optional rule");
     if (!direct && args.json) throw new Error("JSON mode requires a policy key and a YAML value");
-    const editor =
-      process.env.VISUAL?.trim()
-      || process.env.EDITOR?.trim()
-      || (process.stdin.isTTY ? "vi" : undefined);
-    if (!direct && !editor)
-      throw new Error("Set VISUAL or EDITOR, or use policy edit <key> <value>");
+    const editor = direct ? undefined : resolvePolicyEditor(args.editor);
     const path = policyPath();
     const directory = dirname(path);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -542,12 +1052,22 @@ const edit = defineCommand({
           `${JSON.stringify(policySchema(), null, 2)}\n`,
           { mode: 0o600 },
         );
-        const result = spawnSync("/bin/sh", ["-c", `${editor} "$1"`, "policy-editor", draft], {
-          stdio: "inherit",
-        });
-        if (result.error || result.status !== 0)
-          throw new Error("Editor failed or was interrupted; policy unchanged");
-        text = readFileSync(draft, "utf8");
+        if (args.raw) {
+          const result = spawnSync("/bin/sh", ["-c", `${editor!} "$1"`, "policy-editor", draft], {
+            stdio: "inherit",
+          });
+          if (result.error || result.status !== 0)
+            throw new Error("Editor failed or was interrupted; policy unchanged");
+          text = readFileSync(draft, "utf8");
+        } else {
+          const outcome = await runStructuredPolicyEditor(text, { editor: editor!, path });
+          if (outcome.status === "discard") {
+            console.log(`Discarded changes to ${path}`);
+            return;
+          }
+          if (outcome.status === "save") text = outcome.text;
+          writeFileSync(draft, text, { mode: 0o600 });
+        }
       }
       const policy = parsePolicy(text);
       const current = existsSync(path) ? readFileSync(path, "utf8") : undefined;
@@ -559,7 +1079,10 @@ const edit = defineCommand({
         { mode: 0o600 },
       );
       const changed = text !== original;
-      if (changed) renameSync(draft, path);
+      if (changed) {
+        if (original !== undefined) copyFileSync(path, `${path}.bak`);
+        renameSync(draft, path);
+      }
       const result = { status: changed ? "updated" : "unchanged", path, policy };
       if (args.json) return printJson(result);
       console.log(`${changed ? "Updated" : "Validated"} ${path}`);
@@ -573,7 +1096,174 @@ const edit = defineCommand({
   },
 });
 
+function runNextCommand(command: string[]): Promise<{ exitCode: number; output: string }> {
+  return new Promise((_resolve) => {
+    const child = spawn(process.execPath, [process.argv[1], ...command.slice(1)], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    const append = (chunk: Buffer) => {
+      if (output.length < 8192) output += chunk.toString("utf8").slice(0, 8192 - output.length);
+    };
+    child.stdout.on("data", append);
+    child.stderr.on("data", append);
+    child.on("error", (error) => _resolve({ exitCode: 1, output: error.message }));
+    child.on("close", (code) => _resolve({ exitCode: code ?? 1, output }));
+  });
+}
+
+function remotePolicyActionStatus(
+  inspection: Inspection | null,
+  action: PolicyAction,
+): "in_flight" | "ready" | "not_current" | "unknown" {
+  if (!inspection) return "unknown";
+  if (inspection.workflowState.actions.includes(action)) return "in_flight";
+  if (inspection.guidance.nextActions.includes(action)) return "ready";
+  return "not_current";
+}
+
+const runNext = defineCommand({
+  meta: {
+    name: "policy run-next",
+    description: "Start every action in the current policy step",
+  },
+  args: {
+    id: { type: "positional", description: "Challenge ID", required: true },
+    "dry-run": {
+      type: "boolean",
+      description: "Validate and print the next step without starting it",
+    },
+    json: { type: "boolean", description: "Output as JSON" },
+  },
+  run: async ({ args }) => {
+    const client = await getClient();
+    const policy = loadPolicy();
+    const before = await inspectPolicy(client, args.id, policy, true);
+    const guidance = before.guidance;
+    const authorizations = guidance._authorizations ?? [];
+    if (guidance.status !== "ready") {
+      const waiting = {
+        status: before.workflowState.status,
+        challengeId: before.challengeId,
+        versionId: before.versionId,
+        guidanceStatus: guidance.status,
+        nextActions: guidance.nextActions,
+        pendingNotes: guidance.pendingNotes,
+        explanation: guidance.explanation,
+      };
+      if (args.json) return printJson(waiting);
+      console.log(
+        `Remote workflow: ${waiting.status} (${waiting.guidanceStatus}); no action started.`,
+      );
+      return;
+    }
+    if (!guidance.stepId || authorizations.length === 0)
+      throw new Error(`No runnable next step: ${guidance.status}`);
+
+    if (args["dry-run"]) {
+      const plan = {
+        status: "ready",
+        stepId: guidance.stepId,
+        challengeId: before.challengeId,
+        versionId: before.versionId,
+        actions: authorizations.map((item) => item.action),
+      };
+      if (args.json) return printJson(plan);
+      console.log(`Next step ${plan.stepId}: ${plan.actions.join(", ")}`);
+      return;
+    }
+
+    const results = await Promise.all(
+      authorizations.map(async (item) => ({
+        item,
+        result: await runNextCommand(item.command),
+        retried: false,
+      })),
+    );
+    const inspectAfter = async () => {
+      let inspection: Inspection | null = null;
+      let error: string | undefined;
+      for (let attempt = 0; attempt < 2 && !inspection; attempt += 1) {
+        try {
+          inspection = await inspectPolicy(client, args.id, policy, true);
+        } catch (caught) {
+          error = caught instanceof Error ? caught.message : String(caught);
+        }
+      }
+      return { inspection, error };
+    };
+    let { inspection: after, error: postflightError } = await inspectAfter();
+    // Sibling actions of one step dispatch concurrently, so one can observe the other's state change
+    // before dispatching. That refusal happens before any charge: retry it once, sequentially, unless
+    // the action is already running.
+    const transient = /state changed|changed while it was being read/i;
+    const retry = results.filter(
+      ({ item, result }) =>
+        result.exitCode !== 0
+        && transient.test(result.output)
+        && remotePolicyActionStatus(after, item.action) !== "in_flight",
+    );
+    for (const entry of retry) {
+      entry.result = await runNextCommand(entry.item.command);
+      entry.retried = true;
+    }
+    if (retry.length > 0) ({ inspection: after, error: postflightError } = await inspectAfter());
+    // A command can exit nonzero after its job was created (for example a postflight read or a
+    // balance check racing a sibling). The remote state decides whether the action started.
+    const started = (item: (typeof results)[number]) =>
+      item.result.exitCode === 0
+      || remotePolicyActionStatus(after, item.item.action) === "in_flight";
+    const failed = results.some((entry) => !started(entry));
+    const report = {
+      status: after?.workflowState.status ?? "unknown",
+      stepId: guidance.stepId,
+      challengeId: before.challengeId,
+      versionId: before.versionId,
+      started: results.filter(started).map(({ item }) => item.action),
+      notStarted: results.filter((entry) => !started(entry)).map(({ item }) => item.action),
+      actions: results.map((entry) => ({
+        action: entry.item.action,
+        started: started(entry),
+        remoteStatus: remotePolicyActionStatus(after, entry.item.action),
+        commandExitCode: entry.result.exitCode,
+        ...(entry.retried ? { retried: true } : {}),
+        ...(entry.result.exitCode !== 0 && entry.result.output
+          ? { [started(entry) ? "warning" : "error"]: entry.result.output }
+          : {}),
+      })),
+      remoteGuidance: {
+        status: after?.guidance.status ?? "unknown",
+        stepId: after?.guidance.stepId ?? null,
+        nextActions: after?.guidance.nextActions ?? [],
+        ...(postflightError ? { error: postflightError } : {}),
+      },
+    };
+    if (args.json) {
+      printJson(report);
+      if (failed) process.exitCode = 1;
+      return;
+    }
+
+    for (const entry of results) {
+      const remoteStatus = remotePolicyActionStatus(after, entry.item.action);
+      console.log(
+        `${entry.item.action}: ${started(entry) ? "started" : "not started"}; remote ${remoteStatus}; command exit ${entry.result.exitCode}${entry.retried ? " (retried)" : ""}`,
+      );
+      if (entry.result.exitCode !== 0 && entry.result.output)
+        console.error(entry.result.output.trim());
+    }
+    console.log(
+      `Remote workflow: ${after?.workflowState.status ?? "unknown"}; next: ${after?.guidance.nextActions.join(", ") || "none"}`,
+    );
+    if (!after && postflightError)
+      console.error(`Remote state could not be verified: ${postflightError}`);
+    if (failed) process.exitCode = 1;
+  },
+});
+
 export default defineCommand({
   meta: { name: "policy", description: "Configure policy rules and optional action graph" },
-  subCommands: { show, init, edit },
+  subCommands: { guide, show, init, edit, notes, "run-next": runNext },
 });
