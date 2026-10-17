@@ -917,7 +917,8 @@ function imageRow(source: SourceReader): Row {
   const image = source("image");
   const build = source("build");
   const buildStatus = String(build?.status ?? "").toLowerCase();
-  let status = image?.hasImage ? "pass" : "not_run";
+  // A ready image reads DONE; only an active or failed build needs attention.
+  let status = image?.hasImage ? "completed" : "not_run";
   if (buildStatus === "pending" || buildStatus === "running") status = buildStatus;
   else if (buildStatus === "failed" || image?.lastBuildFailedForCurrentInputs) status = "failed";
   const building = status === "pending" || status === "running";
