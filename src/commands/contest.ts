@@ -167,7 +167,6 @@ export default defineCommand({
   subCommands: {
     view,
     "task-prompt": description,
-    // Kept for scripts written before the check was renamed from Description Quality.
     description,
     "test-quality": testQuality,
     solution,

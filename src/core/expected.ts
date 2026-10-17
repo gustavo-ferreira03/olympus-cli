@@ -19,10 +19,6 @@ export const GATING_CHECK_KEYS = [
 /** Triggerable checks that belong to later/optional workflow stages. */
 export const NON_GATING_CHECK_KEYS = ["autoReview", "verifierIncompleteness"] as const;
 
-/**
- * Optional checks `checks run` triggers directly; they never gate submission and are
- * left out of run-all. The web triggers rolloutCoach via triggerDynamicCheck.
- */
 export const OPTIONAL_CHECK_KEYS = ["rolloutCoach"] as const;
 
 /** Keys `checks run` and `checks run-all --checks` may send. */

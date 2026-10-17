@@ -18,7 +18,6 @@ import {
   type SourceQuery,
 } from "./data.ts";
 
-/** The subset of `ConvexClient` the live dashboard uses. */
 export type SubscriptionClient = {
   onUpdate(
     query: any,
@@ -31,9 +30,7 @@ export type SubscriptionClient = {
 };
 
 export type LiveOptions = {
-  /** Re-sync a balance the backend flags with needsRefresh (a mutation). */
   refreshBalance: () => Promise<void>;
-  /** The local token budget is a file, not a query; it is re-read on each tick. */
   readBudget: (id: string) => Promise<unknown>;
 };
 
@@ -41,11 +38,6 @@ const BALANCE_REFRESH_INTERVAL_MS = 60_000;
 const errorMessage = (error: unknown) =>
   clean(error instanceof Error ? error.message : error).slice(0, 300);
 
-/**
- * Keeps the dashboard's data current the way the web app does: Convex query
- * subscriptions over one WebSocket, which deliver a result again only when it
- * changes. Only the view on screen is subscribed, so leaving a view releases its data.
- */
 export class LiveDashboard {
   private subscriptions: Array<() => void> = [];
   private sourceSubscriptions: Array<() => void> = [];
@@ -64,7 +56,6 @@ export class LiveDashboard {
     private onChange: () => void,
   ) {}
 
-  /** True while the WebSocket is connected; updates resume after a reconnect. */
   connected(): boolean {
     try {
       return this.client.connectionState().isWebSocketConnected;
@@ -102,7 +93,6 @@ export class LiveDashboard {
       );
   }
 
-  /** Current overview; the same object until an update arrives. */
   overview(filters: DashboardOverviewFilters): OverviewSnapshot | undefined {
     if (!Array.isArray(this.overviewRaw.problems)) return undefined;
     this.cachedOverview ??= buildOverview(this.overviewRaw, filters);
@@ -138,14 +128,12 @@ export class LiveDashboard {
     void this.tick();
   }
 
-  /** Current challenge snapshot; the same object until something changes. */
   snapshot(): Snapshot | undefined {
     if (this.view?.mode !== "challenge" || !this.head) return undefined;
     this.cached ??= buildSnapshot(this.view.id, this.head, { ...this.sources });
     return this.cached;
   }
 
-  /** Re-read local state that has no subscription. */
   async tick(): Promise<void> {
     if (this.view?.mode !== "challenge") return;
     const { id } = this.view;
@@ -158,7 +146,6 @@ export class LiveDashboard {
     }
   }
 
-  /** Drop and re-create the current view's subscriptions. */
   resubscribe(): void {
     const view = this.view;
     this.reset(undefined);
@@ -179,7 +166,6 @@ export class LiveDashboard {
 
   private subscribeSources(id: string, versionId: string | null): void {
     for (const unsubscribe of this.sourceSubscriptions.splice(0)) unsubscribe();
-    // Results of the previous version must not be shown against the new one.
     const budget = this.sources.budget;
     this.sources = budget ? { budget } : {};
     for (const query of challengeQueries(id, versionId)) this.subscribeSource(id, versionId, query);
@@ -200,7 +186,6 @@ export class LiveDashboard {
       },
       (error) => {
         if (name === "prechecks" && versionId) {
-          // stages.getByVersion is gone from the web app; read what it reads instead.
           unsubscribe();
           unsubscribe = this.client.onUpdate(
             PRECHECK_FALLBACK.reference,
@@ -222,7 +207,6 @@ export class LiveDashboard {
     if (balance?.needsRefresh !== true) return;
     if (Date.now() - this.lastBalanceRefresh < BALANCE_REFRESH_INTERVAL_MS) return;
     this.lastBalanceRefresh = Date.now();
-    // The refreshed balance arrives through the same subscription; a failed refresh retries later.
     void (async () => {
       try {
         await this.options.refreshBalance();

@@ -7,8 +7,6 @@ const iso = (ms: number | null | undefined) =>
 
 const EXACT_FIELDS = ["currentElo", "seatCutElo", "acceptedNow", "isMember"] as const;
 
-// The web reads the precise ELO from the getMyPrestigeOutlookExact action and only those fields
-// from it; the query stays the source for everything else and the fallback when the action fails.
 async function readOutlook(client: any, exact: boolean) {
   const outlook: any = await client.query(api.tierRotation.getMyPrestigeOutlook, {});
   if (!exact) return { outlook, exact: null };

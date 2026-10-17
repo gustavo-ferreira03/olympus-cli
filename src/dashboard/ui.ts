@@ -111,7 +111,6 @@ export function dashboardBadge(row: Row, width: number, now: number): string {
   return result + reset;
 }
 
-/** Shorter tile labels; the full name stays in the details pane. */
 const SHORT_LABELS: Array<[string, string]> = [
   ["Verify ", ""],
   ["Task Prompt Quality", "Task prompt"],
@@ -198,7 +197,6 @@ function renderTile({
   return cell(` ${marker} ${label}`, tileWidth, colors.card);
 }
 
-/** Status label and color for a challenge, using the platform's status names. */
 function statusStyle(status: string): { label: string; color: string } {
   const value = status.toLowerCase();
   const label = STATUS_LABELS[value] ?? (value.replaceAll("_", " ") || "unknown");
@@ -255,7 +253,6 @@ function meter(ratio: number, width: number): string {
 const join = (parts: Array<string | null | false | undefined>) =>
   parts.filter((part): part is string => Boolean(part)).join(" · ");
 
-/** The platform's Tokens summary: balance, drip, approval rate and the next tier. */
 function tokenLines(snapshot: OverviewSnapshot, now: number): string[] {
   const tokens = snapshot.tokens;
   if (tokens.error) return [`${colors.red} Tokens unavailable: ${tokens.error}${reset}`];
@@ -309,7 +306,6 @@ function tokenLines(snapshot: OverviewSnapshot, now: number): string[] {
   return lines;
 }
 
-/** Ledger reasons as the platform's "Token History" names them. */
 const TOKEN_REASON_LABELS: Record<string, string> = {
   initial_grant: "Initial grant",
   precheck_spent: "Ran checks",
@@ -341,7 +337,6 @@ function timelineBars(values: number[], maximum: number, slotWidth: number): str
     .join("");
 }
 
-/** The platform's Elo card: current and projected Elo, rotation, distance to Prestige and boosts. */
 function renderEloDetails(elo: OverviewSnapshot["elo"], now: number): string[] {
   if (!elo.available) return [elo.note];
   const toPrestige =
@@ -512,7 +507,6 @@ function renderAcceptedTimeline(
       : []),
   ];
 }
-/** Accepted-marker colors per submission lane, as on the platform. */
 function laneColor(lane: string): string {
   if (lane === "mars") return colors.red;
   if (lane === "diamond") return colors.purple;
@@ -540,11 +534,6 @@ function alignedTimelineAxis(plotWidth: number): string {
   return chars.join("");
 }
 
-/**
- * Everything on the home above "My Challenges": Tokens (with the accepted timeline and
- * Token History), Prestige (with the token usage chart) and Changes Requested.
- * Level 2 draws the full charts, 1 one-line summaries, 0 only the figures.
- */
 function homeSummary(snapshot: OverviewSnapshot, width: number, now: number, level: 0 | 1 | 2) {
   const lines: string[] = [];
   const wide = level === 2 && width >= 100;
@@ -576,7 +565,6 @@ function homeSummary(snapshot: OverviewSnapshot, width: number, now: number, lev
     }
   }
 
-  // Token History needs the most room; it shows only with the full charts.
   const history = snapshot.tokens.history;
   if (history.length > 0 && level === 2) {
     section("TOKEN HISTORY", colors.amber);
@@ -607,7 +595,6 @@ function homeSummary(snapshot: OverviewSnapshot, width: number, now: number, lev
       else {
         const hours = Math.max(1, Math.round((snapshot.elo.usage.binMs ?? 21_600_000) / 3_600_000));
         const suffix = ` · ${hours}h bins`;
-        // The most recent bins that fit, so "now" stays at the right edge.
         const bins = snapshot.elo.usage.bins.slice(-Math.max(1, width - 16 - suffix.length));
         push(
           `${colors.dim} Token usage ${colors.amber}${timelineBars(bins, Math.max(0, ...bins), 1)}${colors.dim}${suffix}${reset}`,
@@ -621,7 +608,6 @@ function homeSummary(snapshot: OverviewSnapshot, width: number, now: number, lev
     section(`CHANGES REQUESTED · ${requests.length} pending`, colors.amber);
     const shown = level === 0 ? 1 : 3;
     for (const request of requests.slice(0, shown)) {
-      // The feedback gives way first, so the title and when it was reviewed stay visible.
       const title = fit(
         request.title,
         Math.min(request.title.length, Math.floor(width * 0.4)),
@@ -640,7 +626,6 @@ function homeSummary(snapshot: OverviewSnapshot, width: number, now: number, lev
   return lines;
 }
 
-/** Tab labels for terminals too narrow for the platform's full names. */
 const SHORT_TAB_LABELS: Record<string, string> = {
   pending_review: "Pending",
   revision_requested: "Revision",
@@ -669,8 +654,6 @@ function renderOverviewBody(
   const connection = state.connected === false ? "reconnecting…" : "live";
   add(` HOME · updated ${relativeTime(snapshot.fetchedAt, now)} · ${connection}`, colors.dim);
 
-  // The challenge list keeps room for at least five rows; the summary above it gets
-  // less detailed until it fits.
   const listReserve = 10;
   let summary = homeSummary(snapshot, width, now, 0);
   for (const level of [2, 1] as const) {
@@ -714,7 +697,6 @@ function renderOverviewBody(
     add(" ←→ status  r reload  q quit", colors.accent);
     return lines;
   }
-  // Narrow terminals drop the Language column before the title gets too short.
   const statusWidth = 18,
     createdWidth = 7,
     difficultyWidth = 10,

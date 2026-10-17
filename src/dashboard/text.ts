@@ -19,7 +19,6 @@ export const cellWidth = (char: string): number => {
     ? 2
     : 1;
 };
-// Printable ASCII needs neither sanitising nor grapheme segmentation: one char, one cell.
 const PLAIN_ASCII = /^[\x20-\x7e]*$/;
 
 export function fit(value: unknown, width: number): string {
@@ -54,10 +53,6 @@ export function wrap(value: unknown, width: number): string[] {
   lines.push(line);
   return lines;
 }
-/**
- * Like {@link fit}, for text that already carries SGR color sequences: the
- * sequences are kept and only visible cells count toward the width.
- */
 export function fitAnsi(value: string, width: number): string {
   let result = "",
     cells = 0;

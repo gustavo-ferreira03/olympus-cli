@@ -130,7 +130,6 @@ export function installPolicyGuards(
     }
     problem ??= references.get(args.runId) ?? references.get(args.jobId);
     if (!problem && valid(args.jobId)) {
-      // jobs.get is no longer used by the web app; an unavailable lookup falls through to the scope error.
       const job = await client.query(anyApi.jobs.get, { id: args.jobId }).catch(() => null);
       problem = references.get(args.jobId) ?? versions.get(job?.versionId);
     }

@@ -491,7 +491,6 @@ const show = defineCommand({
     }
     let job: any = null;
     if (!args.json || args.full) {
-      // The web no longer reads jobs.get; when it is unavailable, run.output is used instead.
       if (run.jobId) job = await client.query(api.jobs.get, { id: run.jobId }).catch(() => null);
     }
     const output = job?.output ?? run.output ?? {};

@@ -289,7 +289,6 @@ const create = defineCommand({
         estimatedLOC: Number.isFinite(estimatedLOC) ? estimatedLOC : undefined,
       }).filter(([, value]) => value !== undefined),
     );
-    // The platform creates empty drafts and fills them through updateDraft.
     const result = await client.mutation(
       args.diamond ? api.problems.createDiamondDraft : api.problems.createDraft,
       {},
@@ -619,7 +618,6 @@ const download = defineCommand({
     console.log("");
   },
 });
-// The dashboard moved from the fetchAll action to the paginated fetchPage query.
 async function fetchDashboardRows(client: any, status: string | undefined): Promise<Problem[]> {
   try {
     const rows: Problem[] = [];

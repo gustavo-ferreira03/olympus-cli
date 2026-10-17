@@ -114,7 +114,6 @@ export default defineCommand({
       }
       return;
     }
-    // Like the web app, the live dashboard subscribes over one WebSocket instead of polling.
     const subscriptions = new ConvexClient(base.url, { logger: false });
     subscriptions.setAuth(async () => token);
     let listener = () => {};

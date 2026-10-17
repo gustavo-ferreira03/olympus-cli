@@ -10,7 +10,6 @@ import {
   type Snapshot,
 } from "./data.ts";
 
-/** Live data behind the dashboard; see LiveDashboard. */
 export type DashboardFeed = {
   showOverview(): void;
   showChallenge(id: string): void;
@@ -18,10 +17,8 @@ export type DashboardFeed = {
   snapshot(): Snapshot | undefined;
   error(): string | undefined;
   connected(): boolean;
-  /** Re-read local state that has no subscription (the token budget file). */
   tick(): Promise<void>;
   resubscribe(): void;
-  /** Register the callback invoked whenever subscribed data changes. */
   onChange(listener: () => void): void;
   close(): Promise<void>;
   initialId?: string;
@@ -31,14 +28,12 @@ export type ViewState = {
   mode: "overview" | "challenge";
   overview?: OverviewSnapshot;
   overviewSelected: number;
-  /** Selected "My Challenges" status tab; see OVERVIEW_TABS. */
   overviewTab?: string;
   selectedChallengeId?: string;
   snapshot?: Snapshot;
   rowCache?: { snapshot: Snapshot; rows: ReturnType<typeof dashboardRows> };
   error?: string;
   busy: boolean;
-  /** False while the live connection is down; data shown is the last received. */
   connected?: boolean;
   polls: number;
   nextAt: number;
@@ -122,7 +117,6 @@ export async function runDashboard(feed: DashboardFeed, intervalMs: number): Pro
     clearImmediate(syncRequest);
     finish();
   };
-  /** Pull the feed's current data into the view state; data arrives by subscription. */
   const sync = () => {
     syncRequest = undefined;
     if (stopped) return;
@@ -157,7 +151,6 @@ export async function runDashboard(feed: DashboardFeed, intervalMs: number): Pro
     }
     paint();
   };
-  // Subscription updates arrive in bursts; one sync per turn of the event loop is enough.
   const scheduleSync = () => {
     if (!stopped && !syncRequest) syncRequest = setImmediate(sync);
   };
@@ -270,7 +263,6 @@ export async function runDashboard(feed: DashboardFeed, intervalMs: number): Pro
     feed.onChange(scheduleSync);
     if (state.mode === "challenge") feed.showChallenge(state.selectedChallengeId!);
     else feed.showOverview();
-    // No network polling: the interval only re-reads local state and refreshes relative times.
     timer = setInterval(() => {
       state.polls++;
       state.nextAt = Date.now() + intervalMs;

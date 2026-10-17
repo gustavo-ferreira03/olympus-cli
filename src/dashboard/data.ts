@@ -82,7 +82,6 @@ export type OverviewSnapshot = {
     revisionTokenBalance: number | null;
     revisionError: string | null;
     usage: TokenUsageSnapshot;
-    /** Most recent ledger entries, as in the platform's "Token History". */
     history: Array<{ reason: string; amount: number; balance: number | null; at: number }>;
     error: string | null;
   };
@@ -108,7 +107,6 @@ export type OverviewSnapshot = {
       countsAtRotation: boolean;
       inWindow: boolean;
     }>;
-    /** Category ELO multipliers active now. */
     boosts: Array<{
       category: string;
       multiplier: number;
@@ -119,7 +117,6 @@ export type OverviewSnapshot = {
     available: boolean;
     note: string;
   };
-  /** Challenges a reviewer sent back, as on the platform home ("Changes Requested"). */
   revisionRequests: {
     items: Array<{
       id: string;
@@ -191,7 +188,6 @@ const normalizedFilter = (value: string | undefined): string | null => {
 };
 const matchesFilter = (value: string | null, expected: string | null): boolean =>
   expected === null || value?.toLowerCase() === expected;
-// Mirrors the web: a balance flagged needsRefresh is re-synced once before it is shown.
 async function readFreshBalance(client: any): Promise<any> {
   const balance = await client.query(api.contributorTokens.getBalance, {});
   if (balance?.needsRefresh !== true) return balance;
@@ -199,10 +195,8 @@ async function readFreshBalance(client: any): Promise<any> {
   return client.query(api.contributorTokens.getBalance, {});
 }
 
-/** A query the dashboard reads, shared by the one-shot reader and live subscriptions. */
 export type SourceQuery = { name: string; reference: any; args: Record<string, unknown> };
 
-/** Account-level queries behind the overview. */
 export const OVERVIEW_QUERIES: SourceQuery[] = [
   { name: "problems", reference: api.problems.listByUser, args: {} },
   { name: "balance", reference: api.contributorTokens.getBalance, args: {} },
@@ -213,15 +207,12 @@ export const OVERVIEW_QUERIES: SourceQuery[] = [
   { name: "revisionRequests", reference: api.dashboard.getRevisionRequests, args: {} },
 ];
 
-/** Raw overview inputs by query name; a failed account read is carried as `{ error }`. */
 export type OverviewRaw = Record<string, unknown>;
 
-/** Reduce a raw overview result to what the dashboard keeps. */
 export function overviewValue(name: string, value: unknown): unknown {
   return name === "problems" ? slimProblems(value) : value;
 }
 
-/** Overview as one HTTP read, for `--json`. */
 export async function readDashboardOverview(
   client: any,
   requested: DashboardOverviewFilters = {},
@@ -242,7 +233,6 @@ export async function readDashboardOverview(
   return buildOverview(raw, requested);
 }
 
-/** The fields the overview reads; the full documents carry every latest version's patches. */
 function slimProblems(problems: unknown): unknown {
   if (!Array.isArray(problems)) return problems;
   const keep = (value: any, keys: string[]) =>
@@ -694,7 +684,6 @@ function compactSource(name: string, data: any): any {
 
 type Head = Pick<Snapshot, "title" | "status" | "submissionType" | "version" | "versionId">;
 
-/** Title, status and latest version from `problems.getWithLatestVersion`. */
 export function headFromProblem(data: any): Head {
   if (!data) throw new Error("Challenge not found");
   return {
@@ -706,11 +695,6 @@ export function headFromProblem(data: any): Head {
   };
 }
 
-/**
- * Remote queries behind a challenge snapshot. Version-scoped ones are keyed by
- * versionId, so results for different versions never mix. Prechecks fall back to
- * {@link PRECHECK_FALLBACK} when `stages.getByVersion` is unavailable.
- */
 export function challengeQueries(id: string, versionId: string | null): SourceQuery[] {
   const queries: SourceQuery[] = [
     { name: "balance", reference: api.contributorTokens.getBalance, args: {} },
@@ -740,7 +724,6 @@ export function challengeQueries(id: string, versionId: string | null): SourceQu
   ];
 }
 
-/** Precheck source the web app reads, normalized to the getByVersion row shape. */
 export const PRECHECK_FALLBACK: {
   reference: any;
   args: (id: string, versionId: string) => Record<string, unknown>;
@@ -751,7 +734,6 @@ export const PRECHECK_FALLBACK: {
   transform: validationResultsToStages,
 };
 
-/** Validate and compact one source result; throws on a malformed response. */
 export function sourceFromResult(name: string, result: any): Source {
   if (result?.error && name === "budget") throw new Error(result.error);
   if (["prechecks", "runs"].includes(name) && !Array.isArray(result))
@@ -759,7 +741,6 @@ export function sourceFromResult(name: string, result: any): Source {
   return { data: compactSource(name, result), updatedAt: Date.now(), error: null };
 }
 
-/** A failed source keeps its last data so the dashboard shows it as stale, not empty. */
 export function failedSource(error: unknown, previous?: Source): Source {
   return {
     data: previous?.data ?? null,
@@ -772,7 +753,6 @@ export function buildSnapshot(id: string, head: Head, sources: Record<string, So
   return { id, ...head, fetchedAt: Date.now(), sources };
 }
 
-/** Challenge snapshot as one HTTP read, for `--json`. */
 export async function readDashboard(client: any, id: string): Promise<Snapshot> {
   const head = headFromProblem(
     await client.query(api.problems.getWithLatestVersion, { problemId: id }),
@@ -807,7 +787,6 @@ function row(key: string, label: unknown, item: any): Row {
   const verdict =
     output.verdict ?? output.evaluation?.verdict ?? item?.latestVerdict ?? item?.verdict;
   const status = clean(item?.inFlight ? "running" : (item?.status ?? item?.state ?? "not_run"));
-  // Work in flight is for the current inputs; the stale result it replaces must not hide it.
   const freshness = IN_FLIGHT_STATUS.test(status) && !item?.scratched ? "current" : fresh(item);
   return {
     key,
@@ -838,7 +817,6 @@ function row(key: string, label: unknown, item: any): Row {
 /** Reads one named source out of a snapshot. */
 type SourceReader = (name: string) => any;
 
-/** Stage names as the platform shows them. */
 const PRECHECK_STAGE_LABELS: Record<string, string> = {
   github_setup: "GitHub Repository",
   problem_and_tests: "Problem Description & Tests",
@@ -847,7 +825,6 @@ const PRECHECK_STAGE_LABELS: Record<string, string> = {
   solution_patch: "Solution Patch",
 };
 
-/** Failing sub-checks and missing fields of one stage, for its detail line. */
 function stageDetail(stage: any): string {
   const failures = (Array.isArray(stage.checks) ? stage.checks : [])
     .filter((check: any) => /fail|error/i.test(String(check?.status ?? "")))
@@ -860,10 +837,6 @@ function stageDetail(stage: any): string {
     .join(" | ");
 }
 
-/**
- * One row per precheck stage (newest record wins), in the platform's stage order;
- * the readiness criterion stands in while no stage has reported yet.
- */
 function precheckRows(source: SourceReader): Row[] {
   const latest = new Map<string, any>();
   for (const stage of Array.isArray(source("prechecks")) ? source("prechecks") : []) {
@@ -907,17 +880,14 @@ function scopeRow(source: SourceReader): Row {
     ...scope?.current,
     stale: typeof scope?.fresh === "boolean" ? !scope.fresh : undefined,
     status: scope?.inFlight ? "running" : (scope?.current?.status ?? scope?.latestVerdict),
-    // "drop" is the gate's rejection verdict.
     output: { ...scope?.current?.output, verdict: verdict === "drop" ? "FAIL" : verdict },
   });
 }
 
-/** Image/build row: an active build, a failed one, or whether a current image exists. */
 function imageRow(source: SourceReader): Row {
   const image = source("image");
   const build = source("build");
   const buildStatus = String(build?.status ?? "").toLowerCase();
-  // A ready image reads DONE; only an active or failed build needs attention.
   let status = image?.hasImage ? "completed" : "not_run";
   if (buildStatus === "pending" || buildStatus === "running") status = buildStatus;
   else if (buildStatus === "failed" || image?.lastBuildFailedForCurrentInputs) status = "failed";
@@ -937,7 +907,6 @@ function imageRow(source: SourceReader): Row {
 const join = (parts: Array<string | null | false | undefined>) =>
   parts.filter((part): part is string => Boolean(part)).join(" · ");
 
-/** Quality checks in the platform's order, then the later-stage audits. */
 const CHECK_UI_ORDER = [
   "verifyTests",
   "verifySolution",
@@ -949,14 +918,9 @@ const CHECK_UI_ORDER = [
   "verifierIncompleteness",
   "rolloutCoach",
 ];
-/** Checks shown with the later-stage audits rather than the quality checks. */
 const AUDIT_CHECK_KEYS = new Set(["check:verifierIncompleteness", "check:rolloutCoach"]);
 const BUILD_ROW_KEYS = new Set(["image", "scope"]);
 
-/**
- * Sort key for a check row, matching the section order: prechecks, build and scope,
- * quality checks, audits, review, FP check, delivery; unknown keys sort last.
- */
 function checkRank(item: Row): number {
   if (item.key.startsWith("stage:")) return -10;
   if (item.key === "image") return -9;
@@ -1073,11 +1037,6 @@ function runRows(source: SourceReader): Row[] {
   return runs;
 }
 
-/**
- * Status of a readiness requirement. There `pending` means
- * "not met yet", not in progress; like the platform, only a detail that says the work
- * is running shows it as running.
- */
 function requirementStatus(criterion: any): string {
   const status = String(criterion?.status ?? "").toLowerCase();
   if (status === "pass" || status === "fail" || status === "warn") return status;
@@ -1086,10 +1045,6 @@ function requirementStatus(criterion: any): string {
   return "not_run";
 }
 
-/**
- * A failed delivery verification, the only state worth showing: it is not a check,
- * it decides whether a submission goes through.
- */
 export function deliveryFailure(snapshot: Snapshot): string | null {
   const delivery = snapshot.sources.delivery?.data;
   const status = String(delivery?.status ?? "").toLowerCase();
@@ -1097,12 +1052,6 @@ export function deliveryFailure(snapshot: Snapshot): string | null {
   return clean(delivery.failureSummary) || `verification ${status}`;
 }
 
-/**
- * Flatten a snapshot into the three row lists the dashboard renders.
- *
- * Each section is built by its own helper above; this function only decides
- * which rows appear and in what order.
- */
 export function dashboardRows(snapshot: Snapshot): {
   checks: Row[];
   runs: Row[];
@@ -1123,7 +1072,6 @@ export function dashboardRows(snapshot: Snapshot): {
     if (prior >= 0) checks.splice(prior, 1);
     checks.push(...reviewRows(slots));
   } else {
-    // A standalone Auto Review check result belongs with the review rows.
     const prior = checks.find((item) => item.key === "check:autoReview");
     if (prior) prior.key = "review:autoReview";
   }
@@ -1177,7 +1125,6 @@ export function dashboardSections(
 
 type Rows = ReturnType<typeof dashboardRows>;
 
-/** Status lines for what changed between two snapshots; reuses already computed rows. */
 export function observedChanges(
   before: Snapshot | undefined,
   after: Snapshot,
@@ -1204,7 +1151,6 @@ export function observedChanges(
   return changes;
 }
 
-/** Challenge status names as the platform shows them. */
 export const STATUS_LABELS: Record<string, string> = {
   draft: "Draft",
   pending_solution: "Awaiting Solution",
@@ -1216,7 +1162,6 @@ export const STATUS_LABELS: Record<string, string> = {
   archived: "Archived",
 };
 
-/** The status tabs of the platform's "My Challenges" list, in its order. */
 export const OVERVIEW_TABS = [
   { id: "all", label: "All" },
   { id: "draft", label: "Draft" },
@@ -1227,7 +1172,6 @@ export const OVERVIEW_TABS = [
   { id: "rejected", label: "Rejected" },
 ] as const;
 
-/** Whether a challenge belongs to a tab; Pending Review also holds challenges awaiting a solution. */
 export function inOverviewTab(tab: string, status: string): boolean {
   const value = status.toLowerCase();
   if (tab === "all") return true;
@@ -1235,7 +1179,6 @@ export function inOverviewTab(tab: string, status: string): boolean {
   return value === tab;
 }
 
-/** The challenges listed under the selected tab. */
 export function visibleChallenges(
   overview: OverviewSnapshot | undefined,
   tab = "all",

@@ -2,9 +2,6 @@ import { anyApi } from "convex/server";
 
 const api = anyApi;
 
-// stages.getByVersion returns per-run rows; the web app now reads
-// stages.getValidationResults, a record keyed by stage id with upper-case statuses.
-// Callers keep consuming the row shape, so the record is normalized into it.
 const STATUS_ALIASES: Record<string, string> = {
   pass: "pass",
   passed: "pass",
@@ -35,7 +32,6 @@ export function validationResultsToStages(raw: unknown): any[] {
       _id: `validation:${stageId}`,
       _creationTime: 0,
       stageId,
-      // A stale stage ran against an earlier version; report it as not yet terminal here.
       status: result?.stale ? "stale" : normalizeStatus(result?.status),
       stale: Boolean(result?.stale),
       checks: Array.isArray(result?.checks) ? result.checks.map(normalizeCheck) : [],

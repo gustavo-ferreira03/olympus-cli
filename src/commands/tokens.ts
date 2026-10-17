@@ -15,8 +15,6 @@ function number(value: unknown): number | undefined {
   return undefined;
 }
 
-// The web calls refreshBalance whenever getBalance reports needsRefresh; without it the
-// tier, cap and drip can be stale.
 async function readBalance(client: any): Promise<any> {
   const balance = await client.query(api.contributorTokens.getBalance, {});
   if (balance?.needsRefresh !== true) return balance;
@@ -212,7 +210,6 @@ const usage = defineCommand({
     let transactions: any[] = await client.query(api.contributorTokens.getTransactions, {});
     if (!Array.isArray(transactions))
       throw new Error("Backend transactions response is not an array; usage is unavailable");
-    // getTransactions returns only the most recent rows; older history is not reachable.
     const dates = transactions.map(transactionDate).filter((value) => value !== undefined);
     const oldest = dates.length > 0 ? Math.min(...dates) : undefined;
     const ledger = {
@@ -282,7 +279,6 @@ const progression = defineCommand({
   },
   run: async ({ args }) => {
     const client = await getClient();
-    // Contractors and unenrolled accounts are refused with a Forbidden error; report it per section.
     const settle = async (request: Promise<unknown>) => {
       try {
         return await request;

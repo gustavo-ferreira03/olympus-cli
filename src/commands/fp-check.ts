@@ -14,9 +14,6 @@ const FP_CHECK_WAIT_DEFAULTS = {
 
 type FpReviewStatus = "running" | "idle" | "stale" | "completed" | "failed" | "error";
 
-// getFpCheckForVersion reports `state` as not_run | stale | running | passed |
-// passed_with_warnings | failed. `failed` is the review verdict (a false positive was
-// found), not a job failure; a job that crashed carries `error` instead.
 function fpReviewStatus(state: any): FpReviewStatus {
   const status = String(
     state?.state ?? state?.status ?? state?.job?.status ?? state?.jobStatus ?? "",
@@ -144,7 +141,6 @@ const view = defineCommand({
 const MAX_KEEP_PATHS = 10;
 const MAX_KEEP_PATH_LENGTH = 200;
 
-/** Mirrors the web normalization: repo-relative folders with a trailing slash. */
 export function normalizeKeepPaths(raw: string[]): string[] {
   const paths = new Set<string>();
   for (const entry of raw) {

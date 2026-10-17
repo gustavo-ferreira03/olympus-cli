@@ -169,7 +169,6 @@ const handlers: Record<string, (context: NativeRuleContext) => Promise<void>> = 
         );
       }
   },
-  // The web only offers Rollout Coach when its state allows a run.
   "checks.rolloutCoach": async ({ query, command, checkBoolean }) => {
     const state = await query("rolloutCoach", api.rolloutCoach.getRolloutCoachState);
     checkBoolean(
