@@ -153,6 +153,30 @@ Request the complete response only when necessary:
 olympus problems view <challenge-id> --json --full
 ```
 
+Inspect the existing AI dedupe analysis and repository submission counts:
+
+```bash
+olympus problems dedupe <challenge-id>
+olympus problems dedupe <challenge-id> --version=2 --json
+olympus problems dedupe <challenge-id> --full --json
+olympus problems repo-status <challenge-id> --json
+olympus problems repo-status <challenge-id> --repo=https://github.com/owner/repo
+```
+
+Both commands only read existing data. `dedupe` defaults to the latest version and
+returns the overall verdict, candidate verdicts, confidence, similarity, summaries,
+and reasons. `--full` includes each candidate's overlap, meaningful differences,
+evidence gaps, and the raw dedupe stage. `stale: true` means the analysis predates the
+current content; a missing analysis is reported as `not_run` without a verdict.
+The CLI includes all returned candidates, including those the contributor page hides.
+
+`repo-status` returns `author` (your submissions), `global` (all contributors'
+submissions), the normalized repository key, and the server's cap blocking/override
+fields. A `null` global count is unavailable, not zero. These are current counts
+used by repository caps, not a count of unique contributors. `--version` selects
+the version's repository URL; the counts remain current. `--repo` overrides that
+URL for this query without editing the challenge.
+
 ## Drafts and versions
 
 ```bash

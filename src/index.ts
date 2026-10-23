@@ -5,6 +5,7 @@ import { defineCommand, runCommand, runMain, showUsage } from "citty";
 import auth from "./commands/auth.ts";
 import checks from "./commands/checks.ts";
 import problems from "./commands/problems.ts";
+import { dedupe, repoStatus } from "./commands/problem-analysis.ts";
 import runs from "./commands/runs.ts";
 import autoReview from "./commands/auto-review.ts";
 import contest from "./commands/contest.ts";
@@ -31,6 +32,7 @@ import { createSchemaCommand } from "./commands/schema.ts";
 installDiagnosticOutput();
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
+Object.assign(problems.subCommands!, { dedupe, "repo-status": repoStatus });
 const update = defineCommand({
   meta: { name: "update", description: "Update the CLI to the latest version" },
   args: {
