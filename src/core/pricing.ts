@@ -14,6 +14,7 @@ export type OfficialPrices = {
   build: number;
   finalQaPerItem: number;
   diamond: Record<string, number>;
+  trialQa: { base: number; perExtraRun: number } | null;
 };
 const object = (v: any): v is Record<string, any> =>
   v !== null && typeof v === "object" && !Array.isArray(v);
@@ -138,6 +139,7 @@ function parseOfficialPrices(source: string): OfficialPrices {
   const one = <T>(items: T[], label: string): T =>
     items.length === 1 ? items[0] : fail(`missing or ambiguous ${label} (${items.length} matches)`);
   const objects = nodes.filter((n) => n.type === "ObjectExpression");
+  // Keys every catalog revision has carried; all properties of the object are read below.
   const base = one(
     objects.filter((n) =>
       [
@@ -145,12 +147,9 @@ function parseOfficialPrices(source: string): OfficialPrices {
         "verifyTests",
         "verifySolution",
         toBackendCheckKey("testQuality"),
-        "taskQuality",
         "solutionQuality",
         "descriptionQuality",
         "crossRunAnalysis",
-        "autoReview",
-        "verifierIncompleteness",
       ].every((k) => props(n).has(k)),
     ),
     "base check catalog",
@@ -159,6 +158,9 @@ function parseOfficialPrices(source: string): OfficialPrices {
   const checks = Object.fromEntries(
     [...props(base)].map(([propertyKey, node]) => [toPublicCheckKey(propertyKey), value(node)]),
   );
+  // Same ceiling the platform applies to overrides: larger values mean a look-alike object.
+  if (Object.values(checks).some((tokens) => tokens > 500))
+    fail("base check catalog holds a value above the platform's price ceiling");
   const containsLabel = (n: Node, label: string): boolean =>
     n?.type === "Literal"
       ? n.value === label
@@ -242,7 +244,26 @@ function parseOfficialPrices(source: string): OfficialPrices {
     );
     diamond[field] = value(one(matches, field).right);
   }
-  return { checks, scopeGate, bundledPrechecks, build, finalQaPerItem, diamond };
+  // Trial QA tariff from its spend sentence; unmatched means unknown, never zero.
+  let trialQa: OfficialPrices["trialQa"] = null;
+  try {
+    const sentence = one(
+      nodes.filter(
+        (n) =>
+          n.type === "TemplateLiteral"
+          && n.expressions.length === 5
+          && n.quasis.length === 6
+          && ["", " tokens: ", " for the first ", " rollouts + ", " \u00d7 ", " more."].every(
+            (text, index) => n.quasis[index]?.value?.cooked === text,
+          ),
+      ),
+      "Trial QA price sentence",
+    );
+    trialQa = { base: value(sentence.expressions[1]), perExtraRun: value(sentence.expressions[3]) };
+  } catch {
+    trialQa = null;
+  }
+  return { checks, scopeGate, bundledPrechecks, build, finalQaPerItem, diamond, trialQa };
 }
 
 async function readText(url: URL, limit: number): Promise<string> {
@@ -364,8 +385,11 @@ export async function resolveVersionOffer(
   };
 }
 function runPrices(config: any): Record<string, Price> {
+  const solvers = new Set(["claude_code", "codex_cli", "gemini_cli", "taiga"]);
+  if (object(config?.agentRunPricing))
+    for (const k of Object.keys(config.agentRunPricing)) solvers.add(k);
   return Object.fromEntries(
-    ["claude_code", "codex_cli", "gemini_cli", "taiga"].map((k) => [
+    [...solvers].map((k) => [
       k,
       known(
         object(config?.agentRunPricing) && Object.hasOwn(config.agentRunPricing, k)
@@ -391,12 +415,15 @@ export async function resolveCostCatalog(client: PricingReader, versionId?: stri
   if (overrides != null && !object(overrides)) return fail("invalid check override map");
   const checks: Record<string, Price> = {};
   for (const [k, base] of Object.entries(ui.checks)) {
-    const override = object(overrides) && Object.hasOwn(overrides, k) ? overrides[k] : undefined;
+    const overrideKey = [k, toBackendCheckKey(k)].find(
+      (name) => object(overrides) && Object.hasOwn(overrides, name),
+    );
+    const override = overrideKey === undefined ? undefined : overrides[overrideKey];
     // Official check override contract: invalid entries retain the live UI base.
     const accepted = amount(override) && override <= 500;
     checks[k] = known(
       accepted ? override : base,
-      accepted ? `questConfig.checkTokenCostOverrides.${k}` : "official-ui:check-base",
+      accepted ? `questConfig.checkTokenCostOverrides.${overrideKey}` : "official-ui:check-base",
       base,
     );
   }
@@ -427,10 +454,13 @@ export async function resolveCostCatalog(client: PricingReader, versionId?: stri
       bundledPrechecks: known(ui.bundledPrechecks, "official-ui:bundled-prechecks"),
       build: known(ui.build, "official-ui:build-cost-prop"),
       finalQaPerItem: known(ui.finalQaPerItem, "official-ui:final-qa-rerun-item"),
+      trialQa: known(ui.trialQa?.base, "official-ui:trial-qa-price-sentence"),
+      trialQaPerExtraRun: known(ui.trialQa?.perExtraRun, "official-ui:trial-qa-price-sentence"),
     },
     diamond,
     offers: {
       fp,
+      trialQa: fp,
       reevaluation: reeval,
     },
     formulas: {
@@ -439,6 +469,8 @@ export async function resolveCostCatalog(client: PricingReader, versionId?: stri
       finalQaRetry: "finalQaPerItem * failed/cancelled/stale-success item count",
       reevaluation: "total version offer, not a per-run tariff",
       bundledPrechecks: "one charge per bundled dispatch, not per stage",
+      trialQa:
+        "trialQa for the first minWorkingRuns rollouts + trialQaPerExtraRun per rollout beyond; offers.trialQa is the platform's own total for this version (fpReview:getFpCheckForVersion, the read behind the Trial QA panel)",
     },
     unknown: Object.fromEntries(
       [
