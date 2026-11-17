@@ -7,7 +7,7 @@ import { type CheckInputs, type CheckInputsDiagnostic } from "./check-inputs.ts"
  * scope-gate, verifier-audit) all poll the same backend endpoint and print the
  * same summaries, so the loop lives here rather than in any one command.
  */
-import { toPublicCheckKey } from "./expected.ts";
+import { isRetiredCheckKey, toPublicCheckKey } from "./expected.ts";
 import { api, asId } from "../platform/convex.ts";
 import { printJson, statusBadge, truncate } from "../terminal/format.ts";
 import {
@@ -45,6 +45,8 @@ type CheckWaitSummary = {
   checkInputsDiagnostics?: CheckInputsDiagnostic[];
   key: string;
   label: string;
+  /** True for a stored result of a check the platform no longer shows or counts. */
+  retired?: boolean;
   jobId?: string;
   status: string;
   stale: boolean;
@@ -73,6 +75,7 @@ export function summarizeCheck(check: DynamicCheckEntry): CheckWaitSummary {
       ? { checkInputsDiagnostics: check.checkInputsDiagnostics }
       : {}),
     label: formatDynamicCheckLabel(check.key),
+    ...(isRetiredCheckKey(check.key) ? { retired: true } : {}),
     jobId: check.jobId,
     status: check.status,
     stale: Boolean(check.stale),

@@ -21,6 +21,7 @@ import {
   NON_GATING_CHECK_KEYS,
   PRECHECK_STAGE_IDS,
   TRIGGERABLE_CHECK_KEYS,
+  isRetiredCheckKey,
   toBackendCheckKey,
   toPublicCheckKey,
 } from "../core/expected.ts";
@@ -87,12 +88,15 @@ function printQualityChecks(dynamicChecks: unknown): void {
   console.log("\n  Quality Checks:");
   for (const check of checks) {
     const stale = check.stale ? " \x1b[33m(stale)\x1b[0m" : "";
+    const retired = isRetiredCheckKey(check.key)
+      ? " \x1b[90m(retired: no longer on the platform's panel)\x1b[0m"
+      : "";
     const contested = check.contested ? " \x1b[33m(contested)\x1b[0m" : "";
     const verdict = formatCheckVerdict(check);
     const message = formatCheckMessage(check);
     const suffix = `${verdict ? ` [${verdict}]` : ""}${message ? `  ${truncate(message, 70)}` : ""}`;
     console.log(
-      `    ${statusBadge(check.status)}  ${formatDynamicCheckLabel(check.key)} (${check.key})${suffix}${stale}${contested}`,
+      `    ${statusBadge(check.status)}  ${formatDynamicCheckLabel(check.key)} (${check.key})${suffix}${stale}${retired}${contested}`,
     );
     if (check.contestNote) {
       console.log(`      \x1b[33mContest: ${truncate(check.contestNote, 90)}\x1b[0m`);

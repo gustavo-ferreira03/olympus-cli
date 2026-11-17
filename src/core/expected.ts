@@ -58,6 +58,13 @@ export function isRenderableCheckKey(key: string): boolean {
   );
 }
 
+/** Checks the platform no longer shows or counts; their stored result still renders. */
+export const RETIRED_CHECK_KEYS = ["taskQuality"] as const;
+
+export function isRetiredCheckKey(key: string): boolean {
+  return RETIRED_CHECK_KEYS.includes(toPublicCheckKey(key) as any);
+}
+
 export type GatingCheckKey = (typeof GATING_CHECK_KEYS)[number];
 export type NonGatingCheckKey = (typeof NON_GATING_CHECK_KEYS)[number];
 export type TriggerableCheckKey = (typeof TRIGGERABLE_CHECK_KEYS)[number];
