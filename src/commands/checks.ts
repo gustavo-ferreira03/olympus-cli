@@ -165,7 +165,7 @@ const view = defineCommand({
     }
     const client = await getClient();
     const { version } = await requireProblemVersion(client, args.id);
-    const [stages, rawDynamicChecks, readiness] = await Promise.all([
+    const [stages, rawDynamicChecks, readiness, checkOrder] = await Promise.all([
       queryPrecheckStages(client, { problemId: asId(args.id), versionId: version._id }),
       client.query(api.runDynamicChecks.getDynamicChecks, {
         versionId: version._id,
@@ -173,12 +173,21 @@ const view = defineCommand({
       client.query(api.submissionReadiness.getSubmissionReadiness, {
         problemId: asId(args.id),
       }),
+      // Step prerequisites the web check panel reads; --full only.
+      args.full
+        ? client
+            .query(api.runDynamicChecks.getCheckOrder, { versionId: version._id })
+            .catch((error: unknown) => ({
+              unavailable: error instanceof Error ? error.message : String(error),
+            }))
+        : undefined,
     ]);
     const dynamicChecks = enrichCheckResults(rawDynamicChecks, version);
     const result = {
       prechecks: stages,
       dynamicChecks,
       readiness,
+      ...(args.full ? { checkOrder } : {}),
       version: version.version,
     };
     if (args.json) {
