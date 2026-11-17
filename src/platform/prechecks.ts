@@ -46,15 +46,24 @@ export async function queryPrecheckStages(
   client: { query: (reference: any, args: any) => Promise<any> },
   { problemId, versionId }: { problemId: string; versionId: string },
 ): Promise<any[]> {
+  // getByVersion now answers [] even after a run; the web app reads getValidationResults.
+  let stages: any;
+  let legacyError: unknown;
+  let legacyFailed = false;
   try {
-    return await client.query(api.stages.getByVersion, { versionId });
-  } catch (legacyError) {
-    try {
-      return validationResultsToStages(
-        await client.query(api.stages.getValidationResults, { itemId: problemId, versionId }),
-      );
-    } catch {
-      throw legacyError;
-    }
+    stages = await client.query(api.stages.getByVersion, { versionId });
+  } catch (error) {
+    legacyFailed = true;
+    legacyError = error;
   }
+  if (Array.isArray(stages) && stages.length > 0) return stages;
+  try {
+    const validated = validationResultsToStages(
+      await client.query(api.stages.getValidationResults, { itemId: problemId, versionId }),
+    );
+    if (validated.length > 0 || legacyFailed) return validated;
+  } catch {
+    if (legacyFailed) throw legacyError;
+  }
+  return stages ?? [];
 }

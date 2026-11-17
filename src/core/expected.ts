@@ -47,8 +47,22 @@ export function toPublicCheckField(key: string): string {
   return key.startsWith(legacyPrefix) ? `_testQuality${key.slice(legacyPrefix.length)}` : key;
 }
 
+/** Checks the CLI renders but does not trigger. */
+export const READ_ONLY_CHECK_KEYS = ["rewardHacking"] as const;
+
 export function isRenderableCheckKey(key: string): boolean {
-  return TRIGGERABLE_CHECK_KEYS.includes(toPublicCheckKey(key) as any);
+  const publicKey = toPublicCheckKey(key);
+  return (
+    TRIGGERABLE_CHECK_KEYS.includes(publicKey as any)
+    || READ_ONLY_CHECK_KEYS.includes(publicKey as any)
+  );
+}
+
+/** Checks the platform no longer shows or counts; their stored result still renders. */
+export const RETIRED_CHECK_KEYS = ["taskQuality"] as const;
+
+export function isRetiredCheckKey(key: string): boolean {
+  return RETIRED_CHECK_KEYS.includes(toPublicCheckKey(key) as any);
 }
 
 export type GatingCheckKey = (typeof GATING_CHECK_KEYS)[number];

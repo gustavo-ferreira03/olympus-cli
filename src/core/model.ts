@@ -79,6 +79,7 @@ export const DYNAMIC_CHECK_ORDER = [
   "taskQuality",
   "solutionQuality",
   "descriptionQuality",
+  "rewardHacking",
   // Post-rollout / diagnostic checks
   "verifierIncompleteness",
   "autoReview",
@@ -95,6 +96,7 @@ const DYNAMIC_CHECK_LABELS: Record<string, string> = {
   verifierIncompleteness: "Verifier Completeness Audit",
   autoReview: "Auto Review",
   rolloutCoach: "Rollout Coach",
+  rewardHacking: "Reward Hacking",
 };
 /**
  * Checks whose verdict the backend can mark as contested by the author.

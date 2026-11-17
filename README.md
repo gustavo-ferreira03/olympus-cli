@@ -255,6 +255,7 @@ Check keys and the names the platform shows for them:
 | `taskQuality`            | Task Quality                |
 | `solutionQuality`        | Solution Quality            |
 | `descriptionQuality`     | Task Prompt Quality         |
+| `rewardHacking`          | Reward Hacking              |
 | `rolloutCoach`           | Rollout Coach               |
 | `autoReview`             | Auto Review                 |
 | `verifierIncompleteness` | Verifier Completeness Audit |
@@ -262,6 +263,11 @@ Check keys and the names the platform shows for them:
 Use these keys in commands and policy files. `run-all` runs the first seven; Rollout
 Coach runs on its own, and Auto Review and the Verifier Completeness Audit use the
 `auto-review` and `verifier-audit` commands.
+
+`rewardHacking` is read-only here: `checks view`, `checks show` and `checks finding`
+render its result, and `checks run` does not trigger it. Since the platform update of
+2026-11-17 the platform no longer shows or counts Task Quality; its stored result is
+still returned and is marked `retired: true`.
 
 ### Wait separately
 
