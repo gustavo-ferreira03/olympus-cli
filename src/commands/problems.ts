@@ -463,35 +463,49 @@ const view = defineCommand({
       printJson(omitEmpty(result));
       return;
     }
-    const [stages, dynamicChecks, runs, criteria, readiness, reviews] = latestVersion
-      ? await Promise.all([
-          queryPrecheckStages(client, {
-            problemId: asId(args.id),
-            versionId: latestVersion._id,
-          }).catch(() => []),
-          client
-            .query(api.runDynamicChecks.getDynamicChecks, { versionId: latestVersion._id })
-            .catch(() => null),
-          client
-            .query(api.runAgentRuns.getAgentRuns, { versionId: latestVersion._id })
-            .catch(() => null),
-          client
-            .query(api.runAgentRuns.getAgentRunCriteria, { versionId: latestVersion._id })
-            .catch(() => null),
-          client
-            .query(api.submissionReadiness.getSubmissionReadiness, {
+    // A read the platform refuses is reported as such, never as an empty history.
+    const unavailable = (error: unknown) => ({
+      unavailable: error instanceof Error ? error.message : String(error),
+    });
+    const [stages, dynamicChecks, runs, criteria, readiness, reviews, managerFeedback] =
+      latestVersion
+        ? await Promise.all([
+            queryPrecheckStages(client, {
               problemId: asId(args.id),
-            })
-            .catch(() => null),
-          client.query(api.reviews.getReviewHistory, { problemId: asId(args.id) }).catch(() => []),
-        ])
-      : [[], null, null, null, null, []];
+              versionId: latestVersion._id,
+            }).catch(() => []),
+            client
+              .query(api.runDynamicChecks.getDynamicChecks, { versionId: latestVersion._id })
+              .catch(() => null),
+            client
+              .query(api.runAgentRuns.getAgentRuns, { versionId: latestVersion._id })
+              .catch(() => null),
+            client
+              .query(api.runAgentRuns.getAgentRunCriteria, { versionId: latestVersion._id })
+              .catch(() => null),
+            client
+              .query(api.submissionReadiness.getSubmissionReadiness, {
+                problemId: asId(args.id),
+              })
+              .catch(() => null),
+            client
+              .query(api.reviews.getReviewHistory, { problemId: asId(args.id) })
+              .catch(() => []),
+            // Manager verdicts and comments from the web review history; JSON output only.
+            args.json
+              ? client
+                  .query(api.managerReview.getManagerFeedbackHistory, { problemId: asId(args.id) })
+                  .catch(unavailable)
+              : [],
+          ])
+        : [[], null, null, null, null, [], []];
     if (args.json) {
       printJson({
         ...data,
         checks: { stages, dynamicChecks, readiness },
         runs: { agentRuns: runs, criteria },
         reviews,
+        managerFeedback,
       });
       return;
     }
