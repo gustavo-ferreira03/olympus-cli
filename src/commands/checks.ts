@@ -533,6 +533,9 @@ function extractCheckFindings(output: Record<string, any> | undefined) {
     ["evaluation.suggestions", output.evaluation?.suggestions],
     ["gaps", output.gaps],
     ["evaluation.gaps", output.evaluation?.gaps],
+    // Reward Hacking reports under authorReport.
+    ["authorReport.blocking", output.authorReport?.blocking],
+    ["authorReport.notBlocking", output.authorReport?.notBlocking],
   ];
   const findings: Array<{ index: number; source: string; value: any }> = [];
   for (const [source, value] of sources) {
